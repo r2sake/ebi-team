@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.ebi-team/
+*.log
+.DS_Store
+ebi-team.config.json
+.claude/

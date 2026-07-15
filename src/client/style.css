@@ -1,0 +1,401 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel-2: #1f2330;
+  --border: #2a2f3a;
+  --text: #e6e8ee;
+  --muted: #8b93a7;
+  --accent: #ff8a5b; /* エビ色 */
+  --idle: #4caf78;
+  --busy: #e0a23b;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.topbar h1 {
+  font-size: 18px;
+  margin: 0;
+}
+.topbar .sub {
+  font-size: 12px;
+  color: var(--muted);
+  margin-left: 6px;
+}
+
+.controls {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+input[type="text"], select {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+
+button {
+  background: var(--accent);
+  color: #21130c;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-weight: 700;
+  cursor: pointer;
+  font-size: 13px;
+}
+button:hover { filter: brightness(1.07); }
+
+/* worktree オプション（spawn フォーム）。 */
+.wt-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+.wt-toggle input { cursor: pointer; }
+.wt-field { max-width: 160px; }
+.wt-field[hidden] { display: none; }
+
+.conn { font-size: 12px; color: var(--muted); }
+.conn.ok { color: var(--idle); }
+.conn.ng { color: #e05b5b; }
+
+.layout {
+  flex: 1 1 auto;
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  min-height: 0;
+}
+
+/* master-detail のメイン領域。選択中の 1 枚だけを大きく表示する。 */
+.stage {
+  position: relative;
+  padding: 8px;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+}
+
+.pane {
+  /* stage 内で単独の大きな 1 枚として広がる。 */
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  background: #000;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  min-height: 0;
+}
+/* 非表示ペイン: DOM / PTY / xterm は生かしたまま見た目だけ隠す。 */
+.pane.hidden { display: none; }
+
+.pane-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px;
+  background: var(--panel-2);
+  font-size: 12px;
+}
+.pane-head .id { font-weight: 700; }
+.pane-head .dot {
+  display: inline-block;
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  margin-right: 6px;
+}
+.dot.idle { background: var(--idle); }
+.dot.busy { background: var(--busy); }
+.pane-head .pane-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.pane-head .kill {
+  background: transparent;
+  color: var(--muted);
+  padding: 2px 6px;
+  font-weight: 400;
+}
+.pane-head .kill:hover { color: #e05b5b; }
+
+/* 監督・要約ボタン（既定 OFF。supervisor 有効時のみ DOM に出る）。 */
+.pane-head .summarize {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 2px 8px;
+  font-weight: 600;
+  font-size: 11px;
+}
+.pane-head .summarize:hover { filter: brightness(1.2); }
+.pane-head .summarize:disabled {
+  opacity: 0.6;
+  cursor: default;
+  filter: none;
+}
+
+/* 要約パネル（stage の右上に重ねて表示）。 */
+.summary-panel {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 10;
+  width: min(420px, 70%);
+  max-height: 60%;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel-2);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+.summary-panel[hidden] { display: none; }
+.summary-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+.summary-title { font-size: 12px; font-weight: 700; }
+.summary-agent { color: var(--accent); font-weight: 700; }
+.summary-close {
+  background: transparent;
+  color: var(--muted);
+  padding: 2px 6px;
+  font-weight: 400;
+}
+.summary-close:hover { color: #e05b5b; }
+.summary-body {
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow: auto;
+}
+
+.pane-term {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 4px;
+}
+
+.sidebar {
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  padding: 10px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.sidebar h2 { font-size: 13px; margin: 0 0 8px; color: var(--muted); text-transform: uppercase; }
+.h2-hint { font-size: 10px; color: var(--muted); text-transform: none; font-weight: 400; margin-left: 6px; }
+
+.registry table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.registry th, .registry td {
+  text-align: left;
+  padding: 4px 6px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 120px;
+}
+.registry td.status-idle { color: var(--idle); }
+.registry td.status-busy { color: var(--busy); }
+/* worktree 由来 agent の branch セル（🌿 アイコン付き）。 */
+.registry td.branch-cell { color: var(--accent); }
+
+/* REGISTRY 行は agent 選択リストを兼ねる（クリックで切替）。 */
+.registry tr.agent-row { cursor: pointer; }
+.registry tr.agent-row:hover td { background: var(--panel-2); }
+.registry tr.agent-row.active td {
+  background: rgba(255, 138, 91, 0.16); /* エビ色のうっすらハイライト */
+  color: var(--text);
+}
+.registry tr.agent-row.active td:first-child {
+  box-shadow: inset 3px 0 0 var(--accent); /* 左端にアクセントバー */
+  font-weight: 700;
+}
+
+/* isolated な agent は視覚的に区別（行全体を淡くしてアイコンも落とす）。 */
+.registry tr.agent-row.isolated td { opacity: 0.55; }
+.registry tr.agent-row.isolated.active td { opacity: 0.8; }
+
+/* mode トグルボタン（connected/isolated 切替）。 */
+.mode-toggle {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 5px;
+  white-space: nowrap;
+}
+.mode-toggle.connected { background: var(--idle); color: #07160d; }
+.mode-toggle.isolated { background: var(--panel-2); color: var(--muted); }
+
+/* 種別バッジ（master/supervisor/dynamic）。pane ヘッダ / registry の id セルで使う。 */
+.kind-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 5px;
+  vertical-align: middle;
+}
+.kind-badge.kind-master {
+  background: #6b4cff;
+  color: #f3f0ff;
+}
+.kind-badge.kind-supervisor {
+  background: #2f8f8f;
+  color: #eafafa;
+}
+.kind-badge.kind-dynamic {
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--border);
+}
+
+/* 固定エビの registry 行は左端アクセントバーで常駐を示す。 */
+.registry tr.agent-row.kind-master td:first-child {
+  box-shadow: inset 3px 0 0 #6b4cff;
+}
+.registry tr.agent-row.kind-supervisor td:first-child {
+  box-shadow: inset 3px 0 0 #2f8f8f;
+}
+
+.log ul { list-style: none; margin: 0; padding: 0; font-size: 11px; color: var(--muted); }
+.log li { padding: 3px 0; border-bottom: 1px solid var(--border); line-height: 1.4; }
+
+/* 使用状況ダッシュボード（REGISTRY 最上段「📊 ダッシュボード」選択時にメイン領域へ表示）。 */
+.dashboard {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 16px 20px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.dashboard[hidden] { display: none; }
+.dash-title { font-size: 16px; margin: 0 0 14px; color: var(--text); }
+.dash-subtitle {
+  font-size: 12px;
+  margin: 18px 0 8px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.dash-empty, .dash-note {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.6;
+  margin: 8px 0 0;
+}
+
+/* レート制限の行（ラベル＋バー＋％＋カウントダウン）。 */
+.dash-ratelimits { margin-bottom: 8px; }
+.dash-rate-row {
+  display: grid;
+  grid-template-columns: 90px 1fr 48px auto;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+}
+.dash-rate-label { font-size: 12px; color: var(--text); font-weight: 700; }
+.dash-rate-na { font-size: 12px; color: var(--muted); grid-column: 2 / 5; }
+.dash-bar-wrap {
+  height: 10px;
+  background: var(--panel-2);
+  border-radius: 5px;
+  overflow: hidden;
+}
+.dash-bar {
+  height: 100%;
+  background: var(--idle);
+  border-radius: 5px;
+  transition: width 0.3s ease;
+}
+.dash-bar.warn { background: var(--busy); }
+.dash-bar.danger { background: #e05b5b; }
+.dash-rate-pct { font-size: 12px; color: var(--text); text-align: right; }
+.dash-rate-reset { font-size: 11px; color: var(--muted); white-space: nowrap; }
+
+/* エビ別テーブル。 */
+.dash-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }
+.dash-table th, .dash-table td {
+  text-align: left;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 160px;
+}
+.dash-table th { color: var(--muted); font-weight: 600; }
+.dash-table td.dash-waiting { color: var(--muted); text-align: center; }
+.dash-total {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--accent);
+  margin: 12px 0 0;
+}
+
+/* ダッシュボード行（REGISTRY 最上段の合成エントリ）。 */
+.registry tr.dashboard-row { cursor: pointer; }
+.registry tr.dashboard-row td { font-weight: 700; color: var(--text); }
+.registry tr.dashboard-row:hover td { background: var(--panel-2); }
+.registry tr.dashboard-row.active td {
+  background: rgba(255, 138, 91, 0.16);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
+/* 空状態（未選択 / 全 agent 終了）。stage 中央に表示。 */
+.empty {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 14px;
+  padding: 40px;
+  text-align: center;
+  line-height: 1.6;
+}

@@ -1,0 +1,44 @@
+{
+  "name": "ebi-team",
+  "version": "0.1.0",
+  "description": "ローカルWebで複数の Claude Code セッションを並走させるマルチエージェント・オーケストレータ（エビチーム）",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "predev": "npm run gen:master-mcp:dev",
+    "dev": "concurrently -n server,client -c cyan,magenta \"npm:dev:server\" \"npm:dev:client\"",
+    "dev:server": "EBI_IDLE_NOTIFY=off tsx watch src/server/index.ts",
+    "dev:client": "vite",
+    "build": "tsc -p tsconfig.server.json && vite build",
+    "prestart": "npm run gen:master-mcp",
+    "start": "EBI_IDLE_NOTIFY=off node dist/server/server/index.js",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.server.json",
+    "gen:master-mcp": "node scripts/gen-master-mcp.mjs",
+    "gen:master-mcp:dev": "node scripts/gen-master-mcp.mjs --dev",
+    "e2e:control": "node scripts/e2e-control-mcp.mjs",
+    "e2e:send": "node scripts/e2e-send-message.mjs",
+    "e2e:supervisor": "node scripts/e2e-supervisor.mjs",
+    "e2e:reverse-notify": "node scripts/e2e-reverse-notify.mjs",
+    "e2e:usage": "node scripts/e2e-usage.mjs",
+    "postinstall": "node scripts/fix-pty-helper.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "node-pty": "^1.0.0",
+    "ws": "^8.18.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "concurrently": "^9.1.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
