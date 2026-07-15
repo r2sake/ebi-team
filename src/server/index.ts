@@ -8,8 +8,14 @@ import { Mailbox } from "./mailbox.ts";
 import type { SpawnConfig, AgentHandlers, LaunchParams } from "./agent.ts";
 import { addWorktree, removeWorktree } from "./git.ts";
 import { Supervisor } from "./supervisor.ts";
-import { loadFixedEbi, buildClaudeArgs, validatePermissionMode, DEFAULT_PERMISSION_MODE } from "./config.ts";
-import { EBI_ROLES, resolveRole, type EbiMcpRole } from "./roles.ts";
+import {
+  loadFixedEbi,
+  loadRawCustomRoles,
+  buildClaudeArgs,
+  validatePermissionMode,
+  DEFAULT_PERMISSION_MODE,
+} from "./config.ts";
+import { EBI_ROLES, resolveRole, registerCustomRoles, type EbiMcpRole } from "./roles.ts";
 import { FixedEbiManager } from "./fixedEbi.ts";
 import { createControlApi, type GeneralizedSpawnParams } from "./control.ts";
 import { UsageStore } from "./usageStore.ts";
@@ -698,6 +704,29 @@ async function startFixedEbi(): Promise<void> {
     console.warn(`[ebi-team] 固定エビ config の読み込みに失敗（動的エビのみで継続）:`, err);
   }
 }
+
+/**
+ * ebi-team.config.json の top-level "roles"（カスタム動的ロール）を読み、EBI_ROLES
+ * レジストリへマージする。httpServer.listen() より前（＝ spawn 要求を一切受け付けられない
+ * 段階）で完了させ、role 解決が常にマージ後のレジストリを見るようにする。
+ * config が無い/roles 未指定なら何もしない。検証失敗時は警告のみで起動は継続する
+ * （公開版の既定 engineer のみでも成立するため、サーバごと落とさない）。
+ */
+async function loadAndRegisterCustomRoles(): Promise<void> {
+  try {
+    const raw = await loadRawCustomRoles(CONFIG_PATH);
+    registerCustomRoles(raw);
+    const customIds = Object.keys(EBI_ROLES).filter((id) => id !== "engineer");
+    if (customIds.length > 0) {
+      console.log(`[ebi-team] カスタム役割を登録: ${customIds.join(", ")}`);
+    }
+  } catch (err) {
+    console.warn(`[ebi-team] カスタム役割 config の読み込みに失敗（engineer のみで継続）:`, err);
+  }
+}
+
+// spawn 要求（WS / 制御API いずれも）を受け付ける前にカスタム役割を確定させる。
+await loadAndRegisterCustomRoles();
 
 // ===== 起動 / 終了処理 =====
 httpServer.listen(PORT, HOST, () => {

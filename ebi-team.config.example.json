@@ -1,6 +1,17 @@
 {
   "$comment": "固定エビ（削除不可・常駐）の宣言的定義。サーバ起動時に自動 spawn され、exit したら自動再起動される。cwd は $HOME/${VAR}/~ の展開と config 基準の相対解決に対応。command 未指定なら EBI_COMMAND（既定 claude）。claude 起動時のみ --model/--permission-mode/--append-system-prompt が付与される。このファイルは example です。実際に使う場合は ebi-team.config.json という名前でコピーして編集してください（.gitignore 済みなのでコミットされません）。",
-  "_comment_customize": "ここに自分の人格・カスタムロールを書く。master/supervisor の appendSystemPrompt は自由に書き換えてよい。動的エビのカスタム役割（engineer 以外の役割）を増やしたい場合は src/server/roles.ts の EBI_ROLES にエントリを追加する。",
+  "_comment_customize": "ここに自分の人格・カスタムロールを書く。master/supervisor の appendSystemPrompt は自由に書き換えてよい。動的エビのカスタム役割（engineer 以外の役割）を増やしたい場合は下記の \"roles\" にエントリを追加する（コードを触る必要はない）。",
+  "_comment_roles": "roles は { 役割id: 定義 } の任意追加。各定義のフィールドはすべて省略可: label(表示名/既定=id), emoji(バッジ絵文字/既定=🧩), mcpRole(\"engineer\"のみ許容/既定\"engineer\"=動的エビの唯一の権限ティア), permissionMode(claudeの--permission-mode/既定はサーバ既定値), defaultModel(既定モデルalias/既定\"sonnet\"), appendSystemPrompt(--append-system-promptに渡す役割プロンプト/既定は空)。spawn_ebi/send_message の role にこの id を指定すると使える。組込みの \"engineer\" は同名キーで上書きはできるが削除はできない。",
+  "roles": {
+    "reviewer": {
+      "label": "レビュアー",
+      "emoji": "🔍",
+      "mcpRole": "engineer",
+      "permissionMode": "default",
+      "defaultModel": "sonnet",
+      "appendSystemPrompt": "あなたはコードレビュー専任の使い捨てセッション。与えられた差分/PRを読み、正しさ・可読性・設計・セキュリティの観点で指摘を簡潔にまとめ、reply_to_master で報告する。実装の変更は行わない。"
+    }
+  },
   "fixedEbi": [
     {
       "id": "supervisor",

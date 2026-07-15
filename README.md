@@ -96,6 +96,38 @@ cp ebi-team.config.example.json ebi-team.config.json
 
 つまり、コード側は誰にとっても同じ「箱」のままにしておき、**自分らしいエージェントの人格や役割分担は `ebi-team.config.json` の `appendSystemPrompt` に書く**、という運用を想定しています。
 
+### カスタム役割 (custom roles)
+
+動的エビ（`spawn_ebi` / `send_message` で都度起動する作業役）には既定で `engineer` 役割だけが同梱されています。`ebi-team.config.json` の top-level `roles` に定義を追加すると、**コードを一切触らずに** 自分専用の役割（例: レビュー専任、ドキュメント専任など）を増やせます。追加した役割は起動時に読み込まれ、`spawn_ebi` / `send_message` の `role` にその id を指定して使えます。
+
+```jsonc
+{
+  "roles": {
+    "reviewer": {
+      "label": "レビュアー",
+      "emoji": "🔍",
+      "mcpRole": "engineer",
+      "permissionMode": "default",
+      "defaultModel": "sonnet",
+      "appendSystemPrompt": "あなたはコードレビュー専任の使い捨てセッション。…"
+    }
+  }
+}
+```
+
+フィールドはすべて省略可です。
+
+| フィールド | 説明 | 省略時の既定 |
+| --- | --- | --- |
+| `label` | UI 表示名 | 役割 id と同じ |
+| `emoji` | UI バッジ絵文字 | `🧩` |
+| `mcpRole` | 動的エビに与える MCP 権限ティア。**`"engineer"` のみ許容**（動的エビが持つ唯一の最小権限ティアで、他エビの spawn/kill/操作はできません） | `"engineer"` |
+| `permissionMode` | Claude Code の権限モード | サーバの既定値 |
+| `defaultModel` | 起動モデル（`opus` / `sonnet` / `haiku` など） | `"sonnet"` |
+| `appendSystemPrompt` | その役割の人格・振る舞いのルールを注入するシステムプロンプト | 空（注入なし） |
+
+組込みの `engineer` は同名キーで上書きできますが、削除はできません（`roles` は既存レジストリへの追加/上書きのみです）。
+
 ---
 
 ## How it works / Architecture

@@ -20,12 +20,31 @@
 //
 // 注意: このプロセス自体は claude を起動しない。あくまで制御API を呼ぶブリッジ。
 
+import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { EBI_ROLES, type EbiRoleId } from "../server/roles.ts";
+import { EBI_ROLES, registerCustomRoles, type EbiRoleId } from "../server/roles.ts";
+import { loadRawCustomRoles } from "../server/config.ts";
 
 const CONTROL_URL = (process.env.EBI_CONTROL_URL ?? "http://127.0.0.1:8787").replace(/\/$/, "");
+
+// このプロセスは gen-master-mcp.mjs が生成する mcp config で cwd をリポジトリルートに固定して
+// spawn される（EBI_CONFIG_PATH で明示上書きも可）ため、index.ts と同じ既定パス規則で
+// ebi-team.config.json を解決できる。role z.enum(ROLE_IDS)（下記）の選択肢に、サーバ側
+// （index.ts）が起動時にマージするのと同じカスタム役割を反映させるため、ここでも
+// registerCustomRoles を「ツールスキーマを組み立てる前」に呼ぶ（呼ばないと master が
+// spawn_ebi/send_message でカスタム role を指定した瞬間、この bridge の zod バリデーションで
+// 弾かれてしまう＝サーバ側の対応だけでは機能しない）。
+const CONFIG_PATH = process.env.EBI_CONFIG_PATH ?? join(process.cwd(), "ebi-team.config.json");
+try {
+  const rawRoles = await loadRawCustomRoles(CONFIG_PATH);
+  registerCustomRoles(rawRoles);
+} catch (err) {
+  console.error(
+    `[ebi-control-mcp] カスタム役割 config の読み込みに失敗（engineer のみで継続）: ${(err as Error).message}`,
+  );
+}
 
 /**
  * notification 注入方式の long-poll 購読タイムアウト（ms）。

@@ -55,6 +55,39 @@ interface RawFixedEbi {
 
 interface RawConfig {
   fixedEbi?: unknown;
+  /** カスタム役割（{ [id]: RoleDef }）。バリデーション/マージは roles.ts の registerCustomRoles が行う。 */
+  roles?: unknown;
+}
+
+/**
+ * config ファイルを読み JSON パースするだけの共通ヘルパー。
+ * - ファイルが無ければ null（呼び出し側で「機能 OFF」として扱う）。
+ * - JSON 不正は throw（呼び出し側で警告ログにして起動継続するか判断）。
+ * loadFixedEbi / loadRawCustomRoles の双方から使う（同じファイルをそれぞれ独立に読む。
+ * 起動時 1 回だけなので I/O コストは無視できる）。
+ */
+async function readRawConfig(configPath: string): Promise<RawConfig | null> {
+  let text: string;
+  try {
+    text = await readFile(configPath, "utf8");
+  } catch {
+    return null;
+  }
+  try {
+    return JSON.parse(text) as RawConfig;
+  } catch (err) {
+    throw new Error(`${configPath} の JSON パースに失敗: ${(err as Error).message}`);
+  }
+}
+
+/**
+ * ebi-team.config.json の top-level "roles" を生のまま返す（型・意味検証は roles.ts の
+ * registerCustomRoles が行う。ここではファイル読み込み/JSON パースのみ担当する）。
+ * - ファイルが無い、または roles キーが無ければ undefined。
+ */
+export async function loadRawCustomRoles(configPath: string): Promise<unknown> {
+  const parsed = await readRawConfig(configPath);
+  return parsed?.roles;
 }
 
 /** 正規化済みの固定エビ定義。サーバが spawn にそのまま使える形。 */
@@ -206,19 +239,10 @@ export async function loadFixedEbi(
   configPath: string,
   defaults: ConfigDefaults,
 ): Promise<FixedEbiSpec[]> {
-  let text: string;
-  try {
-    text = await readFile(configPath, "utf8");
-  } catch {
+  const parsed = await readRawConfig(configPath);
+  if (parsed === null) {
     // ファイル無し＝固定エビ機能を使わない。エラーにしない。
     return [];
-  }
-
-  let parsed: RawConfig;
-  try {
-    parsed = JSON.parse(text) as RawConfig;
-  } catch (err) {
-    throw new Error(`${configPath} の JSON パースに失敗: ${(err as Error).message}`);
   }
 
   const list = parsed.fixedEbi;
