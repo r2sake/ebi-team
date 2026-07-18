@@ -17,6 +17,10 @@
         </label>
         <input id="spawn-repo" type="text" placeholder="repo パス（空なら cwd）" class="wt-field" hidden />
         <input id="spawn-branch" type="text" placeholder="branch（空なら ebi/&lt;id&gt;）" class="wt-field" hidden />
+        <label class="wt-toggle" title="ON にすると spawn 後に自動でそのエビへ表示を切り替える（既定 OFF＝master 等へのフォーカスを維持）">
+          <input id="spawn-follow" type="checkbox" />
+          spawn後に移動
+        </label>
         <button id="spawn-btn">＋ エビを追加</button>
         <span id="conn-status" class="conn">接続中…</span>
       </div>
@@ -26,6 +30,8 @@
       <section id="stage" class="stage"><!-- 選択中の agent ペインを単独表示。非表示ペインも DOM 上に残す -->
         <!-- 使用状況ダッシュボード（REGISTRY 最上段「📊 ダッシュボード」選択時のみ表示）。 -->
         <div id="dashboard" class="dashboard" hidden></div>
+        <!-- viewer（読み取り専用 md/txt プレビュー。REGISTRY の viewer 行選択時のみ表示）。 -->
+        <div id="viewer" class="viewer" hidden></div>
         <!-- 監督・要約パネル（既定 OFF。supervisor 有効かつ要約結果がある時だけ表示） -->
         <div id="summary-panel" class="summary-panel" hidden>
           <div class="summary-head">

@@ -347,6 +347,22 @@ server.tool(
   },
 );
 
+// ---- open_viewer: md/txt ファイルを読み取り専用パネルとして UI に開く（master 専用）----
+server.tool(
+  "open_viewer",
+  "指定した md/txt ファイルを、UI の読み取り専用プレビュー（viewer）として開く。" +
+    "レビュー用のプランやレポートをユーザーに『見せる』ための明示操作。開くと自動でそのパネルに切り替わる。" +
+    "パスは許可ルート（既定 $HOME/workspace・EBI_VIEWER_ROOTS で設定）配下の .md/.markdown/.txt のみ。",
+  {
+    path: z.string().describe("開くファイルの絶対パス（許可ルート配下の .md/.markdown/.txt）"),
+    title: z.string().optional().describe("表示タイトル（未指定はファイル名）"),
+  },
+  async ({ path, title }) => {
+    const r = await callControl("POST", "/control/open-viewer", { path, title });
+    return toResult(r);
+  },
+);
+
 // ---- ask_supervisor: target エビの状況要約を回収して返す（バッチC 本実装）----
 server.tool(
   "ask_supervisor",
