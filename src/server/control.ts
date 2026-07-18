@@ -11,7 +11,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Registry } from "./registry.ts";
 import type { MailboxMessage } from "./mailbox.ts";
-import { BROADCAST_TARGET, type AgentMode, type AgentKind } from "../shared/protocol.ts";
+import { BROADCAST_TARGET, type AgentMode, type AgentKind, type ViewerRecord } from "../shared/protocol.ts";
 
 /**
  * spawn の一般化パラメータ（WS / 制御API 共通）。
@@ -105,6 +105,12 @@ export interface ControlDeps {
    * pending があれば即返し、無ければ timeoutMs 待って空配列（=再接続を促す）を返す。
    */
   subscribe: (id: string, timeoutMs: number) => Promise<MailboxMessage[]>;
+  /**
+   * viewer（読み取り専用の md/txt プレビュー）を開く。パス検証・ファイル読取・登録を行い、
+   * viewers の broadcast まで済ませて登録された ViewerRecord を返す。
+   * 検証失敗（許可ルート外/拡張子/サイズ/不存在）は throw（呼び出し側で 400 に振り分ける）。
+   */
+  openViewer: (path: string, title?: string) => Promise<ViewerRecord>;
 }
 
 /** JSON レスポンスを返すヘルパー。 */
@@ -167,7 +173,7 @@ function agentSummary(registry: Registry) {
  * false の場合、呼び出し側（index.ts）は従来どおり静的配信などにフォールバックする。
  */
 export function createControlApi(deps: ControlDeps) {
-  const { registry, spawnAgent, inject, sendMessage, broadcastRegistry, summarize, ingestUsage, subscribe } = deps;
+  const { registry, spawnAgent, inject, sendMessage, broadcastRegistry, summarize, ingestUsage, subscribe, openViewer } = deps;
 
   return async function handleControl(
     req: IncomingMessage,
@@ -207,6 +213,27 @@ export function createControlApi(deps: ControlDeps) {
           asEngineer: asBool(body.asEngineer),
         });
         sendJson(res, 200, { id });
+        return true;
+      }
+
+      // ---- POST /control/open-viewer ----
+      // master 専用 MCP `open_viewer` からのブリッジ。パス検証・読取・登録・broadcast は
+      // openViewer（index.ts 側）が行う。content は大きいので応答には含めず要約だけ返す。
+      if (pathname === "/control/open-viewer" && method === "POST") {
+        const body = await readJsonBody(req);
+        const path = asString(body.path);
+        const title = asString(body.title);
+        if (!path) {
+          sendJson(res, 400, { error: "path（文字列）は必須です" });
+          return true;
+        }
+        try {
+          const rec = await openViewer(path, title);
+          sendJson(res, 200, { id: rec.id, path: rec.path, title: rec.title, format: rec.format });
+        } catch (err) {
+          // パス検証エラー（許可ルート外/拡張子/サイズ/不存在）は 400 で理由を返す。
+          sendJson(res, 400, { error: (err as Error).message });
+        }
         return true;
       }
 

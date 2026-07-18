@@ -1,9 +1,11 @@
 import { Pane } from "./pane.ts";
 import { Dashboard } from "./dashboard.ts";
+import { Viewer } from "./viewer.ts";
 import {
   type ClientMessage,
   type ServerMessage,
   type AgentRecord,
+  type ViewerRecord,
 } from "../shared/protocol.ts";
 
 // ===== DOM 参照 =====
@@ -13,6 +15,8 @@ const spawnCwd = document.getElementById("spawn-cwd") as HTMLInputElement;
 const spawnUseWorktree = document.getElementById("spawn-use-worktree") as HTMLInputElement;
 const spawnRepo = document.getElementById("spawn-repo") as HTMLInputElement;
 const spawnBranch = document.getElementById("spawn-branch") as HTMLInputElement;
+// spawn 後に自動でそのエビへ移動するか（既定 OFF）。C: 誤送信防止のため既定は追従しない。
+const spawnFollow = document.getElementById("spawn-follow") as HTMLInputElement;
 const connStatus = document.getElementById("conn-status") as HTMLElement;
 const registryBody = document.querySelector("#registry-table tbody") as HTMLElement;
 const noticeList = document.getElementById("notice-list") as HTMLElement;
@@ -25,6 +29,8 @@ const summaryClose = document.getElementById("summary-close") as HTMLButtonEleme
 // ===== 状態 =====
 const panes = new Map<string, Pane>();
 let registry: AgentRecord[] = [];
+// viewer（読み取り専用 md/txt プレビュー）の一覧。サーバ registry(agents) とは別コレクション。
+let viewers: ViewerRecord[] = [];
 
 // REGISTRY 最上段に常設する合成エントリ（ダッシュボード）。サーバ registry には入れない
 // クライアント側の擬似エントリ。選択するとメイン領域に xterm ではなくダッシュボード DOM を出す。
@@ -32,6 +38,12 @@ const DASHBOARD_ID = "__dashboard__";
 
 // 使用状況ダッシュボード（WS `usage` を受けて描画する）。
 const dashboard = new Dashboard(document.getElementById("dashboard") as HTMLElement);
+
+// viewer パネル（master-detail の 1 枚として、選択中 viewer の内容を描画する単一インスタンス）。
+// ✗ 押下で closeViewer をサーバへ送る。
+const viewer = new Viewer(document.getElementById("viewer") as HTMLElement, (id) =>
+  sendMsg({ type: "closeViewer", id }),
+);
 
 // 表示順: dashboard → master → supervisor → dynamic。同種は元の順を維持（Array.sort は V8 で安定）。
 // 種別ソートにすることで、固定エビが自動再起動で末尾に来ても順序が崩れない。
@@ -48,6 +60,20 @@ let activeId: string | null = null;
 let pendingSelectId: string | null = null;
 // 監督・要約機能が有効か（サーバの capabilities = サブスク claude CLI の有無で決まる）。
 let supervisorEnabled = false;
+
+/** 現在 active な viewer レコード（activeId が viewer id のとき）。無ければ null。 */
+function activeViewer(): ViewerRecord | null {
+  return viewers.find((v) => v.id === activeId) ?? null;
+}
+
+/**
+ * 指定 id が「選択として成立する」対象か。
+ * agent ペイン・ダッシュボード合成行・viewer 合成行のいずれかであれば true。
+ */
+function selectionExists(id: string | null): boolean {
+  if (!id) return false;
+  return id === DASHBOARD_ID || panes.has(id) || viewers.some((v) => v.id === id);
+}
 
 // ===== WebSocket 接続（自動再接続つき）=====
 let ws: WebSocket | null = null;
@@ -158,6 +184,26 @@ function handleServerMessage(msg: ServerMessage): void {
       // 使用状況スナップショット。ダッシュボード表示中なら即描画に反映される。
       dashboard.update(msg);
       break;
+    case "viewers": {
+      const prevIds = new Set(viewers.map((v) => v.id));
+      viewers = msg.viewers;
+      const added = viewers.filter((v) => !prevIds.has(v.id));
+      if (added.length > 0) {
+        // 新規 open は master の「これを見せる」明示操作 → その viewer へ自動フォーカスする。
+        // （エビ spawn の自動追従抑制=C とは別扱い。明示表示なので追従してよい）
+        setActive(added[added.length - 1].id);
+        break;
+      }
+      // close 等で active な viewer が消えたらフォールバック選択。
+      if (activeId && !selectionExists(activeId)) {
+        setActive(registry.length > 0 ? registry[0].id : DASHBOARD_ID);
+        break;
+      }
+      // 同一 viewer の内容更新（同 id 再 open 等）や他 viewer の増減は再描画のみ。
+      viewer.update(activeViewer());
+      renderRegistry();
+      break;
+    }
   }
 }
 
@@ -194,26 +240,26 @@ function syncPanes(): void {
     }
   }
 
-  // spawn 直後の自動選択（その agent が registry に反映されたら拾う）。
+  // spawn 直後の自動選択（C: 既定 OFF）。
+  // 「spawn 後に移動」トグルが ON のときだけ新エビへ追従する。OFF のときは予約を消化
+  // するだけで active は動かさない（＝直近 spawn への誤送信を防ぎ master 等へのフォーカスを維持）。
   if (pendingSelectId && panes.has(pendingSelectId)) {
     const target = pendingSelectId;
     pendingSelectId = null;
-    setActive(target);
-    return;
+    if (spawnFollow.checked) {
+      setActive(target);
+      return;
+    }
   }
 
-  // ダッシュボードは合成エントリで panes には無いが、有効な選択として維持する。
-  if (activeId === DASHBOARD_ID) {
+  // 現在の選択（agent / ダッシュボード / viewer）が成立していれば維持、
+  // 成立しなければ先頭の生存 agent、いなければダッシュボードを既定選択にする
+  // （常設エントリなので「何も無い」状態を避けられる）。
+  if (selectionExists(activeId)) {
     applyVisibility();
     renderEmpty();
-  } else if (!activeId || !panes.has(activeId)) {
-    // 未選択なら先頭の生存 agent を選ぶ。いなければダッシュボードを既定選択にする
-    // （常設エントリなので「何も無い」状態を避けられる）。
-    setActive(registry.length > 0 ? registry[0].id : DASHBOARD_ID);
   } else {
-    // 既存選択を維持しつつ表示・ハイライトを反映。
-    applyVisibility();
-    renderEmpty();
+    setActive(registry.length > 0 ? registry[0].id : DASHBOARD_ID);
   }
 }
 
@@ -239,20 +285,24 @@ function setActive(id: string | null): void {
   renderEmpty();
 }
 
-// activeId に合わせて各ペインの表示/非表示を反映する。
-// ダッシュボード選択時は全 xterm ペインを隠し、ダッシュボード DOM を出す。
+// activeId に合わせて各ペイン/合成パネルの表示/非表示を反映する（dashboard / viewer / pane の N 分岐）。
+// ダッシュボード or viewer 選択時は全 xterm ペインを隠し、対応する合成パネル DOM を出す。
 function applyVisibility(): void {
   const showDashboard = activeId === DASHBOARD_ID;
+  const activeVw = activeViewer();
+  const showViewer = activeVw !== null;
   dashboard.setVisible(showDashboard);
-  for (const [pid, pane] of panes) pane.setVisible(!showDashboard && pid === activeId);
+  viewer.setVisible(showViewer, activeVw);
+  const showPane = !showDashboard && !showViewer;
+  for (const [pid, pane] of panes) pane.setVisible(showPane && pid === activeId);
 }
 
 // ===== 空状態（未選択 / 全 agent 終了）=====
 function renderEmpty(): void {
   const existing = stage.querySelector(".empty");
-  // ダッシュボード表示中は空状態を出さない（メイン領域はダッシュボードが占める）。
+  // ダッシュボード / viewer 表示中は空状態を出さない（メイン領域はそれらが占める）。
   const isEmpty =
-    activeId !== DASHBOARD_ID && (activeId === null || !panes.has(activeId));
+    activeId !== DASHBOARD_ID && activeViewer() === null && (activeId === null || !panes.has(activeId));
   if (isEmpty) {
     if (!existing) {
       const div = document.createElement("div");
@@ -335,6 +385,34 @@ function renderRegistry(): void {
     for (const c of cells) tr.appendChild(c);
     registryBody.appendChild(tr);
   }
+
+  // viewer 合成行（agent の下に列挙）。クリックで単独パネル表示、✗ で close。
+  for (const v of viewers) {
+    const tr = document.createElement("tr");
+    tr.className = "agent-row viewer-row" + (v.id === activeId ? " active" : "");
+    tr.title = `${v.path}（クリックで表示）`;
+    tr.addEventListener("click", () => setActive(v.id));
+
+    const td = document.createElement("td");
+    td.colSpan = 5;
+    td.className = "viewer-row-label";
+    td.append(document.createTextNode(`📄 ${v.title}`));
+
+    // ✗（閉じる）セル。行選択へ伝播させない。
+    const closeTd = document.createElement("td");
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "kill viewer-row-close";
+    closeBtn.textContent = "✕";
+    closeBtn.title = "この viewer を閉じる";
+    closeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      sendMsg({ type: "closeViewer", id: v.id });
+    });
+    closeTd.appendChild(closeBtn);
+
+    tr.append(td, closeTd);
+    registryBody.appendChild(tr);
+  }
 }
 
 function cell(text: string, cls?: string): HTMLTableCellElement {
@@ -410,6 +488,21 @@ spawnUseWorktree.addEventListener("change", () => {
   const on = spawnUseWorktree.checked;
   spawnRepo.hidden = !on;
   spawnBranch.hidden = !on;
+});
+
+// 「spawn 後に移動」トグル（C の opt-in）。既定 OFF。設定は localStorage に保存して復元する。
+const SPAWN_FOLLOW_KEY = "ebi-spawn-follow";
+try {
+  spawnFollow.checked = localStorage.getItem(SPAWN_FOLLOW_KEY) === "1";
+} catch {
+  // localStorage 不可（プライベートモード等）でも既定 OFF で動く。
+}
+spawnFollow.addEventListener("change", () => {
+  try {
+    localStorage.setItem(SPAWN_FOLLOW_KEY, spawnFollow.checked ? "1" : "0");
+  } catch {
+    /* 保存不可でも挙動には影響しない。 */
+  }
 });
 
 spawnBtn.addEventListener("click", () => {

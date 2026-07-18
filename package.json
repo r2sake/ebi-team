@@ -20,6 +20,7 @@
     "e2e:supervisor": "node scripts/e2e-supervisor.mjs",
     "e2e:reverse-notify": "node scripts/e2e-reverse-notify.mjs",
     "e2e:usage": "node scripts/e2e-usage.mjs",
+    "e2e:viewer": "node --import tsx scripts/e2e-viewer.mjs",
     "postinstall": "node scripts/fix-pty-helper.mjs"
   },
   "dependencies": {
