@@ -51,12 +51,23 @@ interface RawFixedEbi {
   appendSystemPrompt?: unknown;
   /** テスト用にバイナリを差し替えたい場合（既定は claude / EBI_COMMAND）。 */
   command?: unknown;
+  /**
+   * notification（mailbox 購読）経路で受信するか（既定 true）。
+   * false にすると「受信を PTY 注入に固定」する（外部チャンネル待機セッションで、
+   * 自セッションに ebi-control channel を登録しない＝notification が黙って捨てられる場合に使う）。
+   */
+  notifySubscribe?: unknown;
 }
 
 interface RawConfig {
   fixedEbi?: unknown;
   /** カスタム役割（{ [id]: RoleDef }）。バリデーション/マージは roles.ts の registerCustomRoles が行う。 */
   roles?: unknown;
+  /**
+   * 起動ゲート自動応答を許可する dev channel 値の追加許可リスト（正確値・完全一致）。
+   * 組込み（server:ebi-control）に足す形。ワイルドカード・部分一致は不可。
+   */
+  devChannelsAllowlist?: unknown;
 }
 
 /**
@@ -90,12 +101,39 @@ export async function loadRawCustomRoles(configPath: string): Promise<unknown> {
   return parsed?.roles;
 }
 
+/**
+ * ebi-team.config.json の top-level "devChannelsAllowlist"（起動ゲート自動応答を許可する
+ * dev channel 値の追加許可リスト・正確値）を読み、文字列配列として返す。
+ * - ファイルが無い／キーが無ければ空配列（追加なし）。
+ * - 配列でない／文字列以外の要素を含む場合は throw（呼び出し側で警告ログにして起動継続する想定）。
+ * 組込みの BASE_ALLOWED_DEV_CHANNELS への「追加」であり、置換ではない（index.ts でマージ）。
+ */
+export async function loadDevChannelsAllowlist(configPath: string): Promise<string[]> {
+  const parsed = await readRawConfig(configPath);
+  const raw = parsed?.devChannelsAllowlist;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    throw new Error(`${configPath} の devChannelsAllowlist は文字列配列である必要があります`);
+  }
+  for (const v of raw) {
+    if (typeof v !== "string") {
+      throw new Error(`${configPath} の devChannelsAllowlist の要素はすべて文字列である必要があります`);
+    }
+  }
+  return raw as string[];
+}
+
 /** 正規化済みの固定エビ定義。サーバが spawn にそのまま使える形。 */
 export interface FixedEbiSpec {
   id: string;
   kind: AgentKind;
   /** 起動に使う実パラメータ（command/args/cwd/model 展開済み）。 */
   launch: LaunchParams;
+  /**
+   * notification（mailbox 購読）経路で受信するか（既定 true）。
+   * false のとき送信側は購読確立を待たず PTY 注入で届ける（受信 PTY 固定）。
+   */
+  notifySubscribe: boolean;
 }
 
 /** 固定エビをビルドするための既定値（サーバの spawnConfig から渡す）。 */
@@ -182,6 +220,14 @@ function asString(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
 }
 
+/** raw な値を boolean として検証する。型不正は明確な Error を throw する。 */
+function asBoolean(v: unknown, id: string): boolean {
+  if (typeof v !== "boolean") {
+    throw new Error(`固定エビ "${id}" の notifySubscribe は真偽値である必要があります`);
+  }
+  return v;
+}
+
 /** raw な args 配列を文字列配列へ正規化する（非文字列要素は除外）。 */
 function asStringArray(v: unknown): string[] {
   if (!Array.isArray(v)) return [];
@@ -227,7 +273,10 @@ function normalizeOne(raw: RawFixedEbi, configDir: string, defaults: ConfigDefau
 
   const args = buildClaudeArgs({ command, model, permissionMode, appendSystemPrompt, extraArgs });
 
-  return { id, kind, launch: { command, args, cwd, model } };
+  // notifySubscribe（既定 true）。false は「受信を PTY 注入に固定」する印。
+  const notifySubscribe = raw.notifySubscribe === undefined ? true : asBoolean(raw.notifySubscribe, id);
+
+  return { id, kind, launch: { command, args, cwd, model }, notifySubscribe };
 }
 
 /**

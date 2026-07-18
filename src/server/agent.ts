@@ -26,8 +26,15 @@ const MIN_BOOT_MS = Number(process.env.EBI_MIN_BOOT_MS) || 1500;
  */
 const REPLY_SUPPRESS_MS = Number(process.env.EBI_REPLY_SUPPRESS_MS) || 5000;
 
-/** 起動ゲート自動応答を許可する唯一の dev channel 値（これ以外・複数指定は自動応答しない）。 */
-const ALLOWED_DEV_CHANNEL = "server:ebi-control";
+/**
+ * 起動ゲート自動応答を許可する dev channel 値の「組込み（既定）許可リスト」。
+ * ここに載っている**正確値**（完全一致）だけを自動応答対象にする。
+ * ワイルドカード・前方一致・部分一致は一切しない（意図せぬ承認を防ぐ）。
+ * 運用者が config（ebi-team.config.json の top-level "devChannelsAllowlist"）で
+ * 追加の正確値を足せる（例: 外部チャンネル待機セッションの plugin:slack@<marketplace>）。
+ * その追加分は index.ts が SpawnConfig.devChannelsAllowlist にマージして Agent に渡す。
+ */
+export const BASE_ALLOWED_DEV_CHANNELS: readonly string[] = ["server:ebi-control"];
 
 /**
  * 起動ゲート（trust / dev-channels 警告）自動応答を受け付ける「起動フェーズ」の時間窓(ms)。
@@ -42,13 +49,20 @@ const GATE_WINDOW_MS = Number(process.env.EBI_GATE_WINDOW_MS) || 90000;
 /**
  * spawn 引数を見て「起動ゲート（trust / dev-channels 警告）の自動応答を有効化してよいか」を判定する。
  *
- * 安全限定: `--dangerously-load-development-channels` の値が
- * `server:ebi-control` ちょうど1個のときだけ true。別サーバ名・複数指定・フラグ自体が無い場合は
- * false（＝自動で危険確認を承認しない。設定書き換えによる意図せぬ承認を防ぐ）。
+ * 安全限定（正確値の許可リスト方式）: `--dangerously-load-development-channels` の値が
+ * **1個以上あり、そのすべてが `allowlist` の正確値（完全一致）である**ときだけ true。
+ * 許可リストに無い値が1つでも混ざる／フラグ自体が無い場合は false
+ * （＝自動で危険確認を承認しない。設定書き換えによる意図せぬ承認を防ぐ）。
+ * 照合は完全一致のみ。ワイルドカード・前方一致・部分一致は一切導入しない
+ * （`plugin:slack@*` のような値は許可リストに正確一致しない限り必ず false）。
  *
+ * `allowlist` 未指定時は組込みの BASE_ALLOWED_DEV_CHANNELS（server:ebi-control のみ）を使う。
  * 当該フラグは variadic（`<servers...>`）で、次の `--flag` までの全トークンを値として取る。
  */
-export function isDevChannelsAutoAnswerEligible(args: readonly string[]): boolean {
+export function isDevChannelsAutoAnswerEligible(
+  args: readonly string[],
+  allowlist: readonly string[] = BASE_ALLOWED_DEV_CHANNELS,
+): boolean {
   const flagIdx = args.indexOf("--dangerously-load-development-channels");
   if (flagIdx === -1) return false;
   const values: string[] = [];
@@ -56,7 +70,32 @@ export function isDevChannelsAutoAnswerEligible(args: readonly string[]): boolea
     if (args[i].startsWith("--")) break;
     values.push(args[i]);
   }
-  return values.length === 1 && values[0] === ALLOWED_DEV_CHANNEL;
+  // 値が1個以上あり、そのすべてが許可リストに完全一致することを要求する。
+  return values.length >= 1 && values.every((v) => allowlist.includes(v));
+}
+
+/**
+ * 起動フェーズの対話ダイアログ種別を、素文スキャンバッファから判定する純関数。
+ *
+ * claude(Ink) TUI は単語間を空白でなくカーソル移動エスケープで描画するため、ANSI 除去後は
+ * "Iamusingthisforlocaldevelopment" のように空白が消えることがある（TUI が空白なしで
+ * 描画する既知の罠）。よって照合は**空白を全除去した文字列**に対して**空白なしパターン**で行う。
+ * これにより空白あり／なしどちらの描画でも同じく検知できる。
+ *
+ * 戻り値:
+ *  - "devChannels": development channels 警告（--dangerously-load-development-channels 使用時）
+ *  - "trust": workspace trust 確認（初見 cwd）
+ *  - null: どちらのダイアログも検知できない
+ */
+export function detectStartupGate(rawScanBuffer: string): "devChannels" | "trust" | null {
+  const compact = rawScanBuffer.replace(/\s+/g, "");
+  if (/Loadingdevelopmentchannels|localchanneldevelopment|Iamusingthisforlocaldevelopment/i.test(compact)) {
+    return "devChannels";
+  }
+  if (/trustthisfolder|Isthisaprojectyou(created|trust)/i.test(compact)) {
+    return "trust";
+  }
+  return null;
 }
 
 /**
@@ -89,6 +128,12 @@ export interface SpawnConfig {
    * PTY 出力をこのバイト数まで保持し、超過分は古い方から捨てる。
    */
   scrollbackBytes: number;
+  /**
+   * 起動ゲート自動応答を許可する dev channel 値の許可リスト（正確値・完全一致）。
+   * 組込みの BASE_ALLOWED_DEV_CHANNELS ＋ config（devChannelsAllowlist）由来の追加値。
+   * index.ts が起動時に組み立てて渡す（未指定時は BASE を使う）。
+   */
+  devChannelsAllowlist?: string[];
 }
 
 /**
@@ -150,6 +195,14 @@ export class Agent {
   readonly pinned: boolean = false;
   /** 動的エビの役割（roles.ts の EBI_ROLES id）。役割なし spawn / 固定エビは null。 */
   readonly role: string | null = null;
+  /**
+   * notification（mailbox 購読）経路で受信するか。既定 true。
+   * false のエビは「受信を PTY 注入に固定」する（外部チャンネル待機セッション minaebi 等、
+   * 自セッションに ebi-control channel を登録しない＝notification が harness に黙って捨てられる
+   * ものに対し、送信側が購読確立を待たず即 PTY で届けるための印）。config の
+   * fixedEbi[].notifySubscribe:false → SpawnOptions 経由で設定される。
+   */
+  readonly notifySubscribe: boolean = true;
   /** 表示用モデル名（alias/full ID）。未指定 spawn なら null。 */
   readonly model: string | null = null;
   /**
@@ -219,9 +272,9 @@ export class Agent {
   constructor(
     id: string,
     launch: LaunchParams,
-    config: Pick<SpawnConfig, "idleThresholdMs" | "scrollbackBytes">,
+    config: Pick<SpawnConfig, "idleThresholdMs" | "scrollbackBytes" | "devChannelsAllowlist">,
     handlers: AgentHandlers,
-    opts?: { kind?: AgentKind; pinned?: boolean; role?: string | null },
+    opts?: { kind?: AgentKind; pinned?: boolean; role?: string | null; notifySubscribe?: boolean },
   ) {
     this.id = id;
     this.cwd = launch.cwd;
@@ -230,9 +283,13 @@ export class Agent {
     this.kind = opts?.kind ?? "dynamic";
     this.pinned = opts?.pinned ?? false;
     this.role = opts?.role ?? null;
+    this.notifySubscribe = opts?.notifySubscribe ?? true;
     this.handlers = handlers;
     this.scrollbackBytes = config.scrollbackBytes;
-    this.autoAnswerStartupGates = isDevChannelsAutoAnswerEligible(launch.args);
+    this.autoAnswerStartupGates = isDevChannelsAutoAnswerEligible(
+      launch.args,
+      config.devChannelsAllowlist ?? BASE_ALLOWED_DEV_CHANNELS,
+    );
 
     this.detector = new IdleDetector(
       config.idleThresholdMs,
@@ -442,30 +499,22 @@ export class Agent {
       .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
       .replace(/\x1b[()][A-Z0-9]/g, "");
     this.gateScanBuffer = (this.gateScanBuffer + plain).slice(-4096);
-    // claude(Ink) TUI は単語間を空白でなくカーソル移動エスケープで描画するため、ANSI 除去後は
-    // "Iamusingthisforlocaldevelopment" のように空白が消える。照合は空白を除去した文字列に
-    // 空白なしパターンで行う（運用者の承認のもと有効化）。
-    const compact = this.gateScanBuffer.replace(/\s+/g, "");
+    // 空白なし照合は detectStartupGate（純関数）に集約している（TUI が空白なしで描画する罠に対応）。
+    const gate = detectStartupGate(this.gateScanBuffer);
 
-    // development channels 警告（運用者承認済みの自動許可対象）。
-    if (
-      !this.devChannelsGateAnswered &&
-      /Loadingdevelopmentchannels|localchanneldevelopment|Iamusingthisforlocaldevelopment/i.test(compact)
-    ) {
+    // development channels 警告（許可リストに正確一致した dev channel を持つ起動でのみ自動許可）。
+    if (gate === "devChannels" && !this.devChannelsGateAnswered) {
       this.devChannelsGateAnswered = true;
       this.proc.write("1\r");
       this.gateScanBuffer = ""; // 次のダイアログ検知のため一旦クリア
-      const msg = `起動ゲート自動応答: development channels 警告に "1"+Enter を送信（server:ebi-control 限定・ready 前）`;
+      const msg = `起動ゲート自動応答: development channels 警告に "1"+Enter を送信（許可リスト限定・ready 前）`;
       console.log(`[ebi-team] [${this.id}] ${msg}`);
       this.handlers.onNotice(this.id, msg);
       return;
     }
 
     // workspace trust 確認。
-    if (
-      !this.trustGateAnswered &&
-      /trustthisfolder|Isthisaprojectyou(created|trust)/i.test(compact)
-    ) {
+    if (gate === "trust" && !this.trustGateAnswered) {
       this.trustGateAnswered = true;
       this.proc.write("1\r");
       this.gateScanBuffer = "";

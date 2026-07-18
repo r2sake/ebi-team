@@ -6,11 +6,13 @@ import { WebSocketServer, WebSocket } from "ws";
 import { Registry, hasControlBridge, isNotifyMode, type WorktreeMeta } from "./registry.ts";
 import { Mailbox } from "./mailbox.ts";
 import type { SpawnConfig, AgentHandlers, LaunchParams } from "./agent.ts";
+import { BASE_ALLOWED_DEV_CHANNELS } from "./agent.ts";
 import { addWorktree, removeWorktree } from "./git.ts";
 import { Supervisor } from "./supervisor.ts";
 import {
   loadFixedEbi,
   loadRawCustomRoles,
+  loadDevChannelsAllowlist,
   buildClaudeArgs,
   validatePermissionMode,
   DEFAULT_PERMISSION_MODE,
@@ -79,6 +81,10 @@ const spawnConfig: SpawnConfig = {
   args: COMMAND_ARGS,
   idleThresholdMs: IDLE_THRESHOLD_MS,
   scrollbackBytes: SCROLLBACK_BYTES,
+  // 起動ゲート自動応答の許可リスト（正確値）。組込みを初期値に持ち、起動時に
+  // ebi-team.config.json の devChannelsAllowlist をマージする（loadAndApplyDevChannelsAllowlist）。
+  // Registry は本オブジェクト参照を保持するため、listen 前のマージが後続の spawn に反映される。
+  devChannelsAllowlist: [...BASE_ALLOWED_DEV_CHANNELS],
 };
 
 // notification 注入方式（mcp notifications/claude/channel）の郵便受け。
@@ -337,12 +343,13 @@ function handleClientMessage(ws: WebSocket, msg: ClientMessage): void {
       break;
     }
     case "kill": {
-      // 固定エビ（master/supervisor）は削除不可。kill を拒否して notice を返す。
+      // 固定エビ（pinned・master/supervisor や minaebi 等の常駐エビ）は削除不可。
+      // kill を拒否して notice を返す。
       if (registry.isPinned(msg.id)) {
         send(ws, {
           type: "notice",
           id: msg.id,
-          text: "固定エビ（master/supervisor）は削除できません",
+          text: "固定エビ（削除不可の常駐エビ）は削除できません",
         });
         break;
       }
@@ -635,7 +642,11 @@ async function sendMessage(params: SendMessageParams): Promise<SendMessageResult
   // 購読確立を最大 SUBSCRIBE_WAIT_MS 待ってから mailbox へ push する。
   // 通知方式は PTY の idle/busy 判定が原理上不要なため、確立さえすれば busy 中でも即届く。
   // 購読が確立しない（ブリッジ非搭載 or 起動に失敗）場合は待たず PTY 経路へフォールバックする。
-  if (registry.notifyEnabled() && hasControlBridge(agent)) {
+  //
+  // ただし notifySubscribe:false のエビ（外部チャンネル待機セッション minaebi 等・受信 PTY 固定）は
+  // この経路に入らず PTY 注入へ直行する。自セッションに ebi-control channel を登録しないため
+  // notification は harness に黙って捨てられる＝購読は永遠に確立せず、待つだけ無駄になるため。
+  if (registry.notifyEnabled() && hasControlBridge(agent) && agent.notifySubscribe !== false) {
     const subscribed =
       registry.hasActiveSubscriber(to) || (await registry.waitForSubscriber(to, SUBSCRIBE_WAIT_MS));
     if (subscribed) {
@@ -748,8 +759,32 @@ async function loadAndRegisterCustomRoles(): Promise<void> {
   }
 }
 
-// spawn 要求（WS / 制御API いずれも）を受け付ける前にカスタム役割を確定させる。
+/**
+ * ebi-team.config.json の top-level "devChannelsAllowlist" を読み、spawnConfig.devChannelsAllowlist
+ * （組込み BASE_ALLOWED_DEV_CHANNELS で初期化済み）へ「追加」マージする。重複は無視する。
+ * httpServer.listen()／固定エビ自動起動より前に完了させ、以降の spawn が常にマージ後の
+ * 許可リストを見るようにする（Registry は spawnConfig 参照を保持する）。
+ * config が無い/未指定なら何もしない。検証失敗時は警告のみで起動を継続する。
+ */
+async function loadAndApplyDevChannelsAllowlist(): Promise<void> {
+  try {
+    const extra = await loadDevChannelsAllowlist(CONFIG_PATH);
+    for (const v of extra) {
+      if (!spawnConfig.devChannelsAllowlist!.includes(v)) spawnConfig.devChannelsAllowlist!.push(v);
+    }
+    if (extra.length > 0) {
+      console.log(
+        `[ebi-team] 起動ゲート許可リスト（dev channels）: ${spawnConfig.devChannelsAllowlist!.join(", ")}`,
+      );
+    }
+  } catch (err) {
+    console.warn(`[ebi-team] devChannelsAllowlist の読み込みに失敗（組込みのみで継続）:`, err);
+  }
+}
+
+// spawn 要求（WS / 制御API いずれも）を受け付ける前にカスタム役割・許可リストを確定させる。
 await loadAndRegisterCustomRoles();
+await loadAndApplyDevChannelsAllowlist();
 
 // ===== 起動 / 終了処理 =====
 httpServer.listen(PORT, HOST, () => {

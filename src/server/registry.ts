@@ -81,6 +81,11 @@ export interface SpawnOptions {
   /** 動的エビの役割（roles.ts の EBI_ROLES id）。バッジ表示・台帳用。 */
   role?: string | null;
   /**
+   * notification（mailbox 購読）経路で受信するか。既定 true。
+   * false のエビは「受信を PTY 注入に固定」する（sendMessage が購読確立を待たず即 PTY）。
+   */
+  notifySubscribe?: boolean;
+  /**
    * 起動パラメータを明示する場合（固定エビ用）。
    * 未指定なら spawnConfig（サーバ既定 command/args）から cwd を当てて構築する。
    */
@@ -137,7 +142,11 @@ export class Registry {
     const agent = this.agents.get(id);
     if (!agent) return false;
     const body = kind === "idle" ? `[idle] ${message}` : kind === "reply" ? `[reply] ${message}` : message;
-    if (this.hasActiveSubscriber(id)) {
+    // notifySubscribe:false のエビ（外部チャンネル待機セッション・受信 PTY 固定）は、たとえ
+    // 何らかの理由で購読者として登録されていても notification 経路に載せない。自セッションに
+    // ebi-control channel が無く notification が harness に黙って捨てられるため（全配送経路
+    // ―inject_message / @all ブロードキャスト / reverseInject―で PTY 注入を強制する）。
+    if (agent.notifySubscribe !== false && this.hasActiveSubscriber(id)) {
       this.mailbox!.push(id, { from, message: body, kind: kind ?? "message", ts: Date.now() });
       return true;
     }
@@ -191,7 +200,7 @@ export class Registry {
       launch,
       this.spawnConfig,
       handlers,
-      { kind: opts?.kind, pinned: opts?.pinned, role: opts?.role },
+      { kind: opts?.kind, pinned: opts?.pinned, role: opts?.role, notifySubscribe: opts?.notifySubscribe },
     );
     if (opts?.branch) agent.branch = opts.branch;
     if (opts?.worktreeRepo && opts?.worktreePath) {
