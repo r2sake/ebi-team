@@ -30,6 +30,32 @@ export type AgentKind = "master" | "supervisor" | "dynamic";
  */
 export type AgentMode = "connected" | "isolated";
 
+/**
+ * viewer（md/txt プレビュー）の表示フォーマット。
+ * - md: 軽量 markdown レンダラで整形表示（見出し/箇条書き/コード/表 等）。
+ * - txt: 生テキストを等幅で表示（.txt はレンダリングしない）。
+ */
+export type ViewerFormat = "md" | "txt";
+
+/**
+ * viewer（読み取り専用の md/txt プレビュー）1 件分のスキーマ。
+ * プロセスを持たない UI エンティティで、AgentRecord とは別のコレクション
+ * （src/server/viewerRegistry.ts）でサーバが保持する。master が open_viewer で開く。
+ * content は open 時点のスナップショット（読み取り専用・以後追従しない）。
+ */
+export interface ViewerRecord {
+  /** viewer id（`viewer-N` 採番。agent id とは名前空間が別）。 */
+  id: string;
+  /** 開いた元ファイルの絶対パス（表示・ツールチップ用）。 */
+  path: string;
+  /** 表示タイトル（未指定時はファイル名）。 */
+  title: string;
+  /** レンダリング形式（拡張子から判定）。 */
+  format: ViewerFormat;
+  /** ファイル内容（open 時点のスナップショット・UTF-8）。 */
+  content: string;
+}
+
 /** registry に保持する agent 1件分のスキーマ。 */
 export interface AgentRecord {
   id: string;
@@ -138,6 +164,16 @@ export interface SummarizeMessage {
   id: string;
 }
 
+/**
+ * viewer を閉じる（クライアント → サーバ）。
+ * viewer はプロセスを持たないため kill 意味論は使わず、専用の close 経路にする。
+ * サーバは viewerRegistry.close(id) 後に `viewers` を再 broadcast する。
+ */
+export interface CloseViewerMessage {
+  type: "closeViewer";
+  id: string;
+}
+
 export type ClientMessage =
   | SpawnMessage
   | KillMessage
@@ -147,7 +183,8 @@ export type ClientMessage =
   | SetModeMessage
   | SubscribeMessage
   | UnsubscribeMessage
-  | SummarizeMessage;
+  | SummarizeMessage
+  | CloseViewerMessage;
 
 // ===== サーバ → クライアント =====
 
@@ -273,6 +310,16 @@ export interface UsageMessage {
   totalCostUsd: number;
 }
 
+/**
+ * viewer コレクションの全件スナップショット（サーバ → クライアント）。
+ * 接続直後に 1 度、および open/close のたびに broadcast する。
+ * クライアントは registry サイドバーに viewer 行を合成表示し、選択でパネル表示する。
+ */
+export interface ViewersMessage {
+  type: "viewers";
+  viewers: ViewerRecord[];
+}
+
 export type ServerMessage =
   | RegistryMessage
   | OutputMessage
@@ -284,4 +331,5 @@ export type ServerMessage =
   | ErrorMessage
   | SummaryMessage
   | CapabilitiesMessage
-  | UsageMessage;
+  | UsageMessage
+  | ViewersMessage;

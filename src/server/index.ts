@@ -19,6 +19,7 @@ import { EBI_ROLES, resolveRole, registerCustomRoles, type EbiMcpRole } from "./
 import { FixedEbiManager } from "./fixedEbi.ts";
 import { createControlApi, type GeneralizedSpawnParams } from "./control.ts";
 import { UsageStore } from "./usageStore.ts";
+import { ViewerRegistry } from "./viewerRegistry.ts";
 import {
   type ClientMessage,
   type ServerMessage,
@@ -98,6 +99,10 @@ const supervisor = new Supervisor();
 // cost/context/model と、アカウント単位の rate_limits を最新値で保持する。
 const usageStore = new UsageStore();
 
+// viewer（読み取り専用の md/txt プレビュー）コレクション。master の open_viewer で開き、
+// クライアントは registry サイドバーに合成行として出す。プロセスは持たない。
+const viewerRegistry = new ViewerRegistry();
+
 // ===== 接続中の WebSocket クライアント集合 =====
 const clients = new Set<WebSocket>();
 
@@ -144,6 +149,11 @@ function broadcastRegistry(): void {
 /** 現在の使用状況スナップショットを全クライアントへ broadcast する。 */
 function broadcastUsage(): void {
   broadcast(usageStore.snapshot());
+}
+
+/** 現在の viewer 一覧を全クライアントへ broadcast する（open/close 時）。 */
+function broadcastViewers(): void {
+  broadcast({ type: "viewers", viewers: viewerRegistry.list() });
 }
 
 /**
@@ -246,6 +256,12 @@ const controlApi = createControlApi({
     }
     return mailbox.subscribe(id, timeoutMs);
   },
+  // master の open_viewer からの viewer 追加。登録後に viewers を broadcast する。
+  openViewer: async (path, title) => {
+    const rec = await viewerRegistry.open({ path, title });
+    broadcastViewers();
+    return rec;
+  },
 });
 
 const httpServer = createServer(async (req, res) => {
@@ -282,6 +298,8 @@ wss.on("connection", (ws) => {
   send(ws, { type: "registry", agents: registry.list() });
   // 接続直後に現在の使用状況スナップショットも送る（ダッシュボードの初期表示用）。
   send(ws, usageStore.snapshot());
+  // 接続直後に現在の viewer 一覧も送る（再接続時に開いている viewer を復元するため）。
+  send(ws, { type: "viewers", viewers: viewerRegistry.list() });
 
   ws.on("message", (raw) => {
     let msg: ClientMessage;
@@ -387,6 +405,11 @@ function handleClientMessage(ws: WebSocket, msg: ClientMessage): void {
     }
     case "summarize": {
       void handleSummarize(ws, msg.id);
+      break;
+    }
+    case "closeViewer": {
+      // viewer を閉じる（プロセスは持たないので kill とは別経路）。
+      if (viewerRegistry.close(msg.id)) broadcastViewers();
       break;
     }
     default: {
@@ -735,6 +758,7 @@ httpServer.listen(PORT, HOST, () => {
   console.log(`[ebi-team] spawn コマンド: ${COMMAND} ${COMMAND_ARGS.join(" ")}`.trim());
   console.log(`[ebi-team] デフォルト cwd: ${DEFAULT_CWD}`);
   console.log(`[ebi-team] idle しきい値: ${IDLE_THRESHOLD_MS}ms / registry ダンプ: ${DUMP_PATH}`);
+  console.log(`[ebi-team] viewer 許可ルート: ${viewerRegistry.getRoots().join(", ")}`);
   // 監督機能の状態のみ表示。キー値は出さない。
   console.log(`[ebi-team] ${supervisor.describeStartup()}`);
   console.log(`[ebi-team] dev フロント: http://localhost:5173 （Vite）`);
