@@ -4,6 +4,16 @@ import "@xterm/xterm/css/xterm.css";
 import type { AgentRecord, AgentStatus } from "../shared/protocol.ts";
 
 /**
+ * 粗ポインタ（タッチ端末）判定。
+ * タブ切替時の自動フォーカスでソフトキーボードが勝手に出るのを防ぐため、
+ * このような端末では受動的な focus()（setVisible 経由）を抑止する。
+ * ユーザーが能動的にペインをタップした場合（touchstart）は別途 focus() する。
+ */
+function isCoarsePointer(): boolean {
+  return typeof window !== "undefined" && window.matchMedia?.("(pointer: coarse)").matches === true;
+}
+
+/**
  * 1つの agent に対応する xterm.js ペイン。
  * キー入力は onInput、リサイズは onResize でサーバへ中継する。
  */
@@ -199,7 +209,10 @@ export class Pane {
       // レイアウト確定を待ってから fit（隠れている間はサイズ 0 になりがち）。
       requestAnimationFrame(() => {
         this.refit();
-        this.term.focus();
+        // タブ切替（表示化）に伴う自動フォーカスは、タッチ端末では抑止する。
+        // これをやらないとタブを切り替えるたびにソフトキーボードが勝手に出る。
+        // デスクトップ（精密ポインタ）では従来どおり即入力できるよう focus する。
+        if (!isCoarsePointer()) this.term.focus();
       });
     }
   }

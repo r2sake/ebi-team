@@ -608,14 +608,19 @@ button:hover { filter: brightness(1.07); }
     gap: 6px;
     padding: 6px 10px;
   }
-  .topbar h1 { font-size: 15px; }
+  /* 狭幅では space-between で振り分けられるため、order でロゴを左端・
+     ハンバーガーメニューを右端に配置（一般的なロゴ左・ナビ右の並び）。 */
+  .topbar h1 { font-size: 15px; order: 0; }
+  .sidebar-toggle { order: 1; margin-right: 0; }
   .topbar .sub { display: none; }
 
-  /* spawn フォームは折り返して収める。入力欄は iOS 自動ズーム抑止のため 16px。 */
+  /* spawn フォームは折り返して収める。入力欄は iOS 自動ズーム抑止のため 16px。
+     order: 2 で 1 行目（ロゴ＋ハンバーガー）の下＝2 行目へ回す。 */
   .controls {
     flex-wrap: wrap;
     gap: 6px;
     width: 100%;
+    order: 2;
   }
   .controls input[type="text"] { font-size: 16px; flex: 1 1 120px; min-width: 0; }
   .controls button { min-height: 40px; }
