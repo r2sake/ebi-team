@@ -22,6 +22,7 @@ import {
   mkdtempSync,
   mkdirSync,
   symlinkSync,
+  realpathSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, resolve } from "node:path";
@@ -52,6 +53,9 @@ const rootDir = join(tmpDir, "roots"); // 許可ルート
 const outsideDir = join(tmpDir, "outside"); // 許可ルート外
 mkdirSync(rootDir, { recursive: true });
 mkdirSync(outsideDir, { recursive: true });
+// macOS では /var → /private/var の symlink があるため、listDir が返す実体（realpath）基準の
+// パスと比較できるよう、正規化済みルートを控えておく。
+const realRootDir = realpathSync(rootDir);
 
 const mdPath = join(rootDir, "plan.md");
 const txtPath = join(rootDir, "note.txt");
@@ -246,12 +250,48 @@ async function unitPath() {
   else fail("close が効かない");
   if (!reg.close("viewer-999")) ok("存在しない id の close は false");
   else fail("存在しない id の close が true を返した");
+
+  // ---- listDir（ファイルピッカー用のディレクトリ列挙）----
+  const reg2 = new ViewerRegistry({ roots, maxBytes: maxBytes * 100 });
+
+  // ルート一覧（path 省略）。
+  const rootListing = await reg2.listDir();
+  if (rootListing.atRoot && rootListing.up === null && rootListing.entries.some((e) => e.path === realRootDir && e.type === "dir"))
+    ok("listDir(): ルート一覧（atRoot・up=null・ルートを dir として列挙）");
+  else fail("listDir() ルート一覧が不正: " + JSON.stringify(rootListing));
+
+  // rootDir 直下。plan.md/note.txt は eligible、secret.env は eligible=false、上へはルート一覧("")。
+  const inside = await reg2.listDir(rootDir);
+  const md = inside.entries.find((e) => e.name === "plan.md");
+  const env = inside.entries.find((e) => e.name === "secret.env");
+  if (!inside.atRoot && inside.up === "" && md?.eligible === true && env?.eligible === false)
+    ok("listDir(root): 子を列挙（.md=eligible / .env=非eligible・up=ルート一覧）");
+  else fail("listDir(root) が不正: " + JSON.stringify(inside));
+
+  // 許可ルート外のディレクトリは拒否（存在有無を漏らさない汎用エラー）。
+  try {
+    await reg2.listDir(outsideDir);
+    fail("listDir: 許可ルート外が通ってしまった");
+  } catch (e) {
+    if (e instanceof ViewerPathError && /許可ルート外/.test(e.message)) ok("listDir: 許可ルート外を拒否");
+    else fail("listDir 許可ルート外の拒否理由が不正: " + e.message);
+  }
+
+  // ファイルを listDir すると「ディレクトリではない」。
+  try {
+    await reg2.listDir(mdPath);
+    fail("listDir: ファイル指定が通ってしまった");
+  } catch (e) {
+    if (e instanceof ViewerPathError && /ディレクトリではありません/.test(e.message)) ok("listDir: ファイル指定を拒否");
+    else fail("listDir ファイル指定の拒否理由が不正: " + e.message);
+  }
 }
 
 // ========== E2E: 実サーバ ==========
 let server;
 let ws;
 const received = []; // 受信した viewers メッセージ（配列）を順に格納
+const dirListings = []; // 受信した dirListing メッセージを順に格納
 
 function startServer() {
   server = spawn("node", ["--import", "tsx", "src/server/index.ts"], {
@@ -286,6 +326,7 @@ function connectWs() {
       let msg;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
       if (msg.type === "viewers") received.push(msg.viewers);
+      if (msg.type === "dirListing") dirListings.push(msg);
     });
     ws.on("open", () => resolveWs());
     ws.on("error", reject);
@@ -298,6 +339,17 @@ async function waitViewers(pred, timeoutMs = 5000) {
   while (Date.now() - start < timeoutMs) {
     const last = received[received.length - 1];
     if (last !== undefined && pred(last)) return last;
+    await sleep(100);
+  }
+  return null;
+}
+
+/** dirListings のうち述語を満たす最新メッセージが来るまで待つ。 */
+async function waitDirListing(pred, timeoutMs = 5000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const hit = [...dirListings].reverse().find(pred);
+    if (hit) return hit;
     await sleep(100);
   }
   return null;
@@ -354,6 +406,48 @@ async function e2e() {
   const afterClose = await waitViewers((v) => v.length === 0, 3000);
   if (afterClose) ok("E4: closeViewer（WS）で viewers が空へ");
   else fail("E4: close 後に viewers が空にならない: " + JSON.stringify(received[received.length - 1]));
+
+  // ---- ユーザー主導のファイルピッカー経路（WS listDir / openViewer）----
+
+  // E5. listDir（ルート一覧）→ dirListing（atRoot・rootDir を含む）。
+  ws.send(JSON.stringify({ type: "listDir" }));
+  const rootLs = await waitDirListing((m) => m.listing?.atRoot === true, 3000);
+  if (rootLs && rootLs.listing.entries.some((e) => e.path === realRootDir))
+    ok("E5: listDir（省略）でルート一覧を受信（atRoot・rootDir 含む）");
+  else fail("E5: ルート listDir が不正: " + JSON.stringify(rootLs));
+
+  // E5b. listDir(rootDir) → plan.md が eligible、secret.env が非eligible。
+  ws.send(JSON.stringify({ type: "listDir", path: rootDir }));
+  const insideLs = await waitDirListing((m) => m.listing?.cwd === realRootDir, 3000);
+  const e5md = insideLs?.listing.entries.find((e) => e.name === "plan.md");
+  const e5env = insideLs?.listing.entries.find((e) => e.name === "secret.env");
+  if (e5md?.eligible === true && e5env?.eligible === false)
+    ok("E5b: listDir(root) で .md=eligible / .env=非eligible");
+  else fail("E5b: listDir(root) が不正: " + JSON.stringify(insideLs));
+
+  // E5c. 許可ルート外の listDir → error（存在有無を漏らさない）。
+  ws.send(JSON.stringify({ type: "listDir", path: outsidePath }));
+  const errLs = await waitDirListing((m) => typeof m.error === "string", 3000);
+  if (errLs && /許可ルート外|アクセスできません/.test(errLs.error))
+    ok("E5c: 許可ルート外の listDir は error（汎用理由）");
+  else fail("E5c: 許可ルート外 listDir が error にならない: " + JSON.stringify(errLs));
+
+  // E6. ユーザー openViewer（WS・正常）→ viewers broadcast に反映。
+  ws.send(JSON.stringify({ type: "openViewer", path: txtPath, title: "ユーザーが開いた" }));
+  const afterUserOpen = await waitViewers(
+    (v) => v.some((x) => x.title === "ユーザーが開いた" && x.format === "txt"),
+    3000,
+  );
+  if (afterUserOpen) ok("E6: ユーザー openViewer（WS）で viewers に反映");
+  else fail("E6: ユーザー openViewer が反映されない: " + JSON.stringify(received[received.length - 1]));
+
+  // E6b. ユーザー openViewer（許可ルート外）→ notice（id=viewer-open）で失敗、viewers は増えない。
+  const beforeCount = (received[received.length - 1] ?? []).length;
+  ws.send(JSON.stringify({ type: "openViewer", path: outsidePath }));
+  await sleep(600);
+  const nowCount = (received[received.length - 1] ?? []).length;
+  if (nowCount === beforeCount) ok("E6b: 許可ルート外の openViewer は viewers を増やさない");
+  else fail("E6b: 許可ルート外の openViewer が viewers を増やした: " + JSON.stringify(received[received.length - 1]));
 }
 
 async function finish() {

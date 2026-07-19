@@ -527,6 +527,34 @@ function handleClientMessage(ws: WebSocket, msg: ClientMessage): void {
       if (viewerRegistry.close(msg.id)) broadcastViewers();
       break;
     }
+    case "listDir": {
+      // ユーザーが自分でファイルを開くためのファイルピッカーのディレクトリ列挙。
+      // 許可ルート配下に限定して検証（ルート外・symlink 脱出・非ディレクトリは拒否）。
+      void (async () => {
+        try {
+          const listing = await viewerRegistry.listDir(msg.path);
+          send(ws, { type: "dirListing", listing });
+        } catch (err) {
+          // ルート外の存在有無を漏らさない汎用メッセージ（viewerRegistry 側で整形済み）。
+          send(ws, { type: "dirListing", error: (err as Error).message });
+        }
+      })();
+      break;
+    }
+    case "openViewer": {
+      // ユーザー操作による viewer オープン。master の open_viewer と同一の
+      // ViewerRegistry.open 検証を通す（許可ルート/拡張子/サイズ/symlink 脱出）。
+      // 成功時は viewers を broadcast（既存の自動フォーカス経路に載る）。失敗は notice。
+      void (async () => {
+        try {
+          await viewerRegistry.open({ path: msg.path, title: msg.title });
+          broadcastViewers();
+        } catch (err) {
+          send(ws, { type: "notice", id: "viewer-open", text: `ファイルを開けません: ${(err as Error).message}` });
+        }
+      })();
+      break;
+    }
     default: {
       send(ws, { type: "error", text: "未知の message type です" });
     }

@@ -1,6 +1,7 @@
 import { Pane } from "./pane.ts";
 import { Dashboard } from "./dashboard.ts";
 import { Viewer } from "./viewer.ts";
+import { FilePicker } from "./filePicker.ts";
 import {
   type ClientMessage,
   type ServerMessage,
@@ -48,6 +49,14 @@ const dashboard = new Dashboard(document.getElementById("dashboard") as HTMLElem
 // ✗ 押下で closeViewer をサーバへ送る。
 const viewer = new Viewer(document.getElementById("viewer") as HTMLElement, (id) =>
   sendMsg({ type: "closeViewer", id }),
+);
+
+// ファイルピッカー（ユーザーが AI を介さず自分で md/txt を開く導線）。
+// ディレクトリ列挙・オープンはすべて WebSocket（listDir / openViewer）で行う。
+const filePicker = new FilePicker(
+  document.getElementById("file-picker") as HTMLElement,
+  (path) => sendMsg({ type: "listDir", path }),
+  (path, title) => sendMsg({ type: "openViewer", path, title }),
 );
 
 // 表示順: dashboard → master → supervisor → dynamic。同種は元の順を維持（Array.sort は V8 で安定）。
@@ -166,6 +175,8 @@ function handleServerMessage(msg: ServerMessage): void {
     case "notice":
       // 要約待ちだった agent への notice なら、要約ボタンのローディングを解除する。
       if (msg.id === summarizingId) clearSummarizing();
+      // ファイルピッカー由来のオープン失敗（id="viewer-open"）はモーダル内にも表示する。
+      if (msg.id === "viewer-open") filePicker.notifyOpenError(msg.text);
       addNotice(msg.id, msg.text);
       break;
     case "error":
@@ -194,7 +205,9 @@ function handleServerMessage(msg: ServerMessage): void {
       viewers = msg.viewers;
       const added = viewers.filter((v) => !prevIds.has(v.id));
       if (added.length > 0) {
-        // 新規 open は master の「これを見せる」明示操作 → その viewer へ自動フォーカスする。
+        // ユーザーがファイルピッカーで開いた場合は、成功とみなしモーダルを閉じる。
+        filePicker.notifyOpened();
+        // 新規 open は「これを見せる」明示操作 → その viewer へ自動フォーカスする。
         // （エビ spawn の自動追従抑制=C とは別扱い。明示表示なので追従してよい）
         setActive(added[added.length - 1].id);
         break;
@@ -209,6 +222,11 @@ function handleServerMessage(msg: ServerMessage): void {
       renderRegistry();
       break;
     }
+    case "dirListing":
+      // ファイルピッカーのディレクトリ列挙応答。error なら理由をモーダル内に表示。
+      if (msg.error) filePicker.setError(msg.error);
+      else if (msg.listing) filePicker.setListing(msg.listing);
+      break;
   }
 }
 
@@ -341,6 +359,19 @@ function renderRegistry(): void {
     const td = document.createElement("td");
     td.colSpan = 6;
     td.textContent = "📊 ダッシュボード";
+    tr.appendChild(td);
+    registryBody.appendChild(tr);
+  }
+
+  // 「📂 ファイルを開く」合成エントリ。クリックでファイルピッカーを開く（AI を介さない）。
+  {
+    const tr = document.createElement("tr");
+    tr.className = "agent-row open-file-row";
+    tr.title = "許可ルート配下の md/txt を自分で開く";
+    tr.addEventListener("click", () => filePicker.open());
+    const td = document.createElement("td");
+    td.colSpan = 6;
+    td.textContent = "📂 ファイルを開く";
     tr.appendChild(td);
     registryBody.appendChild(tr);
   }

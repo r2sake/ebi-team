@@ -56,6 +56,38 @@ export interface ViewerRecord {
   content: string;
 }
 
+/**
+ * ファイルピッカー（ユーザーが自分で md を開くための簡易ブラウザ）1 エントリ分。
+ * 許可ルート配下のディレクトリ 1 件をサーバが列挙して返す。
+ */
+export interface DirEntry {
+  /** 表示名（ファイル/ディレクトリ名。ルート階層ではルートの絶対パスそのもの）。 */
+  name: string;
+  /** このエントリの絶対パス（ディレクトリなら降りる先、ファイルなら開く対象）。 */
+  path: string;
+  /** 種別。 */
+  type: "dir" | "file";
+  /** ファイルのとき、viewer で開ける拡張子（.md/.markdown/.txt）か。ディレクトリでは undefined。 */
+  eligible?: boolean;
+}
+
+/**
+ * ファイルピッカーのディレクトリ一覧レスポンス。
+ * すべて許可ルート配下に制限され、ルート外の存在有無は漏らさない（サーバ側で検証済み）。
+ */
+export interface DirListing {
+  /** true のとき「許可ルートそのものの一覧」（最上位）を表す。 */
+  atRoot: boolean;
+  /** いま列挙しているディレクトリの絶対パス。atRoot のときは空文字。 */
+  cwd: string;
+  /** 「上へ」の遷移先。null=上へ不可、""=ルート一覧へ、それ以外=親ディレクトリの絶対パス。 */
+  up: string | null;
+  /** 子エントリ（ディレクトリ→ファイルの順・名前昇順）。 */
+  entries: DirEntry[];
+  /** 許可ルート一覧（パンくず等の文脈表示用）。 */
+  roots: string[];
+}
+
 /** registry に保持する agent 1件分のスキーマ。 */
 export interface AgentRecord {
   id: string;
@@ -174,6 +206,32 @@ export interface CloseViewerMessage {
   id: string;
 }
 
+/**
+ * ユーザーが自分でファイルを開くためのファイルピッカーのディレクトリ列挙要求
+ * （クライアント → サーバ）。path 省略時は許可ルート一覧を返す。
+ * サーバは許可ルート配下に限定して検証し、結果を `dirListing` で返す
+ * （AI を介さず UI 操作だけで開けるようにするための経路）。
+ */
+export interface ListDirMessage {
+  type: "listDir";
+  /** 列挙するディレクトリの絶対パス。省略・空なら許可ルート一覧。 */
+  path?: string;
+}
+
+/**
+ * ユーザー操作による viewer オープン要求（クライアント → サーバ）。
+ * master の open_viewer（MCP → POST /control/open-viewer）と同一の
+ * ViewerRegistry.open 検証（許可ルート/拡張子/サイズ/シンボリックリンク脱出）を通す。
+ * 成功時はサーバが `viewers` を broadcast する。失敗時は `notice`（id="viewer-open"）。
+ */
+export interface OpenViewerMessage {
+  type: "openViewer";
+  /** 開くファイルの絶対パス。 */
+  path: string;
+  /** 表示タイトル（省略時はファイル名）。 */
+  title?: string;
+}
+
 export type ClientMessage =
   | SpawnMessage
   | KillMessage
@@ -184,7 +242,9 @@ export type ClientMessage =
   | SubscribeMessage
   | UnsubscribeMessage
   | SummarizeMessage
-  | CloseViewerMessage;
+  | CloseViewerMessage
+  | ListDirMessage
+  | OpenViewerMessage;
 
 // ===== サーバ → クライアント =====
 
@@ -320,6 +380,17 @@ export interface ViewersMessage {
   viewers: ViewerRecord[];
 }
 
+/**
+ * ファイルピッカーのディレクトリ列挙結果（サーバ → クライアント）。
+ * `listDir` 要求への応答。成功時は listing、検証失敗（許可ルート外/不存在/非ディレクトリ）
+ * は error に理由を入れる（ルート外の存在有無は漏らさない汎用メッセージ）。
+ */
+export interface DirListingMessage {
+  type: "dirListing";
+  listing?: DirListing;
+  error?: string;
+}
+
 export type ServerMessage =
   | RegistryMessage
   | OutputMessage
@@ -332,4 +403,5 @@ export type ServerMessage =
   | SummaryMessage
   | CapabilitiesMessage
   | UsageMessage
-  | ViewersMessage;
+  | ViewersMessage
+  | DirListingMessage;
