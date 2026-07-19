@@ -1,3 +1,5 @@
+// .env をリポジトリルートから最初に読み込む（他 import が module-level で process.env を読む前に適用）。
+import { loadedEnvKeys } from "./env.ts";
 import { createServer, type IncomingMessage } from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -895,6 +897,10 @@ await loadAndApplyDevChannelsAllowlist();
 // ===== 起動 / 終了処理 =====
 httpServer.listen(PORT, HOST, () => {
   console.log(`[ebi-team] サーバ起動: http://${HOST}:${PORT}  (WS: ws://${HOST}:${PORT}/ws)`);
+  if (loadedEnvKeys.length > 0) {
+    // キー名のみ表示（値・トークンは出さない）。
+    console.log(`[ebi-team] .env 読み込み: ${loadedEnvKeys.length}件 (${loadedEnvKeys.join(", ")})`);
+  }
   console.log(`[ebi-team] 制御API: http://${HOST}:${PORT}/control/*  (loopback 無認証 / 非loopbackはトークン必須)`);
   if (authConfig.token) {
     console.log(`[ebi-team] 認証: EBI_AUTH_TOKEN 設定あり（非 loopback はトークン必須・/login で入力）`);

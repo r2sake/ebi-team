@@ -5,3 +5,5 @@ dist/
 .DS_Store
 ebi-team.config.json
 .claude/
+.env
+!.env.sample

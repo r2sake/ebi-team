@@ -39,16 +39,31 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 npm run build
 ```
 
-起動するときに、環境変数を 2 つ付けます。
+設定は **リポジトリルートの `.env` ファイル**に書きます。まず雛形をコピー:
+
+```bash
+cp .env.sample .env
+```
+
+`.env` をエディタで開き、次の 2 つの行のコメント（先頭の `#`）を外して値を入れます。
 
 - `EBI_AUTH_TOKEN` … さっき決めたトークン
 - `EBI_HOST` … この Mac の **Tailscale の IP**（`100.x.y.z`）。Tailscale アイコンから確認できます。
 
+```dotenv
+EBI_AUTH_TOKEN=ここにさっきのトークン
+EBI_HOST=100.x.y.z
+```
+
+あとは起動するだけ:
+
 ```bash
-EBI_AUTH_TOKEN=ここにさっきのトークン \
-EBI_HOST=100.x.y.z \
 npm start
 ```
+
+> **環境変数を直接付けても動きます。** `.env` を使わず
+> `EBI_AUTH_TOKEN=... EBI_HOST=100.x.y.z npm start` のように一行で渡してもOKです
+> （その場合、直接指定した値が `.env` より優先されます）。
 
 > **なぜ `EBI_HOST` に Tailscale の IP を入れるの？**
 > こうすると「Tailscale の道からしか受け付けない」状態になり、家の Wi-Fi の他の機器からも直接は見えなくなります（いちばん安全）。とりあえず動かしたいだけなら `EBI_HOST=0.0.0.0` でも可ですが、その場合でもトークンで守られます。

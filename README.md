@@ -28,16 +28,23 @@ npm install
 cp ebi-team.config.example.json ebi-team.config.json
 # 自分用の人格・エージェント構成をここに書きます（後述）
 
+cp .env.sample .env
+# ポート・認証トークン・bind ホスト等を設定（任意・後述）
+
 npm run dev
 ```
 
 ブラウザで **http://localhost:5173** を開くと Web UI が表示されます。
 
-別ディレクトリを作業対象にしたい場合は、環境変数でエビの既定 cwd を指定できます。
+### 環境変数（`.env`）
+
+各種設定は環境変数で行います。リポジトリルートに `.env` を置くと **起動時に自動読み込み**されます（`.env.sample` に全キーの用途・例・既定値をコメント付きで記載）。まずは雛形をコピー:
 
 ```bash
-EBI_DEFAULT_CWD=/path/to/your/project npm run dev
+cp .env.sample .env
 ```
+
+`.env` は `.gitignore` 対象です（`.env.sample` は追跡対象）。実際の環境変数が `.env` より優先されるため、一時的な上書きは `EBI_DEFAULT_CWD=/path/to/project npm run dev` のように直接渡せます。スマホ / LAN外からのアクセス設定は [docs/mobile-setup.md](docs/mobile-setup.md) を参照。
 
 ### 本番ビルドで動かす場合
 
