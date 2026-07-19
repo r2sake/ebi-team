@@ -10,10 +10,10 @@
 //   - realpath でシンボリックリンク脱出を防止（実体が許可ルート配下にあること）。
 //   - 拡張子は .md / .markdown / .txt に限定、サイズ上限あり、書き込み口は作らない。
 
-import { readFile, realpath, stat } from "node:fs/promises";
+import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, resolve, extname, basename, sep } from "node:path";
-import type { ViewerRecord, ViewerFormat } from "../shared/protocol.ts";
+import { isAbsolute, resolve, dirname, extname, basename, join, sep } from "node:path";
+import type { ViewerRecord, ViewerFormat, DirEntry, DirListing } from "../shared/protocol.ts";
 
 /** viewer に許可する拡張子とレンダリング形式の対応。 */
 const ALLOWED_EXT: Record<string, ViewerFormat> = {
@@ -63,6 +63,27 @@ export interface ViewerRegistryOptions {
 export class ViewerPathError extends Error {}
 
 /**
+ * roots の各要素を realpath 解決して返す（存在しないルートは黙って除外）。
+ * シンボリックリンク脱出防止のため、包含判定は必ず実体（realpath）基準で行う。
+ */
+async function resolveRealRoots(roots: string[]): Promise<string[]> {
+  const out: string[] = [];
+  for (const root of roots) {
+    try {
+      out.push(await realpath(root));
+    } catch {
+      // 存在しないルートはスキップ。
+    }
+  }
+  return out;
+}
+
+/** realPath が realRoots のいずれかの配下（またはルート自身）か。 */
+function isWithinRoots(realPath: string, realRoots: string[]): boolean {
+  return realRoots.some((r) => realPath === r || realPath.startsWith(r + sep));
+}
+
+/**
  * viewer 用にパスを検証し、実パス・形式・サイズを確定して返す。
  * DOM/ファイル読み込みの前段（純粋にパス安全性のみ）を独立させ、単体テストしやすくする。
  * 失敗時は ViewerPathError を throw する。
@@ -97,20 +118,8 @@ export async function resolveViewerPath(
   }
 
   // 許可ルート配下か（各ルートの realpath 基準で包含判定）。
-  let allowed = false;
-  for (const root of roots) {
-    let realRoot: string;
-    try {
-      realRoot = await realpath(root);
-    } catch {
-      continue; // 存在しないルートはスキップ。
-    }
-    if (realPath === realRoot || realPath.startsWith(realRoot + sep)) {
-      allowed = true;
-      break;
-    }
-  }
-  if (!allowed) {
+  const realRoots = await resolveRealRoots(roots);
+  if (!isWithinRoots(realPath, realRoots)) {
     throw new ViewerPathError(
       `許可ルート外のパスです: ${realPath}（許可ルート: ${roots.join(", ") || "(なし)"}。EBI_VIEWER_ROOTS で設定）`,
     );
@@ -166,6 +175,77 @@ export class ViewerRegistry {
     const rec: ViewerRecord = { id, path: absPath, title, format, content };
     this.viewers.set(id, rec);
     return rec;
+  }
+
+  /**
+   * ファイルピッカー用にディレクトリを列挙する（ユーザーが AI を介さず自分で md を開くための経路）。
+   * rawPath 省略時は「許可ルートそのものの一覧」を返す。指定時は許可ルート配下に限定して検証し、
+   * 実体（realpath）基準でルート外・シンボリックリンク脱出・非ディレクトリを拒否する。
+   * ルート外の存在有無は漏らさない（検証失敗は汎用の ViewerPathError）。
+   */
+  async listDir(rawPath?: string): Promise<DirListing> {
+    const realRoots = await resolveRealRoots(this.roots);
+
+    // ---- ルート一覧（最上位）----
+    // rawPath 未指定・空なら、許可ルートのうち実在するものを「ディレクトリ」として列挙する。
+    if (typeof rawPath !== "string" || rawPath.trim() === "") {
+      const entries: DirEntry[] = realRoots.map((r) => ({ name: r, path: r, type: "dir" }));
+      return { atRoot: true, cwd: "", up: null, entries, roots: [...this.roots] };
+    }
+
+    // ---- 指定ディレクトリの列挙 ----
+    const expanded = expandHome(rawPath.trim());
+    const absPath = isAbsolute(expanded) ? resolve(expanded) : resolve(process.cwd(), expanded);
+
+    // 実体解決（存在しない・アクセス不可はルート外と同じ汎用エラーにして情報を漏らさない）。
+    let realPath: string;
+    try {
+      realPath = await realpath(absPath);
+    } catch {
+      throw new ViewerPathError("ディレクトリにアクセスできません（許可ルート配下のみ閲覧できます）");
+    }
+    if (!isWithinRoots(realPath, realRoots)) {
+      throw new ViewerPathError("許可ルート外のディレクトリです（EBI_VIEWER_ROOTS 配下のみ閲覧できます）");
+    }
+    const dirStat = await stat(realPath);
+    if (!dirStat.isDirectory()) {
+      throw new ViewerPathError("ディレクトリではありません");
+    }
+
+    // 子エントリを列挙。symlink は実体を stat して種別判定（壊れリンク等は静かに除外）。
+    // 表示のみで、実際の降下/オープン時に listDir/open が realpath 基準で再検証するため安全。
+    const dirents = await readdir(realPath, { withFileTypes: true });
+    const dirs: DirEntry[] = [];
+    const files: DirEntry[] = [];
+    for (const d of dirents) {
+      const childPath = join(realPath, d.name);
+      let isDir = d.isDirectory();
+      let isFile = d.isFile();
+      if (d.isSymbolicLink()) {
+        try {
+          const st = await stat(childPath); // symlink 先を解決。
+          isDir = st.isDirectory();
+          isFile = st.isFile();
+        } catch {
+          continue; // 壊れた symlink はスキップ。
+        }
+      }
+      if (isDir) {
+        dirs.push({ name: d.name, path: childPath, type: "dir" });
+      } else if (isFile) {
+        const ext = extname(d.name).toLowerCase();
+        files.push({ name: d.name, path: childPath, type: "file", eligible: Boolean(ALLOWED_EXT[ext]) });
+      }
+    }
+    const byName = (a: DirEntry, b: DirEntry) => a.name.localeCompare(b.name, "ja");
+    dirs.sort(byName);
+    files.sort(byName);
+
+    // 「上へ」の遷移先: ルート自身なら "" (ルート一覧へ)、それ以外は親ディレクトリ。
+    const isRootItself = realRoots.some((r) => r === realPath);
+    const up = isRootItself ? "" : dirname(realPath);
+
+    return { atRoot: false, cwd: realPath, up, entries: [...dirs, ...files], roots: [...this.roots] };
   }
 
   /** viewer を閉じる。存在すれば true。 */
