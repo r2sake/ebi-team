@@ -25,6 +25,11 @@ const summaryPanel = document.getElementById("summary-panel") as HTMLElement;
 const summaryAgent = document.getElementById("summary-agent") as HTMLElement;
 const summaryBody = document.getElementById("summary-body") as HTMLElement;
 const summaryClose = document.getElementById("summary-close") as HTMLButtonElement;
+// スマホ用: サイドバー（registry ドロワー）と入力補助バー。
+const sidebar = document.getElementById("sidebar") as HTMLElement;
+const sidebarToggle = document.getElementById("sidebar-toggle") as HTMLButtonElement;
+const sidebarBackdrop = document.getElementById("sidebar-backdrop") as HTMLElement;
+const keyAssist = document.getElementById("key-assist") as HTMLElement;
 
 // ===== 状態 =====
 const panes = new Map<string, Pane>();
@@ -230,6 +235,11 @@ function syncPanes(): void {
         // 監督有効時のみ要約コールバックを渡す（OFF 時はボタン自体を出さない）。
         supervisorEnabled ? (id) => requestSummary(id) : undefined,
       );
+      // Ctrl 武装状態の変化を入力補助バーの Ctrl ボタンのハイライトに反映する
+      //（active なペインのときだけ）。
+      pane.onCtrlArmedChange = (armed) => {
+        if (activeId === pane.id) updateCtrlIndicator(armed);
+      };
       pane.setStatus(rec.status);
       pane.setVisible(false);
       panes.set(rec.id, pane);
@@ -280,6 +290,8 @@ function removePane(id: string): void {
 // ===== 選択（master-detail の切り替え）=====
 function setActive(id: string | null): void {
   activeId = id;
+  // ペイン切替時は入力補助バーの Ctrl ハイライトをリセットする（武装は各ペイン固有）。
+  updateCtrlIndicator(false);
   applyVisibility();
   renderRegistry();
   renderEmpty();
@@ -524,8 +536,62 @@ spawnBtn.addEventListener("click", () => {
 
 // ウィンドウリサイズ時は、表示中の agent だけ fit&resize すれば良い
 // （隠れているものは表示に切り替えた瞬間に fit される）。
+// スマホの画面回転・ソフトキーボード出現も resize として届くため、ここで refit する。
 window.addEventListener("resize", () => {
   if (activeId) panes.get(activeId)?.refit();
+});
+
+// ===== スマホ: サイドバー（registry ドロワー）開閉 =====
+function setDrawer(open: boolean): void {
+  sidebar.classList.toggle("open", open);
+  sidebarBackdrop.hidden = !open;
+}
+sidebarToggle.addEventListener("click", () => setDrawer(!sidebar.classList.contains("open")));
+sidebarBackdrop.addEventListener("click", () => setDrawer(false));
+// registry から選択したら（狭幅では）ドロワーを閉じてメインへ戻す。
+registryBody.addEventListener("click", () => {
+  if (window.matchMedia("(max-width: 768px)").matches) setDrawer(false);
+});
+
+// ===== スマホ: 入力補助バー（Esc/Tab/矢印/Ctrl/^C を選択中ペインへ送出）=====
+// 狭幅のときだけ表示する。広幅では物理キーボードがある前提で隠す。
+const KEY_SEQ: Record<string, string> = {
+  esc: "\x1b",
+  tab: "\t",
+  up: "\x1b[A",
+  down: "\x1b[B",
+  left: "\x1b[D",
+  right: "\x1b[C",
+  "c-c": "\x03",
+};
+const ctrlBtn = keyAssist.querySelector('[data-key="ctrl"]') as HTMLButtonElement | null;
+
+/** Ctrl ボタンのハイライト（武装中表示）を更新する。 */
+function updateCtrlIndicator(armed: boolean): void {
+  ctrlBtn?.classList.toggle("armed", armed);
+}
+
+/** 狭幅かどうかで入力補助バーの表示を切り替える。 */
+function syncKeyAssistVisibility(): void {
+  keyAssist.hidden = !window.matchMedia("(max-width: 768px)").matches;
+}
+syncKeyAssistVisibility();
+window.addEventListener("resize", syncKeyAssistVisibility);
+
+keyAssist.addEventListener("click", (ev) => {
+  const btn = (ev.target as HTMLElement).closest(".ka-btn") as HTMLElement | null;
+  if (!btn) return;
+  const key = btn.dataset.key;
+  if (!key) return;
+  // 対象は「選択中の xterm ペイン」のみ（ダッシュボード/viewer 表示時は無効）。
+  const pane = activeId ? panes.get(activeId) : undefined;
+  if (!pane) return;
+  if (key === "ctrl") {
+    pane.toggleCtrl();
+    return;
+  }
+  const seq = KEY_SEQ[key];
+  if (seq) pane.sendKey(seq);
 });
 
 connect();
