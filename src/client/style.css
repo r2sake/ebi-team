@@ -547,6 +547,125 @@ button:hover { filter: brightness(1.07); }
 }
 .registry tr.viewer-row .viewer-row-close:hover { color: #e05b5b; }
 
+/* ハンバーガー（サイドバー開閉）ボタン。広幅では非表示、狭幅で表示。 */
+.sidebar-toggle {
+  display: none;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 16px;
+  line-height: 1;
+  margin-right: 8px;
+}
+
+/* ドロワー展開時の背景（狭幅のみ）。 */
+.sidebar-backdrop {
+  display: none;
+}
+
+/* スマホ用入力補助バー（既定は非表示。狭幅時に main.ts が hidden を外す）。 */
+.key-assist {
+  display: none;
+}
+.key-assist:not([hidden]) {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  flex: 0 0 auto;
+  padding: 6px 8px;
+  padding-bottom: max(6px, env(safe-area-inset-bottom));
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  -webkit-overflow-scrolling: touch;
+}
+.key-assist .ka-btn {
+  flex: 0 0 auto;
+  min-width: 44px;
+  min-height: 40px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 6px 12px;
+}
+.key-assist .ka-btn:active { filter: brightness(1.3); }
+/* Ctrl 武装中（次の1打鍵を Ctrl 修飾）のハイライト。 */
+.key-assist .ka-btn.ka-ctrl.armed {
+  background: var(--accent);
+  color: #21130c;
+}
+
+/* ===== 狭幅（スマホ）レイアウト ===== */
+@media (max-width: 768px) {
+  .sidebar-toggle { display: inline-block; }
+
+  .topbar {
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 6px 10px;
+  }
+  /* 狭幅では space-between で振り分けられるため、order でロゴを左端・
+     ハンバーガーメニューを右端に配置（一般的なロゴ左・ナビ右の並び）。 */
+  .topbar h1 { font-size: 15px; order: 0; }
+  .sidebar-toggle { order: 1; margin-right: 0; }
+  .topbar .sub { display: none; }
+
+  /* spawn フォームは折り返して収める。入力欄は iOS 自動ズーム抑止のため 16px。
+     order: 2 で 1 行目（ロゴ＋ハンバーガー）の下＝2 行目へ回す。 */
+  .controls {
+    flex-wrap: wrap;
+    gap: 6px;
+    width: 100%;
+    order: 2;
+  }
+  .controls input[type="text"] { font-size: 16px; flex: 1 1 120px; min-width: 0; }
+  .controls button { min-height: 40px; }
+  .conn { margin-left: auto; }
+
+  /* 2 カラム → メインを全幅に。サイドバーはドロワー化。 */
+  .layout { grid-template-columns: 1fr; }
+  .stage { padding: 4px; }
+
+  /* サイドバーを画面右からスライドインするドロワーにする。 */
+  .sidebar {
+    position: fixed;
+    top: 0;
+    right: 0;
+    z-index: 40;
+    width: min(86vw, 360px);
+    height: 100%;
+    border-left: 1px solid var(--border);
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.5);
+    transform: translateX(100%);
+    transition: transform 0.22s ease;
+    padding-top: max(10px, env(safe-area-inset-top));
+  }
+  .sidebar.open { transform: translateX(0); }
+
+  .sidebar-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 30;
+    background: rgba(0, 0, 0, 0.5);
+  }
+  .sidebar-backdrop[hidden] { display: none; }
+
+  /* registry のタップ領域を拡大（行・トグル・✕ を押しやすく）。 */
+  .registry th, .registry td { padding: 8px 6px; max-width: 40vw; }
+  .registry table { font-size: 13px; }
+  .mode-toggle { min-height: 32px; padding: 5px 8px; }
+  .registry tr.viewer-row .viewer-row-close,
+  .pane-head .kill { min-width: 36px; min-height: 32px; }
+
+  /* xterm はタッチで縦スクロールできるように。ピンチズームの誤爆を軽減。 */
+  .pane-term { touch-action: pan-y; padding: 2px; }
+}
+
 /* 空状態（未選択 / 全 agent 終了）。stage 中央に表示。 */
 .empty {
   flex: 1 1 auto;

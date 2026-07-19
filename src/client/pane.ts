@@ -4,6 +4,16 @@ import "@xterm/xterm/css/xterm.css";
 import type { AgentRecord, AgentStatus } from "../shared/protocol.ts";
 
 /**
+ * 粗ポインタ（タッチ端末）判定。
+ * タブ切替時の自動フォーカスでソフトキーボードが勝手に出るのを防ぐため、
+ * このような端末では受動的な focus()（setVisible 経由）を抑止する。
+ * ユーザーが能動的にペインをタップした場合（touchstart）は別途 focus() する。
+ */
+function isCoarsePointer(): boolean {
+  return typeof window !== "undefined" && window.matchMedia?.("(pointer: coarse)").matches === true;
+}
+
+/**
  * 1つの agent に対応する xterm.js ペイン。
  * キー入力は onInput、リサイズは onResize でサーバへ中継する。
  */
@@ -16,6 +26,10 @@ export class Pane {
   /** 監督・要約ボタン（既定 OFF のときは生成しない）。 */
   private readonly summarizeBtn: HTMLButtonElement | null;
   private ro: ResizeObserver | null = null;
+  // Ctrl 武装フラグ（入力補助バーの Ctrl ボタン）。次の 1 打鍵を Ctrl 修飾に変換する。
+  private ctrlArmed = false;
+  // Ctrl 武装状態が変わったときの通知（入力補助バーのハイライト用）。
+  onCtrlArmedChange: ((armed: boolean) => void) | null = null;
 
   constructor(
     record: AgentRecord,
@@ -89,6 +103,16 @@ export class Pane {
 
     this.el.append(head, termHost);
     this.el.addEventListener("mousedown", () => this.onFocus(this.id));
+    // タッチ端末: タップで選択＆ソフトキーボードを出すため term.focus() も直接呼ぶ
+    // （既に active なペインは setVisible 経由の focus が走らないため、ここで補う）。
+    this.el.addEventListener(
+      "touchstart",
+      () => {
+        this.onFocus(this.id);
+        this.term.focus();
+      },
+      { passive: true },
+    );
 
     this.term = new Terminal({
       cursorBlink: true,
@@ -102,7 +126,15 @@ export class Pane {
     this.term.open(termHost);
 
     // ペインへの生キー入力をサーバへ。
-    this.term.onData((data) => this.onInput(this.id, data));
+    // Ctrl 武装中は、次の 1 打鍵（英字）を Ctrl 修飾（0x01–0x1a）に変換して送る。
+    this.term.onData((data) => {
+      if (this.ctrlArmed && data.length === 1) {
+        const code = data.toLowerCase().charCodeAt(0);
+        if (code >= 97 && code <= 122) data = String.fromCharCode(code & 0x1f);
+        this.setCtrlArmed(false);
+      }
+      this.onInput(this.id, data);
+    });
 
     // 要素サイズ変化に追従して fit + PTY resize 連動。
     this.ro = new ResizeObserver(() => this.refit());
@@ -128,6 +160,33 @@ export class Pane {
     this.term.write(data);
   }
 
+  /** ペインの xterm にフォーカスする（入力補助バー操作後の再フォーカス等）。 */
+  focus(): void {
+    this.term.focus();
+  }
+
+  /**
+   * 入力補助バーからの制御シーケンス送出（Esc/Tab/矢印/^C 等）。
+   * PTY へ直接書き込み、送出後に xterm を再フォーカスしてソフトキーボードを保つ。
+   */
+  sendKey(seq: string): void {
+    this.onInput(this.id, seq);
+    this.term.focus();
+  }
+
+  /** Ctrl 武装をトグルする（入力補助バーの Ctrl ボタン）。 */
+  toggleCtrl(): void {
+    this.setCtrlArmed(!this.ctrlArmed);
+    this.term.focus();
+  }
+
+  /** Ctrl 武装状態を設定し、変化を通知する。 */
+  private setCtrlArmed(armed: boolean): void {
+    if (this.ctrlArmed === armed) return;
+    this.ctrlArmed = armed;
+    this.onCtrlArmedChange?.(armed);
+  }
+
   /**
    * 再アタッチ用スクロールバックを書き戻して画面を復元する。
    * 既存内容を reset でクリアしてから write することで、
@@ -150,7 +209,10 @@ export class Pane {
       // レイアウト確定を待ってから fit（隠れている間はサイズ 0 になりがち）。
       requestAnimationFrame(() => {
         this.refit();
-        this.term.focus();
+        // タブ切替（表示化）に伴う自動フォーカスは、タッチ端末では抑止する。
+        // これをやらないとタブを切り替えるたびにソフトキーボードが勝手に出る。
+        // デスクトップ（精密ポインタ）では従来どおり即入力できるよう focus する。
+        if (!isCoarsePointer()) this.term.focus();
       });
     }
   }

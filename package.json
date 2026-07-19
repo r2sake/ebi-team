@@ -13,6 +13,8 @@
     "prestart": "npm run gen:master-mcp",
     "start": "EBI_IDLE_NOTIFY=off node dist/server/server/index.js",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.server.json",
+    "test:unit": "node --import tsx --test test/*.test.ts",
+    "e2e:minaebi": "node scripts/e2e-fixed-minaebi.mjs",
     "gen:master-mcp": "node scripts/gen-master-mcp.mjs",
     "gen:master-mcp:dev": "node scripts/gen-master-mcp.mjs --dev",
     "e2e:control": "node scripts/e2e-control-mcp.mjs",

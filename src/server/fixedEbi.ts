@@ -145,6 +145,7 @@ export class FixedEbiManager {
         kind: s.spec.kind,
         pinned: true,
         launch,
+        notifySubscribe: s.spec.notifySubscribe,
       });
       console.log(
         `[fixed-ebi] 起動: ${s.spec.id} (${s.spec.kind}) ` +

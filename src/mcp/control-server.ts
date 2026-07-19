@@ -21,6 +21,7 @@
 // 注意: このプロセス自体は claude を起動しない。あくまで制御API を呼ぶブリッジ。
 
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -53,6 +54,19 @@ try {
  * env `EBI_SUBSCRIBE_TIMEOUT_MS` で調整可。
  */
 const SUBSCRIBE_TIMEOUT_MS = Number(process.env.EBI_SUBSCRIBE_TIMEOUT_MS) || 25000;
+
+/**
+ * notification（mailbox 購読）受信を有効にするか（既定 on）。
+ * env `EBI_NOTIFY_SUBSCRIBE` が "off"/"0"/"false" のとき無効化し、subscribeLoop を回さない。
+ *
+ * 用途: 外部チャンネル待機セッション（minaebi 等）は自セッションに ebi-control channel を
+ * 登録しないため、notification 注入は harness に黙って捨てられる（既知トラップ）。この経路を
+ * 使わず「受信は PTY 注入に固定・送信は reply_to_master(HTTP)」で運用するために購読自体を止める。
+ * 純関数として切り出してユニットテスト可能にしている。
+ */
+export function isNotifySubscribeEnabled(raw: string | undefined): boolean {
+  return !["off", "0", "false"].includes((raw ?? "on").toLowerCase());
+}
 
 /** 自分の agent id（index.ts が spawn 時に全経路で launch env へ注入する）。 */
 const EBI_ID = process.env.EBI_ID ?? null;
@@ -397,6 +411,13 @@ server.tool(
  * （reply_to_master 等は元々 master ロールでは出さないため実害は無い）。
  */
 async function subscribeLoop(): Promise<void> {
+  if (!isNotifySubscribeEnabled(process.env.EBI_NOTIFY_SUBSCRIBE)) {
+    console.error(
+      "[ebi-control-mcp] EBI_NOTIFY_SUBSCRIBE=off のため notification 購読を無効化します" +
+        "（受信は PTY 注入・送信は reply_to_master(HTTP) で運用）",
+    );
+    return;
+  }
   if (!EBI_ID) {
     console.error("[ebi-control-mcp] EBI_ID 未設定のため notification 購読はスキップします");
     return;
@@ -451,7 +472,15 @@ async function main(): Promise<void> {
   void subscribeLoop();
 }
 
-main().catch((err) => {
-  console.error("[ebi-control-mcp] 致命的エラー:", err);
-  process.exit(1);
-});
+// エントリポイントとして直接実行されたときだけ起動する（import 時は起動しない＝ユニットテストで
+// 純関数 isNotifySubscribeEnabled 等を import しても stdio 接続/購読ループが走らないようにする）。
+// 本番/開発の起動経路（gen-master-mcp.mjs 生成の mcp config: `node dist/.../control-server.js` /
+// `npx tsx src/mcp/control-server.ts`）はいずれも argv[1] がこのファイル自身になり true になる。
+const isEntryPoint =
+  !!process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isEntryPoint) {
+  main().catch((err) => {
+    console.error("[ebi-control-mcp] 致命的エラー:", err);
+    process.exit(1);
+  });
+}

@@ -1,4 +1,6 @@
-import { createServer } from "node:http";
+// .env をリポジトリルートから最初に読み込む（他 import が module-level で process.env を読む前に適用）。
+import { loadedEnvKeys } from "./env.ts";
+import { createServer, type IncomingMessage } from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, extname, normalize } from "node:path";
@@ -6,11 +8,13 @@ import { WebSocketServer, WebSocket } from "ws";
 import { Registry, hasControlBridge, isNotifyMode, type WorktreeMeta } from "./registry.ts";
 import { Mailbox } from "./mailbox.ts";
 import type { SpawnConfig, AgentHandlers, LaunchParams } from "./agent.ts";
+import { BASE_ALLOWED_DEV_CHANNELS } from "./agent.ts";
 import { addWorktree, removeWorktree } from "./git.ts";
 import { Supervisor } from "./supervisor.ts";
 import {
   loadFixedEbi,
   loadRawCustomRoles,
+  loadDevChannelsAllowlist,
   buildClaudeArgs,
   validatePermissionMode,
   DEFAULT_PERMISSION_MODE,
@@ -20,6 +24,19 @@ import { FixedEbiManager } from "./fixedEbi.ts";
 import { createControlApi, type GeneralizedSpawnParams } from "./control.ts";
 import { UsageStore } from "./usageStore.ts";
 import { ViewerRegistry } from "./viewerRegistry.ts";
+import {
+  loadAuthConfig,
+  isLoopback,
+  authorize,
+  tokenMatches,
+  buildAuthCookie,
+  loginPageHtml,
+  checkRateLimit,
+  recordFailure,
+  recordSuccess,
+  delay,
+  FAILURE_DELAY_MS,
+} from "./auth.ts";
 import {
   type ClientMessage,
   type ServerMessage,
@@ -35,6 +52,10 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.EBI_PORT ?? 8787);
 // bind するホスト。制御API を外部に晒さないため既定 127.0.0.1（loopback 限定）。
 const HOST = process.env.EBI_HOST ?? "127.0.0.1";
+// アプリ層トークン認証の設定（EBI_AUTH_TOKEN）。
+// 未設定なら token=null（＝非 loopback からのアクセスは全拒否の安全側デフォルト）。
+// loopback（母艦ローカル・内部 MCP 呼び）は token の有無に関わらず常に無認証で通す。
+const authConfig = loadAuthConfig();
 // spawn する対象コマンド。claude が PATH に無い環境では EBI_COMMAND=bash 等で fallback。
 const COMMAND = process.env.EBI_COMMAND ?? "claude";
 const COMMAND_ARGS = process.env.EBI_ARGS ? process.env.EBI_ARGS.split(" ") : [];
@@ -79,6 +100,10 @@ const spawnConfig: SpawnConfig = {
   args: COMMAND_ARGS,
   idleThresholdMs: IDLE_THRESHOLD_MS,
   scrollbackBytes: SCROLLBACK_BYTES,
+  // 起動ゲート自動応答の許可リスト（正確値）。組込みを初期値に持ち、起動時に
+  // ebi-team.config.json の devChannelsAllowlist をマージする（loadAndApplyDevChannelsAllowlist）。
+  // Registry は本オブジェクト参照を保持するため、listen 前のマージが後続の spawn に反映される。
+  devChannelsAllowlist: [...BASE_ALLOWED_DEV_CHANNELS],
 };
 
 // notification 注入方式（mcp notifications/claude/channel）の郵便受け。
@@ -264,9 +289,82 @@ const controlApi = createControlApi({
   },
 });
 
+/** HTML を期待するリクエスト（ブラウザ遷移）かを Accept ヘッダで大まかに判定する。 */
+function wantsHtml(req: IncomingMessage): boolean {
+  const accept = req.headers["accept"];
+  return typeof accept === "string" && accept.includes("text/html");
+}
+
 const httpServer = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const urlPath = url.pathname;
+  const loopback = isLoopback(req);
+
+  // ---- ログイン導線（認証ゲートより前・常に到達可能）----
+  // GET /login: トークン入力ページを返す。POST /login: 照合して Cookie を発行する。
+  if (urlPath === "/login" && (req.method ?? "GET") === "GET") {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(loginPageHtml());
+    return;
+  }
+  if (urlPath === "/login" && req.method === "POST") {
+    // レート制限（ブルートフォース対策）。ブロック中は 429。
+    const rl = checkRateLimit(req);
+    if (rl.blocked) {
+      res.writeHead(429, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Retry-After": String(Math.ceil(rl.retryAfterMs / 1000)),
+      });
+      res.end(JSON.stringify({ error: "too many attempts" }));
+      return;
+    }
+    let token = "";
+    try {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const parsed = JSON.parse(Buffer.concat(chunks).toString() || "{}");
+      token = typeof parsed?.token === "string" ? parsed.token : "";
+    } catch {
+      token = "";
+    }
+    // token 未設定運用（authConfig.token=null）ではログインは常に失敗させる
+    // （非 loopback は安全側デフォルトで拒否のため、cookie を配っても意味がない）。
+    if (authConfig.token && tokenMatches(token, authConfig.token)) {
+      recordSuccess(req);
+      res.writeHead(200, {
+        "Content-Type": "application/json; charset=utf-8",
+        "Set-Cookie": buildAuthCookie(authConfig.token),
+      });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    recordFailure(req);
+    await delay(FAILURE_DELAY_MS);
+    res.writeHead(401, { "Content-Type": "application/json; charset=utf-8" });
+    res.end(JSON.stringify({ error: "invalid token" }));
+    return;
+  }
+
+  // ---- 認証ゲート（loopback は常に素通り／非 loopback は token 必須）----
+  const auth = authorize(req, loopback, authConfig, url.searchParams);
+  if (!auth.ok) {
+    if (urlPath.startsWith("/control/")) {
+      // 制御API は JSON で 401（内部 MCP からの loopback 呼びはここに来ない）。
+      res.writeHead(401, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: "unauthorized" }));
+      return;
+    }
+    if (wantsHtml(req)) {
+      // ブラウザ遷移はログイン画面へ誘導する。
+      res.writeHead(302, { Location: "/login" });
+      res.end();
+      return;
+    }
+    res.writeHead(401, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Unauthorized");
+    return;
+  }
+
   // 制御API（/control/*）を最優先で処理する。該当すれば静的配信へは進まない。
   if (await controlApi(req, res, urlPath, url.searchParams)) return;
   let filePath = join(CLIENT_DIST, normalize(urlPath === "/" ? "/index.html" : urlPath));
@@ -288,7 +386,23 @@ const httpServer = createServer(async (req, res) => {
 });
 
 // ===== WebSocket =====
-const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+// HTTP 入口と同じ二段判定でハンドシェイクをゲートする。ここを塞がないと WS だけ
+// 素通りしてしまう（plan §7-2）。token は Cookie ebi_auth / ?token= から拾う。
+const wss = new WebSocketServer({
+  server: httpServer,
+  path: "/ws",
+  verifyClient: (info, cb) => {
+    const req = info.req;
+    const loopback = isLoopback(req);
+    const query = new URL(req.url ?? "/ws", "http://127.0.0.1").searchParams;
+    const auth = authorize(req, loopback, authConfig, query);
+    if (auth.ok) {
+      cb(true);
+    } else {
+      cb(false, 401, "Unauthorized");
+    }
+  },
+});
 
 wss.on("connection", (ws) => {
   clients.add(ws);
@@ -337,12 +451,13 @@ function handleClientMessage(ws: WebSocket, msg: ClientMessage): void {
       break;
     }
     case "kill": {
-      // 固定エビ（master/supervisor）は削除不可。kill を拒否して notice を返す。
+      // 固定エビ（pinned・master/supervisor や minaebi 等の常駐エビ）は削除不可。
+      // kill を拒否して notice を返す。
       if (registry.isPinned(msg.id)) {
         send(ws, {
           type: "notice",
           id: msg.id,
-          text: "固定エビ（master/supervisor）は削除できません",
+          text: "固定エビ（削除不可の常駐エビ）は削除できません",
         });
         break;
       }
@@ -635,7 +750,11 @@ async function sendMessage(params: SendMessageParams): Promise<SendMessageResult
   // 購読確立を最大 SUBSCRIBE_WAIT_MS 待ってから mailbox へ push する。
   // 通知方式は PTY の idle/busy 判定が原理上不要なため、確立さえすれば busy 中でも即届く。
   // 購読が確立しない（ブリッジ非搭載 or 起動に失敗）場合は待たず PTY 経路へフォールバックする。
-  if (registry.notifyEnabled() && hasControlBridge(agent)) {
+  //
+  // ただし notifySubscribe:false のエビ（外部チャンネル待機セッション minaebi 等・受信 PTY 固定）は
+  // この経路に入らず PTY 注入へ直行する。自セッションに ebi-control channel を登録しないため
+  // notification は harness に黙って捨てられる＝購読は永遠に確立せず、待つだけ無駄になるため。
+  if (registry.notifyEnabled() && hasControlBridge(agent) && agent.notifySubscribe !== false) {
     const subscribed =
       registry.hasActiveSubscriber(to) || (await registry.waitForSubscriber(to, SUBSCRIBE_WAIT_MS));
     if (subscribed) {
@@ -748,13 +867,51 @@ async function loadAndRegisterCustomRoles(): Promise<void> {
   }
 }
 
-// spawn 要求（WS / 制御API いずれも）を受け付ける前にカスタム役割を確定させる。
+/**
+ * ebi-team.config.json の top-level "devChannelsAllowlist" を読み、spawnConfig.devChannelsAllowlist
+ * （組込み BASE_ALLOWED_DEV_CHANNELS で初期化済み）へ「追加」マージする。重複は無視する。
+ * httpServer.listen()／固定エビ自動起動より前に完了させ、以降の spawn が常にマージ後の
+ * 許可リストを見るようにする（Registry は spawnConfig 参照を保持する）。
+ * config が無い/未指定なら何もしない。検証失敗時は警告のみで起動を継続する。
+ */
+async function loadAndApplyDevChannelsAllowlist(): Promise<void> {
+  try {
+    const extra = await loadDevChannelsAllowlist(CONFIG_PATH);
+    for (const v of extra) {
+      if (!spawnConfig.devChannelsAllowlist!.includes(v)) spawnConfig.devChannelsAllowlist!.push(v);
+    }
+    if (extra.length > 0) {
+      console.log(
+        `[ebi-team] 起動ゲート許可リスト（dev channels）: ${spawnConfig.devChannelsAllowlist!.join(", ")}`,
+      );
+    }
+  } catch (err) {
+    console.warn(`[ebi-team] devChannelsAllowlist の読み込みに失敗（組込みのみで継続）:`, err);
+  }
+}
+
+// spawn 要求（WS / 制御API いずれも）を受け付ける前にカスタム役割・許可リストを確定させる。
 await loadAndRegisterCustomRoles();
+await loadAndApplyDevChannelsAllowlist();
 
 // ===== 起動 / 終了処理 =====
 httpServer.listen(PORT, HOST, () => {
   console.log(`[ebi-team] サーバ起動: http://${HOST}:${PORT}  (WS: ws://${HOST}:${PORT}/ws)`);
-  console.log(`[ebi-team] 制御API: http://${HOST}:${PORT}/control/*  (loopback 限定)`);
+  if (loadedEnvKeys.length > 0) {
+    // キー名のみ表示（値・トークンは出さない）。
+    console.log(`[ebi-team] .env 読み込み: ${loadedEnvKeys.length}件 (${loadedEnvKeys.join(", ")})`);
+  }
+  console.log(`[ebi-team] 制御API: http://${HOST}:${PORT}/control/*  (loopback 無認証 / 非loopbackはトークン必須)`);
+  if (authConfig.token) {
+    console.log(`[ebi-team] 認証: EBI_AUTH_TOKEN 設定あり（非 loopback はトークン必須・/login で入力）`);
+  } else if (HOST === "127.0.0.1" || HOST === "localhost") {
+    console.log(`[ebi-team] 認証: 未設定（loopback 限定 bind のためローカル運用）`);
+  } else {
+    console.warn(
+      `[ebi-team] 認証: EBI_AUTH_TOKEN 未設定のまま非 loopback に bind（${HOST}）。` +
+        `非 loopback からのアクセスは全拒否されます。外部アクセスには EBI_AUTH_TOKEN を設定してください。`,
+    );
+  }
   console.log(`[ebi-team] spawn コマンド: ${COMMAND} ${COMMAND_ARGS.join(" ")}`.trim());
   console.log(`[ebi-team] デフォルト cwd: ${DEFAULT_CWD}`);
   console.log(`[ebi-team] idle しきい値: ${IDLE_THRESHOLD_MS}ms / registry ダンプ: ${DUMP_PATH}`);
