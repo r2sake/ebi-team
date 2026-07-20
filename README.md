@@ -215,6 +215,33 @@ claude プロセス（エージェント本体）
 - **認証**: `claude` CLI 自体のログイン状態（`claude login` によるサブスクアカウントの認証）に依存します。ebi-team 自身は API キーを持たず、扱いません。
 - **エージェント間の制御**: MCP（Model Context Protocol）ベースの制御サーバを介して、エージェント同士がメッセージを送り合ったり、他のエージェントを起動・監視したりできます。ローカル専用の HTTP 制御 API（127.0.0.1 限定）がその土台です。
 
+### メッセージ配送の仕組みと信頼性
+
+エビ間・master 宛のメッセージは、2 つの経路のいずれかで届きます。
+
+1. **notification 経路（既定）**: 各エビの制御 MCP ブリッジが `/control/subscribe` に long-poll で購読を張り、届いたメッセージを `notifications/claude/channel` としてセッションへ注入します（PTY 入力欄を経由しない）。busy/idle に関係なく届くのが利点です。
+2. **PTY 注入経路**: PTY(stdin) に本文を書き込む従来方式。idle なら即送信、busy ならキューに積んで idle 復帰時に flush します。
+
+**到達確認とフォールバック（配送信頼性の要）**: notification 経路は「送っただけ」では相手セッションに届いたと断定できません（購読が切れている・harness に honor されない等で黙って消えうる）。そこで配送は次のように到達確認します。
+
+- 配送先が**今**購読 live（直近に long-poll 接続がある）かで経路を選ぶ。過去に一度購読しただけの相手（=購読が既に死んでいる相手）へは notification に載せず、最初から PTY 注入する。
+- notification に載せた場合は、ブリッジが emit 後に返す **end-to-end ACK**（`/control/ack`）を待つ。ACK が取れれば到達確認済み。**取れなければ自動で PTY 注入へフォールバック**する。
+- 配送結果はツール応答の `details`（宛先ごとの `via` = `notify` / `pty-fallback` / `pty`、`confirmed`）で確認できる。「delivered と言いつつ実は消えていた」を防ぐための正直な内訳です。
+- 取りこぼし（未回収の pending）は `GET /control/pending` で可視化でき、agent 破棄時に未配送が残っていればサーバログに出ます（黙って失われない）。
+
+**制約と運用上の注意**: ACK は「ブリッジがセッションへ確かに転送した」ことの確認です。harness がその notification を honor するか（会話へ実際に差し込むか）は別レイヤで、環境（claude のバージョン・セッションが background job かどうか等）に依存します。**無人運用や background job として動く常駐セッション（master 含む）で notification の honor が不安定な場合は、受信を PTY 固定にするのが最も確実です**。固定エビ単位なら config の `notifySubscribe: false`、サーバ全体なら `EBI_INJECT_MODE=pty` で旧 PTY 方式へ全面ロールバックできます。
+
+**関連環境変数**:
+
+| 変数 | 既定 | 説明 |
+| --- | --- | --- |
+| `EBI_INJECT_MODE` | `notify` | `pty` にすると notification を使わず全配送を PTY 注入にする（全面ロールバック） |
+| `EBI_DELIVER_ACK_TIMEOUT_MS` | `5000` | notification の ACK 到達確認を待つ時間。超過で PTY フォールバック |
+| `EBI_LIVENESS_WINDOW_MS` | `40000` | 「購読が今 live か」の判定窓。ブリッジ側 `EBI_SUBSCRIBE_TIMEOUT_MS`（既定 25s）を上げたらこちらも合わせて上げる |
+| `EBI_NOTIFY_SUBSCRIBE` | `on` | エビ側ブリッジで `off` にすると購読しない（外部チャンネル待機セッション等・受信 PTY 固定） |
+
+配送信頼性の再現・回帰テスト: `npm run e2e:notify-fallback`（別ポートの実サーバ＋実 PTY で「ブリッジ死亡→PTY フォールバック→実到達」を実証。実 claude 不要）。notification が実 claude セッションで honor されるところまでの疎通は `node scripts/e2e-notify-channel.mjs`（実 claude/haiku を使用）。
+
 ---
 
 ## Extending / 自分用にカスタマイズ

@@ -431,9 +431,10 @@ async function subscribeLoop(): Promise<void> {
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = (await res.json()) as {
-        messages?: Array<{ from: string; message: string; kind?: string; ts: number }>;
+        messages?: Array<{ id?: number; from: string; message: string; kind?: string; ts: number }>;
       };
       backoffMs = 500; // 成功したらバックオフをリセット。
+      const ackIds: number[] = [];
       for (const m of data.messages ?? []) {
         // 現行の [from:xxx] タグ相当の情報を content にも残しつつ、meta にも構造化して積む
         // （content はセッションへそのまま見える本文・meta は将来の機械的な判別用）。
@@ -452,6 +453,18 @@ async function subscribeLoop(): Promise<void> {
             },
           },
         });
+        if (typeof m.id === "number") ackIds.push(m.id);
+      }
+      // 到達確認（end-to-end ACK）: emit した seq id 群をサーバへ返す。これによりサーバ側の
+      // deliver() は「ブリッジが生きていてセッションへ確かに転送した」ことを確認でき、ACK が
+      // 取れないメッセージは PTY 注入へフォールバックされる（黙って消えるのを防ぐ肝）。
+      // best-effort（失敗しても購読ループは継続。次段の可視化/フォールバックで担保）。
+      if (ackIds.length > 0) {
+        void fetch(`${CONTROL_URL}/control/ack`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: EBI_ID, ids: ackIds }),
+        }).catch(() => {});
       }
     } catch (err) {
       console.error(
