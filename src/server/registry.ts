@@ -36,6 +36,14 @@ import {
  */
 const INJECT_MODE = process.env.EBI_INJECT_MODE === "pty" ? "pty" : "notify";
 
+/**
+ * notification 配送の到達確認（end-to-end ACK）待ちタイムアウト（ms）。
+ * deliver() は mailbox へ push した後この時間だけブリッジからの ack を待ち、取れなければ
+ * PTY 注入へ自動フォールバックする。ブリッジのローカル round-trip は通常 1s 未満なので、
+ * これを超える＝ブリッジが死んでいる/転送できていない と判断してよい。env で調整可。
+ */
+const ACK_TIMEOUT_MS = Number(process.env.EBI_DELIVER_ACK_TIMEOUT_MS) || 5000;
+
 /** notification 注入モードが有効か（モジュールレベル・spawn 配線の判定に使う）。 */
 export function isNotifyMode(): boolean {
   return INJECT_MODE === "notify";
@@ -55,13 +63,32 @@ export function hasControlBridge(agent: Pick<Agent, "launch">): boolean {
 }
 
 /**
+ * 1 宛先への配送経路と到達確認の内訳。
+ * - via: どの経路で配送したか
+ *   - "notify": notification 経路で到達確認（ブリッジ ACK）が取れた
+ *   - "pty-fallback": notify を試みたが ACK が取れず PTY 注入へ自動フォールバックした
+ *   - "pty": 最初から PTY 注入（購読 live でない / notifySubscribe:false / EBI_INJECT_MODE=pty）
+ *   - "none": agent 不在で配送できなかった
+ * - confirmed: 相手セッション（の入力）へ到達したと確認できたか。
+ *   notify は ACK 取得を、PTY は入力欄への注入成立をもって true とする（agent 不在時のみ false）。
+ */
+export interface DeliverOutcome {
+  ok: boolean;
+  via: "notify" | "pty-fallback" | "pty" | "none";
+  confirmed: boolean;
+}
+
+/**
  * 注入の宛先解決結果。
  * - delivered: 実際に注入を行った agent id 一覧
  * - rejected: ルールにより拒否した宛先と理由（送信元への notice 表示用）
+ * - details: 宛先ごとの配送経路・到達確認の内訳（delivered の意味を「到達確認済み or
+ *   フォールバック済み」に正直化するための可観測情報。送信元 MCP へそのまま返る）
  */
 export interface InjectResult {
   delivered: string[];
   rejected: { id: string; reason: string }[];
+  details: { id: string; via: DeliverOutcome["via"]; confirmed: boolean }[];
 }
 
 /** spawn 時のオプション（worktree 情報など）。 */
@@ -118,9 +145,33 @@ export class Registry {
     return INJECT_MODE !== "pty" && this.mailbox !== null;
   }
 
-  /** 指定 id が mailbox 経由で確実に届く状態か（一度でも購読 subscribe 済み）。 */
+  /**
+   * 指定 id が mailbox 経由で「今」確実に届く状態か。
+   * = notification 有効 かつ ブリッジの long-poll が直近に生きている（isLive）。
+   *
+   * 【重要】旧実装は everSubscribed（一度でも購読したか＝単調フラグ）で判定していたが、
+   * それだと購読が過去に成立した相手（master 含む）宛は、その後ブリッジが死んでも永久に
+   * notification 経路に載せ続け、黙って消えていた（master 宛全損の直接原因）。現在の
+   * liveness（直近 long-poll 接続あり）に置き換え、死んだ購読へは載せない。
+   */
   hasActiveSubscriber(id: string): boolean {
-    return this.notifyEnabled() && (this.mailbox?.everSubscribed(id) ?? false);
+    return this.notifyEnabled() && (this.mailbox?.isLive(id) ?? false);
+  }
+
+  /**
+   * ブリッジからの到達確認（end-to-end ACK）を mailbox へ渡す。
+   * 制御API `/control/ack` から呼ばれる。notify 無効/mailbox 未設定なら no-op。
+   */
+  ackDelivery(id: string, msgIds: number[]): void {
+    this.mailbox?.ack(id, msgIds);
+  }
+
+  /**
+   * pending（未回収）メッセージの可視化スナップショット。黙って消えていないことの観測入口。
+   * mailbox 未設定（PTY 専用構成）なら空配列。
+   */
+  pendingSnapshot(): { id: string; count: number; live: boolean; oldestAgeMs: number | null }[] {
+    return this.mailbox?.pendingSnapshot() ?? [];
   }
 
   /**
@@ -133,25 +184,49 @@ export class Registry {
   }
 
   /**
-   * 統一配送: mailbox に購読者がいれば notification 経路（PTY 非経由・busy/idle 無関係に即届く）、
-   * いなければ従来の agent.inject()（PTY 入力欄タイプ・idle/busy キューあり）にフォールバックする。
+   * 統一配送（到達確認つき）:
+   * 1. notification 経路が「今」生きている（isLive）なら mailbox へ push し、ブリッジからの
+   *    end-to-end ACK を最大 ACK_TIMEOUT_MS 待つ。ACK が取れれば到達確認済み（via:"notify"）。
+   * 2. ACK が取れなければ、まだ pending に居るメッセージを回収（二重配送防止）してから PTY
+   *    注入へ自動フォールバックする（via:"pty-fallback"）。
+   * 3. そもそも購読が live でない / notifySubscribe:false / notify 無効なら最初から PTY 注入
+   *    （via:"pty"）。
+   *
+   * これにより「push しただけで delivered=true（実際は届かず黙って消える）」を根絶し、
+   * delivered の意味を「到達確認済み or 確実な PTY 経路へ載せ替え済み」に正直化する。
+   *
    * kind 指定時は本文へ [idle]/[reply] タグを付与する（reverseInject 用・resolveAndInject は未指定）。
-   * agent が存在しなければ false を返す（呼び出し側で見つからない扱いにする）。
+   * agent が存在しなければ ok:false（via:"none"）を返す（呼び出し側で見つからない扱いにする）。
    */
-  deliver(id: string, from: string, message: string, kind?: "reply" | "idle"): boolean {
+  async deliver(
+    id: string,
+    from: string,
+    message: string,
+    kind?: "reply" | "idle",
+  ): Promise<DeliverOutcome> {
     const agent = this.agents.get(id);
-    if (!agent) return false;
+    if (!agent) return { ok: false, via: "none", confirmed: false };
     const body = kind === "idle" ? `[idle] ${message}` : kind === "reply" ? `[reply] ${message}` : message;
     // notifySubscribe:false のエビ（外部チャンネル待機セッション・受信 PTY 固定）は、たとえ
     // 何らかの理由で購読者として登録されていても notification 経路に載せない。自セッションに
     // ebi-control channel が無く notification が harness に黙って捨てられるため（全配送経路
     // ―inject_message / @all ブロードキャスト / reverseInject―で PTY 注入を強制する）。
     if (agent.notifySubscribe !== false && this.hasActiveSubscriber(id)) {
-      this.mailbox!.push(id, { from, message: body, kind: kind ?? "message", ts: Date.now() });
-      return true;
+      const msgId = this.mailbox!.push(id, { from, message: body, kind: kind ?? "message", ts: Date.now() });
+      const acked = await this.mailbox!.waitForAck(id, msgId, ACK_TIMEOUT_MS);
+      if (acked) return { ok: true, via: "notify", confirmed: true };
+      // ACK 取れず＝ブリッジが転送できていない可能性。まだ pending に残っていれば回収し、
+      // PTY 注入へフォールバックする（回収できなくても＝既にブリッジが拾って emit 済みでも、
+      // 取りこぼしの方が害が大きいので PTY にも載せて確実に届ける。多少の重複は許容）。
+      this.mailbox!.take(id, msgId);
+      console.warn(
+        `[registry] ${id} 宛 notification の ACK が ${ACK_TIMEOUT_MS}ms 以内に取れず PTY 注入へフォールバック（from=${from}）`,
+      );
+      agent.inject(from, body);
+      return { ok: true, via: "pty-fallback", confirmed: true };
     }
     agent.inject(from, body);
-    return true;
+    return { ok: true, via: "pty", confirmed: true };
   }
 
   /** id を採番する（例: ebi-1）。 */
@@ -229,7 +304,14 @@ export class Registry {
     agent.kill();
     this.agents.delete(id);
     // 破棄した agent 宛の mailbox 状態（pending/購読待ち）も片付ける（届けようがないため）。
-    this.mailbox?.clear(id);
+    // 未回収の pending があれば「配送できずに失われた」ことをログに出す（黙って消さない）。
+    const dropped = this.mailbox?.clear(id) ?? [];
+    if (dropped.length > 0) {
+      console.warn(
+        `[registry] ${id} を除去。未配送 ${dropped.length} 件を破棄: ` +
+          dropped.map((m) => `[from:${m.from}] ${m.message.slice(0, 60)}`).join(" / "),
+      );
+    }
     void this.dump();
     return true;
   }
@@ -255,16 +337,21 @@ export class Registry {
    *
    * 各 agent の idle/busy キュー機構（Agent.inject）はそのまま使う。
    */
-  resolveAndInject(to: string, from: string, message: string): InjectResult {
-    const result: InjectResult = { delivered: [], rejected: [] };
+  async resolveAndInject(to: string, from: string, message: string): Promise<InjectResult> {
+    const result: InjectResult = { delivered: [], rejected: [], details: [] };
 
     if (to === BROADCAST_TARGET) {
       // @all: connected な agent にだけ配信。isolated は黙ってスキップ。
-      for (const agent of this.agents.values()) {
-        if (agent.mode === "isolated") continue;
-        this.deliver(agent.id, from, message);
-        result.delivered.push(agent.id);
-      }
+      // 各配送は ACK 待ちを含むため並列で行う（宛先が多くても待ち時間を直列に積み上げない）。
+      const targets = [...this.agents.values()].filter((a) => a.mode !== "isolated");
+      const outcomes = await Promise.all(
+        targets.map((a) => this.deliver(a.id, from, message)),
+      );
+      targets.forEach((a, i) => {
+        const o = outcomes[i]!;
+        result.delivered.push(a.id);
+        result.details.push({ id: a.id, via: o.via, confirmed: o.confirmed });
+      });
       return result;
     }
 
@@ -282,8 +369,9 @@ export class Registry {
       });
       return result;
     }
-    this.deliver(agent.id, from, message);
+    const o = await this.deliver(agent.id, from, message);
     result.delivered.push(agent.id);
+    result.details.push({ id: agent.id, via: o.via, confirmed: o.confirmed });
     return result;
   }
 
@@ -305,13 +393,13 @@ export class Registry {
    *
    * @param to 宛先（当面 "master" 既定。将来 エビ間通知に拡張可能なよう引数化）
    */
-  reverseInject(
+  async reverseInject(
     fromAgent: string,
     toAgent: string,
     message: string,
     kind: "reply" | "idle",
-  ): InjectResult {
-    const result: InjectResult = { delivered: [], rejected: [] };
+  ): Promise<InjectResult> {
+    const result: InjectResult = { delivered: [], rejected: [], details: [] };
 
     if (fromAgent === toAgent) {
       result.rejected.push({ id: toAgent, reason: "自己送信は禁止です" });
@@ -332,8 +420,9 @@ export class Registry {
     // （直後の idle で B を抑制するため）。from が存在しなくても通知自体は通す。
     if (kind === "reply") this.agents.get(fromAgent)?.markReplied();
 
-    this.deliver(toAgent, fromAgent, message, kind);
+    const o = await this.deliver(toAgent, fromAgent, message, kind);
     result.delivered.push(toAgent);
+    result.details.push({ id: toAgent, via: o.via, confirmed: o.confirmed });
     return result;
   }
 

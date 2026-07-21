@@ -79,8 +79,19 @@ export interface ControlDeps {
   registry: Registry;
   /** spawn の中核。spawned/registry ブロードキャストまで行い agent id を返す。 */
   spawnAgent: (params: GeneralizedSpawnParams) => Promise<string>;
-  /** 注入（registry.resolveAndInject ラッパ）。rejected があれば理由配列を返す。 */
-  inject: (to: string, from: string, message: string) => { delivered: string[]; rejected: { id: string; reason: string }[] };
+  /**
+   * 注入（registry.resolveAndInject ラッパ）。到達確認（ACK 待ち）を含むため async。
+   * delivered / rejected に加え details（宛先ごとの配送経路・到達確認）を返す。
+   */
+  inject: (
+    to: string,
+    from: string,
+    message: string,
+  ) => Promise<{
+    delivered: string[];
+    rejected: { id: string; reason: string }[];
+    details: { id: string; via: string; confirmed: boolean }[];
+  }>;
   /**
    * 統一送信（送信先が無ければ spawn し、ready まで待ってから確実に送信する）。
    * 「立ち上がってる／まだ」の分岐は index.ts の sendMessage 内で完結する。
@@ -268,13 +279,13 @@ export function createControlApi(deps: ControlDeps) {
           sendJson(res, 400, { error: "to と message（文字列）は必須です" });
           return true;
         }
-        const result = inject(to, from, message);
+        const result = await inject(to, from, message);
         if (to !== BROADCAST_TARGET && result.delivered.length === 0) {
           // 単体宛で配信ゼロ（見つからない/isolated 遮断）は 4xx。
           sendJson(res, 400, { error: result.rejected[0]?.reason ?? "注入に失敗しました", rejected: result.rejected });
           return true;
         }
-        sendJson(res, 200, { delivered: result.delivered, rejected: result.rejected });
+        sendJson(res, 200, { delivered: result.delivered, rejected: result.rejected, details: result.details });
         return true;
       }
 
@@ -292,13 +303,13 @@ export function createControlApi(deps: ControlDeps) {
           sendJson(res, 400, { error: "from と message（文字列）は必須です" });
           return true;
         }
-        const result = registry.reverseInject(from, to, message, kind);
+        const result = await registry.reverseInject(from, to, message, kind);
         if (result.delivered.length === 0) {
           // 宛先なし/isolated/自己送信などで配信ゼロは 4xx で理由を返す。
           sendJson(res, 400, { error: result.rejected[0]?.reason ?? "逆方向通知に失敗しました", rejected: result.rejected });
           return true;
         }
-        sendJson(res, 200, { delivered: result.delivered, rejected: result.rejected });
+        sendJson(res, 200, { delivered: result.delivered, rejected: result.rejected, details: result.details });
         return true;
       }
 
@@ -375,6 +386,32 @@ export function createControlApi(deps: ControlDeps) {
           Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? Math.min(Math.max(timeoutRaw, 1000), 60000) : 25000;
         const messages = await subscribe(id, timeoutMs);
         sendJson(res, 200, { messages });
+        return true;
+      }
+
+      // ---- POST /control/ack ----
+      // notification 到達確認（end-to-end ACK）。制御MCP ブリッジ（src/mcp/control-server.ts）が
+      // subscribe で受け取ったメッセージを notifications/claude/channel として emit した「後」に、
+      // その seq id 群（body.ids）を返す。deliver() 側の waitForAck を解決し、これが取れないと
+      // deliver は PTY 注入へフォールバックする（黙って消えるのを防ぐ肝）。
+      if (pathname === "/control/ack" && method === "POST") {
+        const body = await readJsonBody(req);
+        const id = asString(body.id);
+        const idsRaw = Array.isArray(body.ids) ? body.ids : [];
+        const ids = idsRaw.filter((n): n is number => typeof n === "number" && Number.isFinite(n));
+        if (!id) {
+          sendJson(res, 400, { error: "id（文字列）は必須です" });
+          return true;
+        }
+        registry.ackDelivery(id, ids);
+        sendJson(res, 200, { ok: true, acked: ids.length });
+        return true;
+      }
+
+      // ---- GET /control/pending ----
+      // pending（未回収）メッセージの可視化。黙って消えていないことを master / 運用者が観測する入口。
+      if (pathname === "/control/pending" && method === "GET") {
+        sendJson(res, 200, { pending: registry.pendingSnapshot() });
         return true;
       }
 

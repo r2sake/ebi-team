@@ -109,7 +109,13 @@ const spawnConfig: SpawnConfig = {
 // notification 注入方式（mcp notifications/claude/channel）の郵便受け。
 // 各エビの制御MCP ブリッジ（src/mcp/control-server.ts）が /control/subscribe に long-poll し、
 // ここに push されたメッセージを受け取って自分のセッションへ notification として注入する。
-const mailbox = new Mailbox();
+//
+// liveness window（配送ゲート判定）は「ブリッジの long-poll timeout ＋ 再接続の余裕」を満たす
+// 必要がある。ブリッジ側 EBI_SUBSCRIBE_TIMEOUT_MS（既定 25s）を上げた場合はこちらも
+// EBI_LIVENESS_WINDOW_MS で合わせて上げること（下回るとライブなブリッジを誤って dead 判定する）。
+const LIVENESS_WINDOW_MS =
+  Number(process.env.EBI_LIVENESS_WINDOW_MS) || Mailbox.DEFAULT_LIVENESS_WINDOW_MS;
+const mailbox = new Mailbox(LIVENESS_WINDOW_MS);
 
 const registry = new Registry(spawnConfig, DUMP_PATH, mailbox);
 
@@ -235,16 +241,20 @@ const handlers: AgentHandlers = {
     // [B] idle 自動通知（保険）。busy→idle のエッジで、master/supervisor 以外かつ
     // ready 済みのエビが「直近に A の明示リプライ無し・クールダウン超過」のとき Agent から
     // 呼ばれる。本文抽出はせず「待機に入った／read_scrollback で確認可」の軽い通知だけ送る。
-    const result = registry.reverseInject(
-      id,
-      "master",
-      "待機に入りました。詳細は read_scrollback で確認できます。",
-      "idle",
-    );
-    if (result.delivered.length === 0 && result.rejected.length > 0) {
-      // master が居ない等で配信不能でも致命ではない（保険の通知なので notice のみ）。
-      console.warn(`[ebi-team] idle 自動通知の配信不可（${id}）: ${result.rejected[0]?.reason}`);
-    }
+    // reverseInject は到達確認（ACK 待ち）を含むため async。保険通知なので投げっぱなしにする。
+    void registry
+      .reverseInject(
+        id,
+        "master",
+        "待機に入りました。詳細は read_scrollback で確認できます。",
+        "idle",
+      )
+      .then((result) => {
+        if (result.delivered.length === 0 && result.rejected.length > 0) {
+          // master が居ない等で配信不能でも致命ではない（保険の通知なので notice のみ）。
+          console.warn(`[ebi-team] idle 自動通知の配信不可（${id}）: ${result.rejected[0]?.reason}`);
+        }
+      });
   },
 };
 
@@ -786,7 +796,8 @@ async function sendMessage(params: SendMessageParams): Promise<SendMessageResult
     const subscribed =
       registry.hasActiveSubscriber(to) || (await registry.waitForSubscriber(to, SUBSCRIBE_WAIT_MS));
     if (subscribed) {
-      registry.deliver(to, from, message);
+      // deliver は ACK 到達確認を含み、取れなければ内部で PTY 注入へフォールバックする。
+      await registry.deliver(to, from, message);
       return { ok: true, id: to, spawned, status: agent.getStatus() };
     }
     broadcast({
