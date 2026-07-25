@@ -1,6 +1,6 @@
 import { writeFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import { Agent, type SpawnConfig, type AgentHandlers, type LaunchParams } from "./agent.ts";
+import { Agent, containsEcho, type SpawnConfig, type AgentHandlers, type LaunchParams } from "./agent.ts";
 import { Mailbox } from "./mailbox.ts";
 import {
   BROADCAST_TARGET,
@@ -43,6 +43,24 @@ const INJECT_MODE = process.env.EBI_INJECT_MODE === "pty" ? "pty" : "notify";
  * これを超える＝ブリッジが死んでいる/転送できていない と判断してよい。env で調整可。
  */
 const ACK_TIMEOUT_MS = Number(process.env.EBI_DELIVER_ACK_TIMEOUT_MS) || 5000;
+
+/**
+ * notification 配送の「セッション到達」確認（本文エコー）を待つ上限（ms）。
+ *
+ * 【2026-07-25 spawn 直後の本文消失の根治】
+ * ブリッジ ACK は「control-server が `server.notification()` を stdout へ書いた」ことしか
+ * 保証しない。spawn 直後は claude 本体がまだ ebi-control を channel として登録し終えておらず
+ * （TUI に `server:ebi-control · no MCP server configured with that name` が出る）、harness は
+ * その notification を**黙って捨てる**。ACK は返るため deliver() は到達済みと誤判定し、
+ * 本文が痕跡ゼロで消えていた（live e2e で 6 回中 2 回再現）。
+ * そこで ACK の後さらに「セッションが本文を描画したか」を scrollback で確認し、この時間内に
+ * 確認できなければ PTY 注入へフォールバックする（at-least-once 化）。
+ * env `EBI_ECHO_CONFIRM_MS` で調整可（0 以下でこの確認を無効化＝旧挙動）。
+ */
+const ECHO_CONFIRM_MS = Number(process.env.EBI_ECHO_CONFIRM_MS ?? 8000);
+
+/** エコー確認のポーリング間隔（ms）。 */
+const ECHO_POLL_MS = 250;
 
 /** notification 注入モードが有効か（モジュールレベル・spawn 配線の判定に使う）。 */
 export function isNotifyMode(): boolean {
@@ -212,9 +230,24 @@ export class Registry {
     // ebi-control channel が無く notification が harness に黙って捨てられるため（全配送経路
     // ―inject_message / @all ブロードキャスト / reverseInject―で PTY 注入を強制する）。
     if (agent.notifySubscribe !== false && this.hasActiveSubscriber(id)) {
+      // エコー確認の起点。push より前にマークし、「push 以降に出力された分」だけを検査する
+      // （過去の同種メッセージの描画を到達と誤認しないため）。
+      const mark = agent.scrollbackMark();
       const msgId = this.mailbox!.push(id, { from, message: body, kind: kind ?? "message", ts: Date.now() });
       const acked = await this.mailbox!.waitForAck(id, msgId, ACK_TIMEOUT_MS);
-      if (acked) return { ok: true, via: "notify", confirmed: true };
+      if (acked) {
+        // ブリッジ ACK は「stdout へ書いた」までの保証。セッション到達（harness が channel を
+        // honor してモデルに見せた）まで確認できて初めて配送成立とみなす。
+        if (await this.confirmSessionEcho(agent, `[from:${from}] ${body}`, mark)) {
+          return { ok: true, via: "notify", confirmed: true };
+        }
+        console.warn(
+          `[registry] ${id} 宛 notification は ACK されたがセッションへの到達（本文エコー）を` +
+            `${ECHO_CONFIRM_MS}ms 以内に確認できず PTY 注入へフォールバック（from=${from}）`,
+        );
+        agent.inject(from, body);
+        return { ok: true, via: "pty-fallback", confirmed: true };
+      }
       // ACK 取れず＝ブリッジが転送できていない可能性。まだ pending に残っていれば回収し、
       // PTY 注入へフォールバックする（回収できなくても＝既にブリッジが拾って emit 済みでも、
       // 取りこぼしの方が害が大きいので PTY にも載せて確実に届ける。多少の重複は許容）。
@@ -227,6 +260,35 @@ export class Registry {
     }
     agent.inject(from, body);
     return { ok: true, via: "pty", confirmed: true };
+  }
+
+  /**
+   * notification 配送が「セッションに到達した」ことを本文エコーで確認する。
+   *
+   * claude TUI は channel 受信を `ebi-control: [from:master] <本文先頭>…` と描画するため、
+   * mark 以降の scrollback に本文先頭が現れれば到達とみなせる。逆に、channel が未登録で
+   * harness に捨てられた場合はこの描画が一切出ない（＝この関数が唯一の見分け手段）。
+   *
+   * 一度到達を確認できたエビは以降スキップする（channelProven）。既存セッションへの再送は
+   * 元々取りこぼしが無く、毎回待つのは無駄な遅延と重複配送のリスクにしかならないため
+   * 、確認は「まだ実績の無いエビ」＝ spawn 直後の危険窓に限定する。
+   * ECHO_CONFIRM_MS <= 0 なら確認を行わない（旧挙動へのロールバック口）。
+   */
+  private async confirmSessionEcho(agent: Agent, renderedBody: string, mark: number): Promise<boolean> {
+    if (ECHO_CONFIRM_MS <= 0) return true;
+    if (agent.isChannelProven()) return true;
+    // channel 本文を描画するのは claude セッション（制御MCP ブリッジ持ち）だけ。
+    // それ以外（bash 等のテスト起動）はエコーが原理上出ないため確認対象外とする。
+    if (!hasControlBridge(agent)) return true;
+    const deadline = Date.now() + ECHO_CONFIRM_MS;
+    for (;;) {
+      if (containsEcho(agent.scrollbackSince(mark), renderedBody)) {
+        agent.markChannelProven();
+        return true;
+      }
+      if (Date.now() >= deadline) return false;
+      await new Promise<void>((r) => setTimeout(r, ECHO_POLL_MS));
+    }
   }
 
   /** id を採番する（例: ebi-1）。 */

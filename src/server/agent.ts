@@ -99,6 +99,54 @@ export function detectStartupGate(rawScanBuffer: string): "devChannels" | "trust
 }
 
 /**
+ * 起動ゲート自動応答が有効な agent で、「dev-channels ゲートへの応答が済むまで ready 昇格を
+ * 待つ」上限(ms)。この時間を過ぎてもゲートを検知しなければ、従来どおりの ready 判定へ degrade する
+ * （将来 claude 側がダイアログを出さなくなっても永久に ready にならない事故を防ぐ保険）。
+ * 実測ではダイアログは spawn 後 2〜4 秒で出る。env `EBI_GATE_SETTLE_MS` で調整可。
+ */
+const GATE_SETTLE_MS = Number(process.env.EBI_GATE_SETTLE_MS) || 20000;
+
+/**
+ * notification（channel）配送の「セッション到達」確認に使う、本文エコー照合の長さ（文字数・compact 後）。
+ * claude TUI は channel 受信を `ebi-control: [from:master] <本文先頭>…` と**先頭を切り詰めて**描画するため、
+ * 本文全体ではなく先頭のこの長さだけを照合する。短すぎると誤検知、長すぎると切り詰めで検知漏れになる。
+ * 実測（80 桁）では compact 後 40 文字強まで描画される。env `EBI_ECHO_NEEDLE_LEN` で調整可。
+ */
+const ECHO_NEEDLE_LEN = Number(process.env.EBI_ECHO_NEEDLE_LEN) || 24;
+
+/**
+ * ANSI/OSC エスケープと空白を全除去して素文へ畳む。
+ * claude(Ink) TUI は単語間を空白でなくカーソル移動エスケープで描画することがあるため、
+ * 「空白を全部落とした文字列同士」で照合する（detectStartupGate と同じ流儀）。
+ */
+export function compactPlain(raw: string): string {
+  return raw
+    .replace(/\x1b\][^\x07]*\x07/g, "")
+    .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+    .replace(/\x1b[()][A-Z0-9]/g, "")
+    .replace(/\s+/g, "");
+}
+
+/**
+ * 配送本文（`[from:x] 本文`）から「セッション到達を照合するための針」を作る純関数。
+ * compact 後の先頭 `len` コードポイントを返す（サロゲートペアを割らないよう Array.from で切る）。
+ */
+export function echoNeedle(body: string, len: number = ECHO_NEEDLE_LEN): string {
+  return Array.from(compactPlain(body)).slice(0, len).join("");
+}
+
+/**
+ * scrollback 断片に配送本文のエコー（＝ claude セッションが channel 本文を実際に描画したこと）が
+ * 含まれるかを判定する純関数。TUI の空白潰し・行折返しに耐えるよう compact 同士で照合する。
+ * needle が空（本文が空白のみ等）なら常に false（誤検知させない）。
+ */
+export function containsEcho(scrollbackChunk: string, body: string, len: number = ECHO_NEEDLE_LEN): boolean {
+  const needle = echoNeedle(body, len);
+  if (needle.length === 0) return false;
+  return compactPlain(scrollbackChunk).includes(needle);
+}
+
+/**
  * [B] idle 自動通知の per-agent クールダウン(ms)。同一エビが busy→idle を繰り返しても、
  * この時間内は B を 1 回しか出さない（master への通知洪水を防ぐ）。
  * env `EBI_IDLE_NOTIFY_COOLDOWN_MS` で調整可。
@@ -235,6 +283,11 @@ export class Agent {
   private readonly readyWaiters: ((ready: boolean) => void)[] = [];
   /** boot 猶予満了時に ready 昇格を再評価するためのタイマ。 */
   private bootTimer: NodeJS.Timeout | null = null;
+  /**
+   * 起動ゲート待ちの上限（GATE_SETTLE_MS）満了時に ready 昇格を再評価するタイマ。
+   * ダイアログを検知できないまま出力も止まった場合に、degrade 判定を確実に走らせる。
+   */
+  private gateSettleTimer: NodeJS.Timeout | null = null;
 
   // ===== 起動ゲート自動応答（workspace trust / development channels 警告）=====
   // notification 注入（EBI_INJECT_MODE=notify）で ebi-control を dev channel として使うと、
@@ -268,6 +321,21 @@ export class Agent {
   private readonly scrollbackBytes: number;
   private readonly scrollbackChunks: string[] = [];
   private scrollbackSize = 0;
+  /**
+   * これまでに追記した scrollback の総文字数（リングバッファで捨てた分も含む単調増加カウンタ）。
+   * 「ある時点以降に出力された分だけ」を切り出す（scrollbackSince）ための位置マークに使う。
+   */
+  private scrollbackTotalChars = 0;
+
+  // ===== channel（notification）配送のセッション到達確認 =====
+  /**
+   * このエビの channel 受信が「セッションに実際に届く」ことを一度でも確認できたか。
+   * 未確認のうちは deliver() が配送のたびに本文エコーを scrollback で照合し、
+   * 出なければ PTY 注入へフォールバックする（spawn 直後の取りこぼし根治）。
+   * 一度確認できたら以降は照合をスキップする（既存セッションへの再送は元々取りこぼさないため、
+   * 無駄な待ちと重複配送を作らない）。
+   */
+  private channelProven = false;
 
   constructor(
     id: string,
@@ -335,6 +403,10 @@ export class Agent {
         clearTimeout(this.bootTimer);
         this.bootTimer = null;
       }
+      if (this.gateSettleTimer) {
+        clearTimeout(this.gateSettleTimer);
+        this.gateSettleTimer = null;
+      }
       this.resolveReadyWaiters(false);
       this.handlers.onExit(this.id, exitCode);
     });
@@ -345,6 +417,15 @@ export class Agent {
       this.bootTimer = null;
       this.promoteReadyIfEligible();
     }, MIN_BOOT_MS + 50);
+
+    // 起動ゲート待ち（degrade）の再評価タイマ。ダイアログを検知できないまま出力も止まった
+    // ケースで、GATE_SETTLE_MS 満了後に確実に ready 判定をやり直す。
+    if (this.autoAnswerStartupGates) {
+      this.gateSettleTimer = setTimeout(() => {
+        this.gateSettleTimer = null;
+        this.promoteReadyIfEligible();
+      }, GATE_SETTLE_MS + 50);
+    }
   }
 
   getStatus(): AgentStatus {
@@ -411,7 +492,15 @@ export class Agent {
    */
   private promoteReadyIfEligible(): void {
     if (this.disposed || this.hasBeenReady) return;
-    if (Date.now() - this.spawnedAt < MIN_BOOT_MS) return;
+    const elapsed = Date.now() - this.spawnedAt;
+    if (elapsed < MIN_BOOT_MS) return;
+    // 起動ゲート自動応答が有効な agent は、dev-channels ダイアログへ応答するまで ready にしない。
+    // ダイアログはセッションを入力待ちで沈黙させ、その沈黙を idle 検出器が拾うため、従来の
+    // 「boot 猶予＋idle」だけだとダイアログ表示中に ready へ誤昇格していた（＝入力欄がまだ
+    // 無いのに本文を注入して吸われる／channel も未登録で捨てられる、の温床）。
+    // 保険: GATE_SETTLE_MS を過ぎてもゲートを検知できなければ従来判定へ degrade する
+    // （将来 claude がダイアログを出さなくなっても永久に ready にならない事故を防ぐ）。
+    if (this.autoAnswerStartupGates && !this.devChannelsGateAnswered && elapsed < GATE_SETTLE_MS) return;
     if (this.getStatus() !== "idle") return;
     this.hasBeenReady = true;
     this.handlers.onNotice(this.id, "ready（入力受付になりました）");
@@ -426,9 +515,46 @@ export class Agent {
     return this.scrollbackChunks.join("");
   }
 
+  /**
+   * 現在の scrollback 位置マークを返す。scrollbackSince(mark) と対で使い、
+   * 「この時点より後に出力された分」だけを検査するために使う（過去の同種メッセージを
+   * 到達エコーと誤認しないため）。
+   */
+  scrollbackMark(): number {
+    return this.scrollbackTotalChars;
+  }
+
+  /**
+   * mark 以降に出力された scrollback を返す。リングバッファで既に捨てられた区間は返せないため、
+   * 保持している範囲で最大限（＝実際より広い範囲）を返す（安全側: 検査対象が広がるだけ）。
+   */
+  scrollbackSince(mark: number): string {
+    const wanted = this.scrollbackTotalChars - mark;
+    if (wanted <= 0) return "";
+    const parts: string[] = [];
+    let acc = 0;
+    for (let i = this.scrollbackChunks.length - 1; i >= 0 && acc < wanted; i--) {
+      const chunk = this.scrollbackChunks[i]!;
+      parts.push(chunk);
+      acc += chunk.length;
+    }
+    return parts.reverse().join("");
+  }
+
+  /** channel 受信のセッション到達を一度でも確認できたか（deliver のエコー照合スキップ判定）。 */
+  isChannelProven(): boolean {
+    return this.channelProven;
+  }
+
+  /** channel 受信のセッション到達が確認できたことを記録する（以降のエコー照合を省く）。 */
+  markChannelProven(): void {
+    this.channelProven = true;
+  }
+
   /** PTY 出力チャンクをリングバッファに追記し、上限超過分を古い方から捨てる。 */
   private appendScrollback(data: string): void {
     if (this.scrollbackBytes <= 0 || data.length === 0) return;
+    this.scrollbackTotalChars += data.length;
     this.scrollbackChunks.push(data);
     this.scrollbackSize += Buffer.byteLength(data, "utf8");
     // 上限超過分を先頭（古い）から丸ごと捨てる。1 チャンクで上限超でも最低 1 件は残す。
@@ -575,6 +701,10 @@ export class Agent {
     if (this.bootTimer) {
       clearTimeout(this.bootTimer);
       this.bootTimer = null;
+    }
+    if (this.gateSettleTimer) {
+      clearTimeout(this.gateSettleTimer);
+      this.gateSettleTimer = null;
     }
     this.resolveReadyWaiters(false);
     // MVP は生存 agent のみスクロールバックを保持する方針。exit/kill で破棄する。

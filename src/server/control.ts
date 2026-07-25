@@ -71,7 +71,14 @@ export interface SendMessageInput {
 
 /** sendMessage の結果（index.ts の SendMessageResult と互換な最小形）。 */
 export type SendMessageOutcome =
-  | { ok: true; id: string; spawned: boolean; status: string }
+  | {
+      ok: true;
+      id: string;
+      spawned: boolean;
+      status: string;
+      /** 実際に使った配送経路（"notify" / "pty-fallback" / "pty"）。 */
+      via?: string;
+    }
   | { ok: false; error: string; spawned: boolean };
 
 /** 制御API が依存する処理（index.ts から注入する）。 */
@@ -338,7 +345,15 @@ export function createControlApi(deps: ControlDeps) {
           asEngineer: asBool(body.asEngineer),
         });
         if (result.ok) {
-          sendJson(res, 200, { ok: true, id: result.id, spawned: result.spawned, status: result.status });
+          // via（notify / pty-fallback / pty）も返す。spawn 直後の配送がどの経路で成立したかを
+          // 呼び出し側（master の send_message / e2e）から観測できるようにするため。
+          sendJson(res, 200, {
+            ok: true,
+            id: result.id,
+            spawned: result.spawned,
+            status: result.status,
+            via: result.via,
+          });
         } else {
           // not found / ready timeout 等は 400 で error と spawned を返す。
           sendJson(res, 400, { ok: false, error: result.error, spawned: result.spawned });

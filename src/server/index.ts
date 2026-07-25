@@ -5,7 +5,13 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join, extname, normalize } from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
-import { Registry, hasControlBridge, isNotifyMode, type WorktreeMeta } from "./registry.ts";
+import {
+  Registry,
+  hasControlBridge,
+  isNotifyMode,
+  type DeliverOutcome,
+  type WorktreeMeta,
+} from "./registry.ts";
 import { Mailbox } from "./mailbox.ts";
 import type { SpawnConfig, AgentHandlers, LaunchParams } from "./agent.ts";
 import { BASE_ALLOWED_DEV_CHANNELS } from "./agent.ts";
@@ -730,7 +736,14 @@ export interface SendMessageParams {
 
 /** sendMessage の結果。 */
 export type SendMessageResult =
-  | { ok: true; id: string; spawned: boolean; status: AgentStatus }
+  | {
+      ok: true;
+      id: string;
+      spawned: boolean;
+      status: AgentStatus;
+      /** 実際に使った配送経路（notify / pty-fallback / pty）。運用の可観測性・e2e の判定に使う。 */
+      via: DeliverOutcome["via"];
+    }
   | { ok: false; error: string; spawned: boolean };
 
 /**
@@ -740,12 +753,14 @@ export type SendMessageResult =
  *  1. 宛先が存在しない:
  *     - spawnIfMissing=false → { ok:false, error:"not found" }（notice も）
  *     - spawnIfMissing=true  → engineer として spawn（id は `to` を採用）→ spawned=true
- *  2. 対象が ready（入力受付）になるまで waitUntilReady(READY_WAIT_MS) で待つ。
- *     timeout したら { ok:false, error:"ready timeout" }（spawn 済みなら spawned=true で返す）。
- *  3. ready 後に agent.inject(from, message)（idle→即送信／busy→キューは既存ロジックに委ねる）。
+ *  2. spawn 直後なら ready（起動ゲート応答済み＋入力受付）まで待つ。ここで待つのは、
+ *     起動ゲート表示中に notification を push しても harness に黙って捨てられるため。
+ *  3. notification 経路（購読 live）なら registry.deliver へ。deliver は ACK に加えて
+ *     セッション到達（本文エコー）まで確認し、取れなければ PTY 注入へフォールバックする。
+ *  4. notification が使えないなら ready を待って agent.inject（idle→即送信／busy→キュー）。
  *
- * 「すでに立ち上がっている」= 1 をスキップし 2 が即 resolve → 3 で送信。
- * 「まだ」= 1 で spawn → 2 で ready 待ち → 3 で送信。分岐はこの関数内で完結する。
+ * 「すでに立ち上がっている」= 1・2 をスキップし 3/4 で送信。
+ * 「まだ」= 1 で spawn → 2 で ready 待ち → 3/4 で送信。分岐はこの関数内で完結する。
  */
 async function sendMessage(params: SendMessageParams): Promise<SendMessageResult> {
   const { to, message } = params;
@@ -783,6 +798,28 @@ async function sendMessage(params: SendMessageParams): Promise<SendMessageResult
     }
   }
 
+  // ---- 1.5. spawn 直後は「入力受付（ready）」まで待ってから経路を選ぶ ----
+  // 【2026-07-25 spawn 直後の本文消失の根治】
+  // spawn 直後の claude は起動ゲート（dev-channels 警告 / workspace trust）で止まっており、
+  // その間はセッションに ebi-control が channel として登録されていない（TUI に
+  // `server:ebi-control · no MCP server configured with that name` が出る）。一方、制御MCP
+  // ブリッジは別プロセスとして数百 ms で立ち上がり購読を張ってしまうため、購読確立だけを合図に
+  // notification を push すると harness に黙って捨てられ、本文が痕跡ゼロで消えていた。
+  // ready 判定は「起動ゲート応答済み＋idle」に強化してある（agent.ts）ので、spawn 直後だけ
+  // ここで ready を待ってレース窓を潰す。ready を待てなくても配送自体は続行する
+  // （notification 経路のセッション到達確認＋PTY フォールバックが後段で担保するため、
+  // ここで失敗にして本文を捨てるより届ける方を優先する）。
+  if (spawned) {
+    const bootReady = await agent.waitUntilReady(READY_WAIT_MS);
+    if (!bootReady) {
+      broadcast({
+        type: "notice",
+        id: to,
+        text: `${to} を spawn しましたが ready 待ちがタイムアウトしました（${READY_WAIT_MS}ms）。配送は継続します`,
+      });
+    }
+  }
+
   // ---- 2. notification 経路（優先）----
   // mailbox 経由の配送が有効 かつ 対象が制御MCP ブリッジを持つ（claude + --mcp-config）なら、
   // 購読確立を最大 SUBSCRIBE_WAIT_MS 待ってから mailbox へ push する。
@@ -796,9 +833,10 @@ async function sendMessage(params: SendMessageParams): Promise<SendMessageResult
     const subscribed =
       registry.hasActiveSubscriber(to) || (await registry.waitForSubscriber(to, SUBSCRIBE_WAIT_MS));
     if (subscribed) {
-      // deliver は ACK 到達確認を含み、取れなければ内部で PTY 注入へフォールバックする。
-      await registry.deliver(to, from, message);
-      return { ok: true, id: to, spawned, status: agent.getStatus() };
+      // deliver は ACK＋セッション到達（本文エコー）確認を含み、取れなければ内部で PTY 注入へ
+      // フォールバックする。
+      const outcome = await registry.deliver(to, from, message);
+      return { ok: true, id: to, spawned, status: agent.getStatus(), via: outcome.via };
     }
     broadcast({
       type: "notice",
@@ -822,7 +860,7 @@ async function sendMessage(params: SendMessageParams): Promise<SendMessageResult
 
   // ---- 4. 送信（idle→即送信／busy→キューは Agent.inject に委ねる）----
   agent.inject(from, message);
-  return { ok: true, id: to, spawned, status: agent.getStatus() };
+  return { ok: true, id: to, spawned, status: agent.getStatus(), via: "pty" };
 }
 
 /**
