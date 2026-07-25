@@ -11,6 +11,8 @@ import assert from "node:assert/strict";
 import {
   isDevChannelsAutoAnswerEligible,
   detectStartupGate,
+  containsEcho,
+  echoNeedle,
   BASE_ALLOWED_DEV_CHANNELS,
 } from "../src/server/agent.ts";
 import { isNotifySubscribeEnabled } from "../src/mcp/control-server.ts";
@@ -124,4 +126,42 @@ test("購読: 'off'/'0'/'false'/'OFF' → 無効", () => {
 test("購読: '1' や他の文字列 → 有効", () => {
   assert.equal(isNotifySubscribeEnabled("1"), true);
   assert.equal(isNotifySubscribeEnabled("yes"), true);
+});
+
+// ---- containsEcho / echoNeedle: channel 本文のセッション到達照合（spawn 直後の消失根治）----
+// claude TUI は channel 受信を `ebi-control: [from:master] <本文先頭>…` と、空白を潰し
+// 先頭を切り詰めて描画する。この描画を「セッションに実際に届いた」唯一の観測点として使うため、
+// compact 同士の前方一致で照合する。
+
+test("containsEcho: TUI が空白を潰して先頭だけ描画しても到達と判定する", () => {
+  const body = "[from:master] # タスク 2（到達計測用・トークン ACKOK2XEAYS）\n本文が続く…";
+  const rendered =
+    "\x1b[2m❯ ←\x1b[0mebi-control:[from:master]#タスク2（到達計測用・トークンACKOK2XEAYS…";
+  assert.equal(containsEcho(rendered, body), true);
+});
+
+test("containsEcho: 空白ありで描画された場合も到達と判定する", () => {
+  const body = "[from:master] hello world from ebi-team delivery";
+  assert.equal(containsEcho("ebi-control: [from:master] hello world from ebi-team…", body), true);
+});
+
+test("containsEcho: channel が捨てられ本文が描画されない scrollback は未到達と判定する", () => {
+  const body = "[from:master] # タスク 1（到達計測用・トークン ACKOK1XRQX7）";
+  // 実際の失敗ラウンドの scrollback（harness が channel を honor できなかったときの表示）。
+  const rendered =
+    "▎server:ebi-control · no MCP server configured with that name" +
+    "❯ Try \"refactor <filepath>\"⏵⏵ bypass permissions on";
+  assert.equal(containsEcho(rendered, body), false);
+});
+
+test("containsEcho: 本文が空/空白のみなら誤検知させない（常に false）", () => {
+  assert.equal(containsEcho("なんでも描画されている", "   \n  "), false);
+});
+
+test("echoNeedle: compact 後の先頭 N コードポイントを返す（サロゲートペアを割らない）", () => {
+  assert.equal(echoNeedle("[from:master] ab cd", 15), "[from:master]ab");
+  // 絵文字（サロゲートペア）が境界に来ても壊れた半端文字を作らない。
+  const needle = echoNeedle("🛠🛠🛠", 2);
+  assert.equal(needle, "🛠🛠");
+  assert.equal(Array.from(needle).length, 2);
 });

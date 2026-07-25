@@ -23,6 +23,7 @@
     "e2e:reverse-notify": "node scripts/e2e-reverse-notify.mjs",
     "e2e:notify-fallback": "node scripts/e2e-notify-fallback.mjs",
     "e2e:master-channel": "node scripts/e2e-master-channel.mjs",
+    "e2e:spawn-delivery": "node scripts/e2e-spawn-delivery.mjs",
     "e2e:usage": "node scripts/e2e-usage.mjs",
     "e2e:viewer": "node --import tsx scripts/e2e-viewer.mjs",
     "postinstall": "node scripts/fix-pty-helper.mjs"
