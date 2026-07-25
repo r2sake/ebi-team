@@ -15,10 +15,13 @@ import { test, before, after, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 
 // deliver の ACK 待ちタイムアウトを短くしてテストを速くする（registry.ts はモジュール読込時に
 // この env を読むので、動的 import より前に設定する）。
 process.env.EBI_DELIVER_ACK_TIMEOUT_MS = "300";
+// セッション到達確認（本文エコー）の待ちも短くする（同上・モジュール読込前に設定）。
+process.env.EBI_ECHO_CONFIRM_MS = "1500";
 delete process.env.EBI_INJECT_MODE; // notify モード（既定）で検証する。
 
 const { Registry } = await import("../src/server/registry.ts");
@@ -167,4 +170,92 @@ test("@all ブロードキャストは connected 各宛先の details を返し 
   assert.deepEqual(res.delivered, ["ebi-1"], "isolated は配信対象外");
   assert.equal(res.details.length, 1);
   assert.equal(res.details[0]!.id, "ebi-1");
+});
+
+// ===== セッション到達確認（本文エコー）: spawn 直後の本文消失の根治ガード =====
+// ブリッジ ACK は「control-server が notification を stdout へ書いた」までしか保証しない。
+// spawn 直後は claude 本体がまだ channel を登録しておらず harness が本文を黙って捨てるため、
+// ACK だけを信じると本文が痕跡ゼロで消える（2026-07-25 の実障害・live e2e で再現済み）。
+// deliver は ACK 後に「セッションが本文を描画したか」を scrollback で確認し、
+// 取れなければ PTY 注入へフォールバックする。
+//
+// 実 claude は使わず、`claude` という名前の cat スクリプト（＝ hasControlBridge を満たし、
+// PTY へ書いた内容がそのまま scrollback に出る）で channel 描画の有無を模す。
+
+const fakeClaudeDir = mkdtempSync(join(tmpdir(), "ebi-fake-claude-"));
+const fakeClaude = join(fakeClaudeDir, "claude");
+writeFileSync(fakeClaude, "#!/bin/sh\nexec cat\n", { mode: 0o755 });
+
+/** hasControlBridge を満たす起動パラメータ（command 名が claude ＋ --mcp-config）。 */
+const bridgeLaunch = (cwd: string) => ({
+  command: fakeClaude,
+  args: ["--mcp-config", "/dev/null"],
+  cwd,
+  model: null,
+});
+
+after(() => rmSync(fakeClaudeDir, { recursive: true, force: true }));
+
+test("回帰: ACK は取れたがセッションに本文が描画されない → PTY フォールバック（spawn 直後の消失根治）", async () => {
+  const mb = new Mailbox();
+  const reg = makeRegistry(mb);
+  reg.spawn(".", handlers, { id: "ebi-1", launch: bridgeLaunch(".") });
+
+  // ブリッジ役: ack は返すが、セッション（TUI）は本文を描画しない＝harness に捨てられた状態。
+  const bridge = (async () => {
+    const msgs = await mb.subscribe("ebi-1", 2000);
+    mb.ack("ebi-1", msgs.map((m) => m.id));
+  })();
+
+  const out = await reg.deliver("ebi-1", "master", "spawn 直後の大事なタスク本文");
+  await bridge;
+  assert.equal(out.via, "pty-fallback", "ACK だけでは到達とみなさず PTY へ載せ替える");
+  assert.equal(out.confirmed, true);
+});
+
+test("ACK＋セッションが本文を描画 → via:notify（以降は確認をスキップ＝channelProven）", async () => {
+  const mb = new Mailbox();
+  const reg = makeRegistry(mb);
+  const agent = reg.spawn(".", handlers, { id: "ebi-2", launch: bridgeLaunch(".") });
+
+  // ブリッジ役: ack を返し、さらに「セッションが channel 本文を描画した」状態を
+  // PTY へのエコー（fake claude = cat）で作る。
+  const bridge = (async () => {
+    const msgs = await mb.subscribe("ebi-2", 2000);
+    mb.ack("ebi-2", msgs.map((m) => m.id));
+    for (const m of msgs) agent.write(`ebi-control: [from:${m.from}] ${m.message}\n`);
+  })();
+
+  const out = await reg.deliver("ebi-2", "master", "描画される本文です");
+  await bridge;
+  assert.equal(out.via, "notify", "セッション到達（本文エコー）まで確認できた");
+  assert.equal(out.confirmed, true);
+  assert.equal(agent.isChannelProven(), true, "以降の配送はエコー確認をスキップする");
+
+  // 2 通目: エコーを出さなくても channelProven により notify のまま（無駄な待ち・重複を作らない）。
+  const bridge2 = (async () => {
+    const msgs = await mb.subscribe("ebi-2", 2000);
+    mb.ack("ebi-2", msgs.map((m) => m.id));
+  })();
+  const out2 = await reg.deliver("ebi-2", "master", "2 通目");
+  await bridge2;
+  assert.equal(out2.via, "notify");
+});
+
+test("エコー照合は push 以降の出力だけを見る（過去の同一本文を到達と誤認しない）", async () => {
+  const mb = new Mailbox();
+  const reg = makeRegistry(mb);
+  const agent = reg.spawn(".", handlers, { id: "ebi-3", launch: bridgeLaunch(".") });
+
+  // push より「前」に同一本文が scrollback に出ている状況を作る。
+  agent.write("ebi-control: [from:master] 同じ本文\n");
+  await sleep(300);
+
+  const bridge = (async () => {
+    const msgs = await mb.subscribe("ebi-3", 2000);
+    mb.ack("ebi-3", msgs.map((m) => m.id));
+  })();
+  const out = await reg.deliver("ebi-3", "master", "同じ本文");
+  await bridge;
+  assert.equal(out.via, "pty-fallback", "過去の描画は到達の根拠にしない");
 });
