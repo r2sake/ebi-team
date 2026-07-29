@@ -9,8 +9,13 @@
 //   - EBI_VIEWER_ROOTS（`:` 区切り・未設定時は `$HOME/workspace`）配下に限定。
 //   - realpath でシンボリックリンク脱出を防止（実体が許可ルート配下にあること）。
 //   - 拡張子は .md / .markdown / .txt に限定、サイズ上限あり、書き込み口は作らない。
+// - 永続化（サーバ再起動をまたいでタブを復元する）:
+//   - open/close のたびに `.ebi-team/viewers.json` へ `{id, path, title, openedAt}` を atomic 書き出し。
+//   - 起動時 restore() で読み直し、同じ id/openedAt のまま再登録する（content は読み直したスナップショット）。
+//   - ファイル欠損・許可ルート外・拡張子/サイズ違反のエントリは warn して skip し、viewers.json から掃除する
+//     （fail-soft: 起動は止めない）。
 
-import { readFile, readdir, realpath, stat } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, resolve, dirname, extname, basename, join, sep } from "node:path";
 import type { ViewerRecord, ViewerFormat, DirEntry, DirListing } from "../shared/protocol.ts";
@@ -55,6 +60,39 @@ export interface ViewerRegistryOptions {
   roots?: string[];
   /** サイズ上限（バイト・未指定は env or 既定 1MB）。 */
   maxBytes?: number;
+  /**
+   * 永続化先（`.ebi-team/viewers.json`）。未指定なら永続化しない（従来どおりメモリのみ）。
+   * テストでは temp dir 配下を渡す。
+   */
+  storePath?: string;
+}
+
+/** viewers.json の 1 エントリ（content は保存しない＝復元時にファイルから読み直す）。 */
+interface PersistedViewer {
+  id: string;
+  path: string;
+  title: string;
+  openedAt: number;
+}
+
+/** viewers.json 全体。version は将来の形式変更に備えた識別子。 */
+interface ViewerStoreFile {
+  version: 1;
+  savedAt: string;
+  viewers: PersistedViewer[];
+}
+
+/** restore() の結果（起動ログ用）。 */
+export interface ViewerRestoreResult {
+  restored: ViewerRecord[];
+  /** 復元できず掃除したエントリ（path と理由）。 */
+  skipped: { path: string; reason: string }[];
+}
+
+/** `viewer-<n>` から n を取り出す（採番の続きを決めるため）。合致しなければ 0。 */
+function seqOfViewerId(id: string): number {
+  const m = /^viewer-(\d+)$/.exec(id);
+  return m ? Number(m[1]) : 0;
 }
 
 /**
@@ -146,11 +184,15 @@ export class ViewerRegistry {
   private seq = 0;
   private readonly roots: string[];
   private readonly maxBytes: number;
+  private readonly storePath: string | null;
+  /** 永続化の直列化キュー（open/close が連続しても書き込み順を保つ）。 */
+  private persistChain: Promise<void> = Promise.resolve();
 
   constructor(opts: ViewerRegistryOptions = {}) {
     this.roots = opts.roots ?? defaultViewerRoots();
     this.maxBytes =
       opts.maxBytes ?? (Number(process.env.EBI_VIEWER_MAX_BYTES) || DEFAULT_MAX_BYTES);
+    this.storePath = opts.storePath ?? null;
   }
 
   /** 現在の許可ルート（表示・ログ用）。 */
@@ -172,8 +214,9 @@ export class ViewerRegistry {
     const id = `viewer-${++this.seq}`;
     const title =
       params.title && params.title.trim() ? params.title.trim() : basename(absPath);
-    const rec: ViewerRecord = { id, path: absPath, title, format, content };
+    const rec: ViewerRecord = { id, path: absPath, title, format, content, openedAt: Date.now() };
     this.viewers.set(id, rec);
+    await this.persist();
     return rec;
   }
 
@@ -248,13 +291,134 @@ export class ViewerRegistry {
     return { atRoot: false, cwd: realPath, up, entries: [...dirs, ...files], roots: [...this.roots] };
   }
 
-  /** viewer を閉じる。存在すれば true。 */
+  /**
+   * viewer を閉じる。存在すれば true。
+   * 呼び出し元（WS ハンドラ）が同期のため、永続化は fire-and-forget で走らせる
+   * （書き込み完了を待ちたい場合は flush() を await する）。
+   */
   close(id: string): boolean {
-    return this.viewers.delete(id);
+    const existed = this.viewers.delete(id);
+    if (existed) void this.persist();
+    return existed;
   }
 
   /** 現在の viewer 一覧（broadcast 用・content 込み）。 */
   list(): ViewerRecord[] {
     return [...this.viewers.values()];
+  }
+
+  // ===== 永続化（viewers.json）=====
+
+  /** 進行中の永続化がすべて終わるまで待つ（テスト・終了処理用）。 */
+  async flush(): Promise<void> {
+    await this.persistChain;
+  }
+
+  /**
+   * 現在の viewer 一覧を viewers.json へ atomic に書き出す。
+   * 失敗しても運用は継続できるべきなので warn のみ（throw しない）。
+   */
+  private persist(): Promise<void> {
+    if (!this.storePath) return Promise.resolve();
+    this.persistChain = this.persistChain.then(() => this.writeStore());
+    return this.persistChain;
+  }
+
+  /** tmp へ書いてから rename する（クラッシュ時に中途半端な JSON を残さない）。 */
+  private async writeStore(): Promise<void> {
+    const storePath = this.storePath;
+    if (!storePath) return;
+    const payload: ViewerStoreFile = {
+      version: 1,
+      savedAt: new Date().toISOString(),
+      viewers: [...this.viewers.values()].map(({ id, path, title, openedAt }) => ({
+        id,
+        path,
+        title,
+        openedAt: openedAt ?? 0,
+      })),
+    };
+    const tmpPath = `${storePath}.tmp-${process.pid}`;
+    try {
+      await mkdir(dirname(storePath), { recursive: true });
+      await writeFile(tmpPath, JSON.stringify(payload, null, 2), "utf8");
+      await rename(tmpPath, storePath);
+    } catch (err) {
+      console.warn("[viewer] viewers.json の保存に失敗:", err);
+      // 失敗した tmp は残さない（次回の rename 対象にもならないが掃除しておく）。
+      try {
+        await unlink(tmpPath);
+      } catch {
+        // 無ければ何もしない。
+      }
+    }
+  }
+
+  /**
+   * viewers.json を読み、保存されていた viewer を再登録する（サーバ起動時に 1 回）。
+   * fail-soft: ファイル無し・壊れた JSON・個々のエントリ検証失敗はいずれも起動を止めず、
+   * 失敗エントリは warn して skip し、掃除済みの内容で viewers.json を書き戻す。
+   */
+  async restore(): Promise<ViewerRestoreResult> {
+    const result: ViewerRestoreResult = { restored: [], skipped: [] };
+    if (!this.storePath) return result;
+
+    let raw: string;
+    try {
+      raw = await readFile(this.storePath, "utf8");
+    } catch {
+      return result; // 未作成（初回起動）は正常系。
+    }
+
+    let entries: PersistedViewer[];
+    try {
+      const parsed = JSON.parse(raw) as Partial<ViewerStoreFile>;
+      entries = Array.isArray(parsed?.viewers) ? (parsed.viewers as PersistedViewer[]) : [];
+    } catch (err) {
+      console.warn(`[viewer] viewers.json が壊れているため復元をスキップ: ${(err as Error).message}`);
+      return result;
+    }
+
+    // 保存順ではなく openedAt 昇順で復元し、再起動前のタブ並びを保つ。
+    const sane = entries
+      .filter((e) => e && typeof e.path === "string" && e.path.trim() !== "")
+      .sort((a, b) => (Number(a.openedAt) || 0) - (Number(b.openedAt) || 0));
+
+    for (const e of sane) {
+      try {
+        // open と同じ検証（許可ルート・拡張子・サイズ・symlink 脱出）を通す。
+        const { realPath, absPath, format } = await resolveViewerPath(
+          e.path,
+          this.roots,
+          this.maxBytes,
+        );
+        const content = await readFile(realPath, "utf8");
+        const id =
+          typeof e.id === "string" && /^viewer-\d+$/.test(e.id) && !this.viewers.has(e.id)
+            ? e.id
+            : `viewer-${this.seq + 1}`;
+        const title =
+          typeof e.title === "string" && e.title.trim() ? e.title.trim() : basename(absPath);
+        const rec: ViewerRecord = {
+          id,
+          path: absPath,
+          title,
+          format,
+          content,
+          openedAt: Number(e.openedAt) || Date.now(),
+        };
+        this.viewers.set(id, rec);
+        this.seq = Math.max(this.seq, seqOfViewerId(id));
+        result.restored.push(rec);
+      } catch (err) {
+        const reason = (err as Error).message;
+        console.warn(`[viewer] 復元できないためスキップ: ${e.path}（${reason}）`);
+        result.skipped.push({ path: e.path, reason });
+      }
+    }
+
+    // skip が出た場合は掃除後の内容で書き戻す（次回起動で同じ warn を繰り返さない）。
+    if (result.skipped.length > 0) await this.persist();
+    return result;
   }
 }

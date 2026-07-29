@@ -26,6 +26,7 @@
     "e2e:spawn-delivery": "node scripts/e2e-spawn-delivery.mjs",
     "e2e:usage": "node scripts/e2e-usage.mjs",
     "e2e:viewer": "node --import tsx scripts/e2e-viewer.mjs",
+    "e2e:viewer-persist": "node scripts/e2e-viewer-persist.mjs",
     "postinstall": "node scripts/fix-pty-helper.mjs"
   },
   "dependencies": {

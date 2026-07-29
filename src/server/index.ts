@@ -138,7 +138,9 @@ const usageStore = new UsageStore();
 
 // viewer（読み取り専用の md/txt プレビュー）コレクション。master の open_viewer で開き、
 // クライアントは registry サイドバーに合成行として出す。プロセスは持たない。
-const viewerRegistry = new ViewerRegistry();
+// viewers.json（open 中の viewer の永続化先）。再起動後に同じタブを復元するために使う。
+const VIEWERS_PATH = process.env.EBI_VIEWERS_PATH ?? join(process.cwd(), ".ebi-team", "viewers.json");
+const viewerRegistry = new ViewerRegistry({ storePath: VIEWERS_PATH });
 
 // ===== 接続中の WebSocket クライアント集合 =====
 const clients = new Set<WebSocket>();
@@ -971,6 +973,9 @@ async function loadAndApplyDevChannelsAllowlist(): Promise<void> {
 await loadAndRegisterCustomRoles();
 await loadAndApplyDevChannelsAllowlist();
 
+// 前回終了時に開いていた viewer を復元する（fail-soft: 個別エントリの失敗は warn して掃除）。
+const viewerRestore = await viewerRegistry.restore();
+
 // ===== 起動 / 終了処理 =====
 httpServer.listen(PORT, HOST, () => {
   console.log(`[ebi-team] サーバ起動: http://${HOST}:${PORT}  (WS: ws://${HOST}:${PORT}/ws)`);
@@ -993,6 +998,10 @@ httpServer.listen(PORT, HOST, () => {
   console.log(`[ebi-team] デフォルト cwd: ${DEFAULT_CWD}`);
   console.log(`[ebi-team] idle しきい値: ${IDLE_THRESHOLD_MS}ms / registry ダンプ: ${DUMP_PATH}`);
   console.log(`[ebi-team] viewer 許可ルート: ${viewerRegistry.getRoots().join(", ")}`);
+  console.log(
+    `[ebi-team] viewer 永続化: ${VIEWERS_PATH}（復元 ${viewerRestore.restored.length}件` +
+      `${viewerRestore.skipped.length > 0 ? ` / skip ${viewerRestore.skipped.length}件` : ""}）`,
+  );
   // 監督機能の状態のみ表示。キー値は出さない。
   console.log(`[ebi-team] ${supervisor.describeStartup()}`);
   console.log(`[ebi-team] dev フロント: http://localhost:5173 （Vite）`);

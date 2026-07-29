@@ -301,6 +301,8 @@ function startServer() {
       EBI_PORT: String(PORT),
       EBI_COMMAND: "bash",
       EBI_DUMP_PATH: join(tmpDir, "registry.json"),
+      // viewer 永続化先も temp に隔離する（本番 .ebi-team/viewers.json を汚さないため必須）。
+      EBI_VIEWERS_PATH: join(tmpDir, "viewers.json"),
       EBI_VIEWER_ROOTS: rootDir,
       EBI_IDLE_NOTIFY: "off",
     },
