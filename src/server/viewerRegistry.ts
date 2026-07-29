@@ -9,8 +9,12 @@
 //   - EBI_VIEWER_ROOTS（`:` 区切り・未設定時は `$HOME/workspace`）配下に限定。
 //   - realpath でシンボリックリンク脱出を防止（実体が許可ルート配下にあること）。
 //   - 拡張子は .md / .markdown / .txt に限定、サイズ上限あり、書き込み口は作らない。
+// - 永続化（サーバ再起動をまたぐ復元）:
+//   - agent 側 Registry の流儀に合わせ、一覧が変わるたび .ebi-team/viewers.json へ JSON ダンプ。
+//   - content は保存しない（復元時にファイルを読み直す＝古いスナップショットを蘇らせない）。
+//   - 復元は必ず open() 経路＝resolveViewerPath の検証を通す。消えたファイルや検証NGはスキップ。
 
-import { readFile, readdir, realpath, stat } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, resolve, dirname, extname, basename, join, sep } from "node:path";
 import type { ViewerRecord, ViewerFormat, DirEntry, DirListing } from "../shared/protocol.ts";
@@ -55,6 +59,21 @@ export interface ViewerRegistryOptions {
   roots?: string[];
   /** サイズ上限（バイト・未指定は env or 既定 1MB）。 */
   maxBytes?: number;
+  /** 一覧ダンプの保存先（未指定は env or 既定 `<cwd>/.ebi-team/viewers.json`）。 */
+  dumpPath?: string;
+}
+
+/** viewers.json に保存する 1 件分（content は保存しない＝復元時に読み直す）。 */
+interface ViewerDumpEntry {
+  id: string;
+  path: string;
+  title: string;
+  format: ViewerFormat;
+}
+
+/** viewer 一覧ダンプの既定パス。agent 側 registry.json と同じ `.ebi-team/` 配下に置く。 */
+export function defaultViewerDumpPath(): string {
+  return process.env.EBI_VIEWER_DUMP_PATH ?? join(process.cwd(), ".ebi-team", "viewers.json");
 }
 
 /**
@@ -146,11 +165,18 @@ export class ViewerRegistry {
   private seq = 0;
   private readonly roots: string[];
   private readonly maxBytes: number;
+  private readonly dumpPath: string;
 
   constructor(opts: ViewerRegistryOptions = {}) {
     this.roots = opts.roots ?? defaultViewerRoots();
     this.maxBytes =
       opts.maxBytes ?? (Number(process.env.EBI_VIEWER_MAX_BYTES) || DEFAULT_MAX_BYTES);
+    this.dumpPath = opts.dumpPath ?? defaultViewerDumpPath();
+  }
+
+  /** 一覧ダンプの保存先（表示・ログ用）。 */
+  getDumpPath(): string {
+    return this.dumpPath;
   }
 
   /** 現在の許可ルート（表示・ログ用）。 */
@@ -163,13 +189,26 @@ export class ViewerRegistry {
    * content は open 時点のスナップショット（読み取り専用）。
    */
   async open(params: { path: string; title?: string }): Promise<ViewerRecord> {
+    const rec = await this.openEntry(params);
+    void this.dump();
+    return rec;
+  }
+
+  /**
+   * open の実体。復元時は既存 id を引き継ぎたいので forcedId を受ける。
+   * ダンプは呼び出し側が行う（復元では全件登録後に 1 回だけ書けばよいため）。
+   */
+  private async openEntry(
+    params: { path: string; title?: string },
+    forcedId?: string,
+  ): Promise<ViewerRecord> {
     const { realPath, absPath, format } = await resolveViewerPath(
       params.path,
       this.roots,
       this.maxBytes,
     );
     const content = await readFile(realPath, "utf8");
-    const id = `viewer-${++this.seq}`;
+    const id = forcedId ?? `viewer-${++this.seq}`;
     const title =
       params.title && params.title.trim() ? params.title.trim() : basename(absPath);
     const rec: ViewerRecord = { id, path: absPath, title, format, content };
@@ -250,11 +289,77 @@ export class ViewerRegistry {
 
   /** viewer を閉じる。存在すれば true。 */
   close(id: string): boolean {
-    return this.viewers.delete(id);
+    const existed = this.viewers.delete(id);
+    if (existed) void this.dump();
+    return existed;
   }
 
   /** 現在の viewer 一覧（broadcast 用・content 込み）。 */
   list(): ViewerRecord[] {
     return [...this.viewers.values()];
+  }
+
+  /**
+   * 一覧を dumpPath へ JSON 書き出しする（open/close のたび）。
+   * content は保存しない。書き込み失敗はサーバを落とさず警告のみ（agent 側 Registry と同じ流儀）。
+   */
+  private async dump(): Promise<void> {
+    try {
+      await mkdir(dirname(this.dumpPath), { recursive: true });
+      const snapshot = {
+        dumpedAt: new Date().toISOString(),
+        viewers: [...this.viewers.values()].map(
+          ({ id, path, title, format }): ViewerDumpEntry => ({ id, path, title, format }),
+        ),
+      };
+      await writeFile(this.dumpPath, JSON.stringify(snapshot, null, 2), "utf8");
+    } catch (err) {
+      console.warn("[viewer] dump 失敗:", err);
+    }
+  }
+
+  /**
+   * dumpPath から前回の viewer 一覧を復元する（サーバ起動時に 1 回）。
+   * 各エントリは通常の open 経路（resolveViewerPath の許可ルート/拡張子/サイズ/symlink 検証）を通す。
+   * ファイルが消えている・検証NGのエントリはスキップして理由を返す（サーバは落とさない）。
+   * 戻り値は呼び出し側のログ/broadcast 判断用。
+   */
+  async restore(): Promise<{ restored: ViewerRecord[]; skipped: { path: string; reason: string }[] }> {
+    const restored: ViewerRecord[] = [];
+    const skipped: { path: string; reason: string }[] = [];
+
+    let entries: ViewerDumpEntry[];
+    try {
+      const raw = await readFile(this.dumpPath, "utf8");
+      const parsed = JSON.parse(raw) as { viewers?: unknown };
+      if (!Array.isArray(parsed?.viewers)) return { restored, skipped };
+      entries = parsed.viewers as ViewerDumpEntry[];
+    } catch (err) {
+      // ダンプ無し（初回起動）は正常系。壊れている場合のみ警告して空復元にする。
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        console.warn("[viewer] dump 読み込み失敗（復元をスキップ）:", err);
+      }
+      return { restored, skipped };
+    }
+
+    for (const e of entries) {
+      if (!e || typeof e.path !== "string") continue;
+      try {
+        const rec = await this.openEntry(
+          { path: e.path, title: typeof e.title === "string" ? e.title : undefined },
+          typeof e.id === "string" && e.id ? e.id : undefined,
+        );
+        restored.push(rec);
+        // 復元 id と採番カウンタが衝突しないよう seq を進める（`viewer-N` の N を吸収）。
+        const n = Number(/^viewer-(\d+)$/.exec(rec.id)?.[1]);
+        if (Number.isFinite(n) && n > this.seq) this.seq = n;
+      } catch (err) {
+        skipped.push({ path: e.path, reason: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    // 復元でスキップが出た分をダンプへ反映しておく（次回起動で再試行しない）。
+    if (skipped.length > 0) void this.dump();
+    return { restored, skipped };
   }
 }

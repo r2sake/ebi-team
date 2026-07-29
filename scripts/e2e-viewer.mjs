@@ -234,7 +234,7 @@ async function unitPath() {
   }
 
   // ViewerRegistry open/close
-  const reg = new ViewerRegistry({ roots, maxBytes: maxBytes * 100 });
+  const reg = new ViewerRegistry({ roots, maxBytes: maxBytes * 100, dumpPath: join(tmpDir, "viewers-unit.json") });
   const rec = await reg.open({ path: mdPath, title: "計画" });
   if (rec.id.startsWith("viewer-") && rec.title === "計画" && rec.content.includes("# 見出し1"))
     ok(`ViewerRegistry.open（id=${rec.id}・content スナップショット込み）`);
@@ -252,7 +252,7 @@ async function unitPath() {
   else fail("存在しない id の close が true を返した");
 
   // ---- listDir（ファイルピッカー用のディレクトリ列挙）----
-  const reg2 = new ViewerRegistry({ roots, maxBytes: maxBytes * 100 });
+  const reg2 = new ViewerRegistry({ roots, maxBytes: maxBytes * 100, dumpPath: join(tmpDir, "viewers-unit.json") });
 
   // ルート一覧（path 省略）。
   const rootListing = await reg2.listDir();
@@ -301,6 +301,9 @@ function startServer() {
       EBI_PORT: String(PORT),
       EBI_COMMAND: "bash",
       EBI_DUMP_PATH: join(tmpDir, "registry.json"),
+      // viewer 一覧ダンプも temp へ隔離する（実運用の .ebi-team/viewers.json を汚さない・
+      // 単体パートが書いた viewers-unit.json も復元してこない）。
+      EBI_VIEWER_DUMP_PATH: join(tmpDir, "viewers-e2e.json"),
       EBI_VIEWER_ROOTS: rootDir,
       EBI_IDLE_NOTIFY: "off",
     },

@@ -194,6 +194,24 @@ function broadcastViewers(): void {
 }
 
 /**
+ * サーバ起動時に前回の viewer 一覧を復元する。
+ * 復元は open 経路（許可ルート/拡張子/サイズ検証）を通り、消えたファイル等はスキップされる。
+ * 復元後に broadcast し、以後の新規 WS 接続にも接続直後送信で一覧が届く。
+ */
+async function restoreViewers(): Promise<void> {
+  const { restored, skipped } = await viewerRegistry.restore();
+  for (const s of skipped) {
+    console.warn(`[ebi-team] viewer 復元スキップ: ${s.path} (${s.reason})`);
+  }
+  if (restored.length > 0) {
+    console.log(
+      `[ebi-team] viewer 復元: ${restored.length}件 (${restored.map((r) => r.title).join(", ")})`,
+    );
+    broadcastViewers();
+  }
+}
+
+/**
  * worktree 由来 agent の kill/exit 後に git worktree を remove する。
  * 未コミット変更等で remove が失敗した場合は **force せず**、残置して notice で通知する
  * （データ保護優先）。成功時も通知する。
@@ -993,6 +1011,9 @@ httpServer.listen(PORT, HOST, () => {
   console.log(`[ebi-team] デフォルト cwd: ${DEFAULT_CWD}`);
   console.log(`[ebi-team] idle しきい値: ${IDLE_THRESHOLD_MS}ms / registry ダンプ: ${DUMP_PATH}`);
   console.log(`[ebi-team] viewer 許可ルート: ${viewerRegistry.getRoots().join(", ")}`);
+  console.log(`[ebi-team] viewer ダンプ: ${viewerRegistry.getDumpPath()}`);
+  // 前回終了時の viewer 一覧を復元する（非同期・失敗してもサーバは継続）。
+  void restoreViewers();
   // 監督機能の状態のみ表示。キー値は出さない。
   console.log(`[ebi-team] ${supervisor.describeStartup()}`);
   console.log(`[ebi-team] dev フロント: http://localhost:5173 （Vite）`);
