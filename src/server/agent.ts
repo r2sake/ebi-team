@@ -161,6 +161,56 @@ const IDLE_NOTIFY_ENABLED = !["off", "0", "false"].includes(
   (process.env.EBI_IDLE_NOTIFY ?? "on").toLowerCase(),
 );
 
+/**
+ * TUI を「代替スクリーン（alternate screen）」ではなく通常バッファへインライン描画させるための
+ * 既定 env。ブラウザ側 xterm.js のスクロールバックを機能させるために必須。
+ *
+ * 背景（実測 claude 2.1.198）:
+ * - claude CLI は起動直後に `ESC[?1049h`（代替スクリーン ON）＋ `ESC[?1000h/1002h/1006h`
+ *   （マウストラッキング ON）を送り、セッション中 `ESC[?1049l` を送らない。
+ * - 代替スクリーンでは xterm.js は **スクロールバックを一切持たない**（仕様）。さらにマウス
+ *   トラッキング中はホイールが端末側スクロールではなくアプリへ転送される。
+ *   結果、ブラウザのペインは「claude 内部ビューの見えている範囲」しか見られなくなり、
+ *   /compact のような全画面再描画（内部ビューのリセット）が走ると過去ログを辿れなくなる。
+ *   タッチ端末はホイールが無いためスクロール手段が完全に消える（既知バックログと同根）。
+ * - `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` を与えると 1049/1000/1002/1006 を一切送らず、
+ *   通常バッファへインライン追記する（実測で確認）。これで xterm.js の scrollback が効く。
+ *
+ * env `EBI_INLINE_TUI` を "off"/"0"/"false" にすると注入しない（従来挙動へ戻す非常口）。
+ * 親 env / launch.env で同名キーを明示指定した場合はそちらが優先される。
+ */
+const INLINE_TUI_ENABLED = !["off", "0", "false"].includes(
+  (process.env.EBI_INLINE_TUI ?? "on").toLowerCase(),
+);
+
+/** INLINE_TUI_ENABLED のときに既定値として注入する env。 */
+const INLINE_TUI_ENV: Record<string, string> = {
+  CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: "1",
+  // 代替スクリーン OFF なら現行版はマウス報告を送らないが、将来版でホイールを奪われないよう保険。
+  CLAUDE_CODE_DISABLE_MOUSE: "1",
+};
+
+/**
+ * pty に渡す env を組み立てる純関数。優先度は低い順に
+ * 「インライン TUI 既定 < 親 env < launch.env」。
+ * 親 env に同名キーがあればユーザーの明示指定として尊重する。
+ */
+export function buildSpawnEnv(
+  parentEnv: Record<string, string | undefined>,
+  launchEnv?: Record<string, string>,
+  inlineTui: boolean = INLINE_TUI_ENABLED,
+): Record<string, string> {
+  const merged: Record<string, string> = inlineTui ? { ...INLINE_TUI_ENV } : {};
+  // 値が undefined のキーで既定を握り潰さない（spread だと undefined でも上書きされてしまう）。
+  for (const [key, value] of Object.entries(parentEnv)) {
+    if (value !== undefined) merged[key] = value;
+  }
+  for (const [key, value] of Object.entries(launchEnv ?? {})) {
+    if (value !== undefined) merged[key] = value;
+  }
+  return merged;
+}
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** spawn する対象コマンドの設定（サーバ全体の既定値）。 */
@@ -367,9 +417,8 @@ export class Agent {
 
     // 引数配列方式で起動（シェル非経由）。長文の --append-system-prompt も安全に渡る。
     // launch.env があれば親 env にマージする（engineer の EBI_ID 等。子の stdio MCP が継承する）。
-    const spawnEnv = launch.env
-      ? { ...(process.env as Record<string, string>), ...launch.env }
-      : (process.env as { [key: string]: string });
+    // さらに TUI をインライン描画させる既定 env を最下位優先で敷く（xterm.js のスクロール確保）。
+    const spawnEnv = buildSpawnEnv(process.env, launch.env);
     this.proc = pty.spawn(launch.command, launch.args, {
       name: "xterm-color",
       cols: 80,

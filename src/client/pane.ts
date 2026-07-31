@@ -119,7 +119,10 @@ export class Pane {
       fontSize: 12,
       fontFamily: 'Menlo, Monaco, "Courier New", monospace',
       theme: { background: "#000000" },
-      scrollback: 5000,
+      // インライン TUI 化（サーバ側で CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1）により、
+      // 通常バッファへ実ログが積まれてスクロールバックが機能する。長時間セッションでも
+      // 遡れるよう広めに取る（代替スクリーン時代は事実上 0 行だった）。
+      scrollback: 20000,
     });
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);

@@ -77,8 +77,10 @@ const READY_WAIT_MS = Number(process.env.EBI_READY_WAIT_MS ?? 30000);
 const SUBSCRIBE_WAIT_MS = Number(process.env.EBI_SUBSCRIBE_WAIT_MS ?? 20000);
 // registry のダンプ先。
 const DUMP_PATH = process.env.EBI_DUMP_PATH ?? join(process.cwd(), ".ebi-team", "registry.json");
-// 再アタッチ用スクロールバックのリングバッファ上限（バイト相当・既定 256KB）。
-const SCROLLBACK_BYTES = Number(process.env.EBI_SCROLLBACK_BYTES ?? 256 * 1024);
+// 再アタッチ用スクロールバックのリングバッファ上限（バイト相当・既定 1MB）。
+// インライン TUI 化（agent.ts の INLINE_TUI_ENV）以降、ここには代替スクリーンの再描画ノイズでは
+// なく「実ログ」が積まれるため、リロード後に十分遡れるよう既定を広げている。
+const SCROLLBACK_BYTES = Number(process.env.EBI_SCROLLBACK_BYTES ?? 1024 * 1024);
 // 固定エビ config のパス（無ければ固定エビ機能 OFF）。
 const CONFIG_PATH = process.env.EBI_CONFIG_PATH ?? join(process.cwd(), "ebi-team.config.json");
 // 役割別 MCP config（reply_to_master 等の最小権限）のパス。
