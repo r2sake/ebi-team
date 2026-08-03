@@ -13,6 +13,7 @@ import {
   type WorktreeMeta,
 } from "./registry.ts";
 import { Mailbox } from "./mailbox.ts";
+import { configureDeliveryLog, deliveryLogPath, logDelivery } from "./deliveryLog.ts";
 import type { SpawnConfig, AgentHandlers, LaunchParams } from "./agent.ts";
 import { BASE_ALLOWED_DEV_CHANNELS } from "./agent.ts";
 import { addWorktree, removeWorktree } from "./git.ts";
@@ -77,6 +78,14 @@ const READY_WAIT_MS = Number(process.env.EBI_READY_WAIT_MS ?? 30000);
 const SUBSCRIBE_WAIT_MS = Number(process.env.EBI_SUBSCRIBE_WAIT_MS ?? 20000);
 // registry のダンプ先。
 const DUMP_PATH = process.env.EBI_DUMP_PATH ?? join(process.cwd(), ".ebi-team", "registry.json");
+// 配送イベントの恒久ログ（JSONL）。tty の console だけでは事後追跡できなかった反省から、
+// フォールバック・二重購読・滞留・破棄をファイルにも残す。env EBI_DELIVERY_LOG_PATH で変更、
+// "off" で無効化（console のみ）。
+const DELIVERY_LOG_PATH =
+  process.env.EBI_DELIVERY_LOG_PATH === "off"
+    ? null
+    : (process.env.EBI_DELIVERY_LOG_PATH ?? join(process.cwd(), ".ebi-team", "delivery.log"));
+configureDeliveryLog(DELIVERY_LOG_PATH);
 // 再アタッチ用スクロールバックのリングバッファ上限（バイト相当・既定 256KB）。
 const SCROLLBACK_BYTES = Number(process.env.EBI_SCROLLBACK_BYTES ?? 256 * 1024);
 // 固定エビ config のパス（無ければ固定エビ機能 OFF）。
@@ -121,7 +130,11 @@ const spawnConfig: SpawnConfig = {
 // EBI_LIVENESS_WINDOW_MS で合わせて上げること（下回るとライブなブリッジを誤って dead 判定する）。
 const LIVENESS_WINDOW_MS =
   Number(process.env.EBI_LIVENESS_WINDOW_MS) || Mailbox.DEFAULT_LIVENESS_WINDOW_MS;
-const mailbox = new Mailbox(LIVENESS_WINDOW_MS);
+// 購読所有権の失効時間（ms）。所有者の long-poll がこの時間 1 度も張り直されなければ、
+// 別トークンの購読者が引き継げる（正当な再接続の救済。既定 30s < long-poll 25s の 2 周期）。
+const SUBSCRIBER_TAKEOVER_MS =
+  Number(process.env.EBI_SUBSCRIBER_TAKEOVER_MS) || Mailbox.DEFAULT_SUBSCRIBER_TAKEOVER_MS;
+const mailbox = new Mailbox(LIVENESS_WINDOW_MS, SUBSCRIBER_TAKEOVER_MS);
 
 const registry = new Registry(spawnConfig, DUMP_PATH, mailbox);
 
@@ -291,11 +304,41 @@ const controlApi = createControlApi({
   },
   // 各エビの制御MCP ブリッジが自分宛メッセージを long-poll 購読するための経路。
   // 初回購読の確立はサーバログに出す（notification 経路が生きているかの観測点）。
-  subscribe: (id, timeoutMs) => {
-    if (!mailbox.everSubscribed(id)) {
-      console.log(`[ebi-team] notification 購読が確立: id=${id}`);
+  subscribe: async (id, timeoutMs, opts) => {
+    // 二重購読（同一 id を別プロセスが名乗る）をここで検出・拒否する。
+    // 旧実装は互いを蹴り出し合い、push の瞬間に座っていた方へ coin flip で配送していた
+    // （幽霊プロセスが master 宛の約半分を横取りした実障害の直接原因）。
+    const claim = mailbox.claimSubscriber(id, opts?.token);
+    if (!claim.ok) {
+      logDelivery({
+        event: "duplicate-subscriber",
+        msg:
+          `id=${id} への二重購読を拒否（先着 token=${claim.holder.token} が保持中・` +
+          `拒否 ${claim.holder.rejected} 回目）。同じ EBI_ID を名乗る別プロセスが居ないか確認すること`,
+        id,
+        rejectedToken: opts?.token ?? null,
+        holder: claim.holder,
+      });
+      return { rejected: { reason: claim.reason, holder: claim.holder } };
     }
-    return mailbox.subscribe(id, timeoutMs);
+    if (claim.mode === "claimed") {
+      console.log(`[ebi-team] notification 購読が確立: id=${id} token=${opts?.token ?? "(未提示)"}`);
+    } else if (claim.mode === "takeover") {
+      logDelivery({
+        event: "subscriber-takeover",
+        level: "info",
+        msg:
+          `id=${id} の購読を引き継ぎ（旧 token=${claim.previousToken} が ` +
+          `${SUBSCRIBER_TAKEOVER_MS}ms 無音 → 新 token=${opts?.token}）`,
+        id,
+        previousToken: claim.previousToken ?? null,
+        token: opts?.token ?? null,
+      });
+    } else if (claim.mode === "untracked" && !mailbox.everSubscribed(id)) {
+      console.log(`[ebi-team] notification 購読が確立: id=${id}（token 未提示・二重購読検出は無効）`);
+    }
+    const messages = await mailbox.subscribe(id, timeoutMs, opts);
+    return { messages };
   },
   // master の open_viewer からの viewer 追加。登録後に viewers を broadcast する。
   openViewer: async (path, title) => {
@@ -743,6 +786,8 @@ export type SendMessageResult =
       status: AgentStatus;
       /** 実際に使った配送経路（notify / pty-fallback / pty）。運用の可観測性・e2e の判定に使う。 */
       via: DeliverOutcome["via"];
+      /** PTY 注入が busy で滞留した（idle 復帰時に flush）か。滞留は「相手が受け取った」ではない。 */
+      queued: boolean;
     }
   | { ok: false; error: string; spawned: boolean };
 
@@ -836,7 +881,7 @@ async function sendMessage(params: SendMessageParams): Promise<SendMessageResult
       // deliver は ACK＋セッション到達（本文エコー）確認を含み、取れなければ内部で PTY 注入へ
       // フォールバックする。
       const outcome = await registry.deliver(to, from, message);
-      return { ok: true, id: to, spawned, status: agent.getStatus(), via: outcome.via };
+      return { ok: true, id: to, spawned, status: agent.getStatus(), via: outcome.via, queued: outcome.queued };
     }
     broadcast({
       type: "notice",
@@ -859,8 +904,8 @@ async function sendMessage(params: SendMessageParams): Promise<SendMessageResult
   }
 
   // ---- 4. 送信（idle→即送信／busy→キューは Agent.inject に委ねる）----
-  agent.inject(from, message);
-  return { ok: true, id: to, spawned, status: agent.getStatus(), via: "pty" };
+  const state = agent.inject(from, message);
+  return { ok: true, id: to, spawned, status: agent.getStatus(), via: "pty", queued: state === "queued" };
 }
 
 /**
@@ -993,6 +1038,7 @@ httpServer.listen(PORT, HOST, () => {
   console.log(`[ebi-team] デフォルト cwd: ${DEFAULT_CWD}`);
   console.log(`[ebi-team] idle しきい値: ${IDLE_THRESHOLD_MS}ms / registry ダンプ: ${DUMP_PATH}`);
   console.log(`[ebi-team] viewer 許可ルート: ${viewerRegistry.getRoots().join(", ")}`);
+  console.log(`[ebi-team] 配送ログ: ${deliveryLogPath() ?? "（無効・console のみ）"}`);
   // 監督機能の状態のみ表示。キー値は出さない。
   console.log(`[ebi-team] ${supervisor.describeStartup()}`);
   console.log(`[ebi-team] dev フロント: http://localhost:5173 （Vite）`);

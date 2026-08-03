@@ -2,6 +2,7 @@ import { writeFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { Agent, containsEcho, type SpawnConfig, type AgentHandlers, type LaunchParams } from "./agent.ts";
 import { Mailbox } from "./mailbox.ts";
+import { logDelivery } from "./deliveryLog.ts";
 import {
   BROADCAST_TARGET,
   type AgentMode,
@@ -62,6 +63,50 @@ const ECHO_CONFIRM_MS = Number(process.env.EBI_ECHO_CONFIRM_MS ?? 8000);
 /** エコー確認のポーリング間隔（ms）。 */
 const ECHO_POLL_MS = 250;
 
+/**
+ * 一度セッション到達を確認できたエビについて、その確認を再利用してよい時間（ms）。
+ *
+ * 【2026-08-04 channelProven の見直し】
+ * 旧実装は `if (agent.isChannelProven()) return true` で、一度でも到達確認が取れたエビは
+ * **以降永久に**エコー確認をスキップしていた。長寿命の master は起動直後に proven になるため
+ * 確認が二度と走らず、購読が別プロセスに乗っ取られた後も「ACK が返る＝到達」と誤判定し続けた
+ * （幽霊購読インシデントで唯一の砦が無効化されていた直接原因）。
+ * そこで確認結果に鮮度を持たせ、この時間を過ぎたら再確認する。
+ * env `EBI_ECHO_RECONFIRM_MS` で調整可。0 以下なら旧挙動（永久に信用）へロールバック。
+ */
+const ECHO_RECONFIRM_MS = Number(process.env.EBI_ECHO_RECONFIRM_MS ?? 600_000);
+
+/**
+ * 「毎回必ずエコー確認する」エビ種別。master は最重要かつ最長寿命の宛先で、ここが静かに
+ * 壊れると全体の指揮が止まるため、鮮度ではなく毎回の確認を既定にする
+ * （確認が取れれば数百 ms で通過し、取れなければ PTY へ載せ替わる＝取りこぼしゼロ側に倒す）。
+ * env `EBI_ECHO_ALWAYS_MASTER` を "off"/"0"/"false" にすると鮮度ベース（ECHO_RECONFIRM_MS）に落とす。
+ */
+const ECHO_ALWAYS_MASTER = !["off", "0", "false"].includes(
+  (process.env.EBI_ECHO_ALWAYS_MASTER ?? "on").toLowerCase(),
+);
+
+/**
+ * セッション到達（本文エコー）の確認をスキップしてよいかを決める純関数。
+ *
+ * - 未確認（provenAgeMs === null）: 必ず確認する（spawn 直後の危険窓）。
+ * - reconfirmMs <= 0: 旧挙動（一度確認できたら永久にスキップ）へのロールバック。
+ * - master: 既定で常に確認する（最重要・最長寿命の宛先。ここが静かに壊ると全体が止まる）。
+ * - それ以外: 直近の確認から reconfirmMs 未満ならスキップ、経過していれば再確認する。
+ */
+export function shouldSkipEchoConfirm(
+  kind: AgentKind,
+  provenAgeMs: number | null,
+  opts?: { reconfirmMs?: number; alwaysMaster?: boolean },
+): boolean {
+  const reconfirmMs = opts?.reconfirmMs ?? ECHO_RECONFIRM_MS;
+  const alwaysMaster = opts?.alwaysMaster ?? ECHO_ALWAYS_MASTER;
+  if (provenAgeMs === null) return false;
+  if (reconfirmMs <= 0) return true;
+  if (alwaysMaster && kind === "master") return false;
+  return provenAgeMs < reconfirmMs;
+}
+
 /** notification 注入モードが有効か（モジュールレベル・spawn 配線の判定に使う）。 */
 export function isNotifyMode(): boolean {
   return INJECT_MODE === "notify";
@@ -87,13 +132,22 @@ export function hasControlBridge(agent: Pick<Agent, "launch">): boolean {
  *   - "pty-fallback": notify を試みたが ACK が取れず PTY 注入へ自動フォールバックした
  *   - "pty": 最初から PTY 注入（購読 live でない / notifySubscribe:false / EBI_INJECT_MODE=pty）
  *   - "none": agent 不在で配送できなかった
- * - confirmed: 相手セッション（の入力）へ到達したと確認できたか。
- *   notify は ACK 取得を、PTY は入力欄への注入成立をもって true とする（agent 不在時のみ false）。
+ * - confirmed: 相手セッションへ実際に本文が渡ったと確認できたか。
+ *   notify は ACK＋本文エコー、PTY は「今この場で stdin へ書けた」ことをもって true とする。
+ * - queued: PTY 経路で相手が busy だったため injectQueue に滞留した（idle 復帰時に flush）。
+ *
+ * 【2026-08-04 confirmed の正直化】
+ * 旧実装は agent.inject() を呼びさえすれば全経路で confirmed:true を返していた。しかし相手が
+ * busy のとき inject は injectQueue へ積むだけで、flush は busy→idle のエッジまで来ない
+ * （その間に agent が消えれば中身は失われる）。「送った」と「積んだ」を同じ true で表すのは
+ * 送信元への嘘なので、滞留は confirmed:false + queued:true として区別する。
  */
 export interface DeliverOutcome {
   ok: boolean;
   via: "notify" | "pty-fallback" | "pty" | "none";
   confirmed: boolean;
+  /** PTY 注入が busy で滞留した（＝まだ相手の入力欄に入っていない）か。 */
+  queued: boolean;
 }
 
 /**
@@ -106,7 +160,7 @@ export interface DeliverOutcome {
 export interface InjectResult {
   delivered: string[];
   rejected: { id: string; reason: string }[];
-  details: { id: string; via: DeliverOutcome["via"]; confirmed: boolean }[];
+  details: { id: string; via: DeliverOutcome["via"]; confirmed: boolean; queued: boolean }[];
 }
 
 /** spawn 時のオプション（worktree 情報など）。 */
@@ -223,8 +277,11 @@ export class Registry {
     kind?: "reply" | "idle",
   ): Promise<DeliverOutcome> {
     const agent = this.agents.get(id);
-    if (!agent) return { ok: false, via: "none", confirmed: false };
+    if (!agent) return { ok: false, via: "none", confirmed: false, queued: false };
     const body = kind === "idle" ? `[idle] ${message}` : kind === "reply" ? `[reply] ${message}` : message;
+    // TUI 描画時に本文の前へ付く固定部。エコー照合の針をこの長さだけオフセットして
+    // 「実質 5 文字しか照合していない」状態を解消する（agent.echoNeedle 参照）。
+    const echoTag = `[from:${from}] ${kind ? `[${kind}] ` : ""}`;
     // notifySubscribe:false のエビ（外部チャンネル待機セッション・受信 PTY 固定）は、たとえ
     // 何らかの理由で購読者として登録されていても notification 経路に載せない。自セッションに
     // ebi-control channel が無く notification が harness に黙って捨てられるため（全配送経路
@@ -238,28 +295,66 @@ export class Registry {
       if (acked) {
         // ブリッジ ACK は「stdout へ書いた」までの保証。セッション到達（harness が channel を
         // honor してモデルに見せた）まで確認できて初めて配送成立とみなす。
-        if (await this.confirmSessionEcho(agent, `[from:${from}] ${body}`, mark)) {
-          return { ok: true, via: "notify", confirmed: true };
+        if (await this.confirmSessionEcho(agent, echoTag, message, mark)) {
+          return { ok: true, via: "notify", confirmed: true, queued: false };
         }
-        console.warn(
-          `[registry] ${id} 宛 notification は ACK されたがセッションへの到達（本文エコー）を` +
+        logDelivery({
+          event: "echo-timeout",
+          msg:
+            `${id} 宛 notification は ACK されたがセッションへの到達（本文エコー）を` +
             `${ECHO_CONFIRM_MS}ms 以内に確認できず PTY 注入へフォールバック（from=${from}）`,
-        );
-        agent.inject(from, body);
-        return { ok: true, via: "pty-fallback", confirmed: true };
+          id,
+          from,
+          msgId,
+          subscriberToken: this.mailbox!.subscriberToken(id),
+        });
+        return this.injectFallback(agent, from, body, "pty-fallback", msgId);
       }
       // ACK 取れず＝ブリッジが転送できていない可能性。まだ pending に残っていれば回収し、
       // PTY 注入へフォールバックする（回収できなくても＝既にブリッジが拾って emit 済みでも、
       // 取りこぼしの方が害が大きいので PTY にも載せて確実に届ける。多少の重複は許容）。
       this.mailbox!.take(id, msgId);
-      console.warn(
-        `[registry] ${id} 宛 notification の ACK が ${ACK_TIMEOUT_MS}ms 以内に取れず PTY 注入へフォールバック（from=${from}）`,
-      );
-      agent.inject(from, body);
-      return { ok: true, via: "pty-fallback", confirmed: true };
+      logDelivery({
+        event: "ack-timeout",
+        msg: `${id} 宛 notification の ACK が ${ACK_TIMEOUT_MS}ms 以内に取れず PTY 注入へフォールバック（from=${from}）`,
+        id,
+        from,
+        msgId,
+        subscriberToken: this.mailbox!.subscriberToken(id),
+      });
+      return this.injectFallback(agent, from, body, "pty-fallback", msgId);
     }
-    agent.inject(from, body);
-    return { ok: true, via: "pty", confirmed: true };
+    return this.injectFallback(agent, from, body, "pty", null);
+  }
+
+  /**
+   * PTY 注入を行い、その結果（即送信 or busy 滞留）を DeliverOutcome へ正直に写す。
+   * 滞留（queued）は「まだ相手の目に触れていない」ので confirmed:false とし、恒久ログにも残す
+   * （滞留したまま agent が消えると内容は失われるため、事後追跡できる必要がある）。
+   */
+  private injectFallback(
+    agent: Agent,
+    from: string,
+    body: string,
+    via: DeliverOutcome["via"],
+    msgId: number | null,
+  ): DeliverOutcome {
+    const state = agent.inject(from, body);
+    if (state === "queued") {
+      logDelivery({
+        event: "inject-queued",
+        level: "info",
+        msg:
+          `${agent.id} が busy のため注入を保留（待ち ${agent.pendingInjectCount()} 件・` +
+          `idle 復帰時に flush・from=${from}）`,
+        id: agent.id,
+        from,
+        via,
+        msgId,
+        queueLength: agent.pendingInjectCount(),
+      });
+    }
+    return { ok: true, via, confirmed: state === "sent", queued: state === "queued" };
   }
 
   /**
@@ -269,20 +364,23 @@ export class Registry {
    * mark 以降の scrollback に本文先頭が現れれば到達とみなせる。逆に、channel が未登録で
    * harness に捨てられた場合はこの描画が一切出ない（＝この関数が唯一の見分け手段）。
    *
-   * 一度到達を確認できたエビは以降スキップする（channelProven）。既存セッションへの再送は
-   * 元々取りこぼしが無く、毎回待つのは無駄な遅延と重複配送のリスクにしかならないため
-   * 、確認は「まだ実績の無いエビ」＝ spawn 直後の危険窓に限定する。
+   * スキップ条件は shouldSkipEchoConfirm() を参照（一度の成功で永久に信用することはしない）。
    * ECHO_CONFIRM_MS <= 0 なら確認を行わない（旧挙動へのロールバック口）。
    */
-  private async confirmSessionEcho(agent: Agent, renderedBody: string, mark: number): Promise<boolean> {
+  private async confirmSessionEcho(
+    agent: Agent,
+    echoTag: string,
+    payload: string,
+    mark: number,
+  ): Promise<boolean> {
     if (ECHO_CONFIRM_MS <= 0) return true;
-    if (agent.isChannelProven()) return true;
     // channel 本文を描画するのは claude セッション（制御MCP ブリッジ持ち）だけ。
     // それ以外（bash 等のテスト起動）はエコーが原理上出ないため確認対象外とする。
     if (!hasControlBridge(agent)) return true;
+    if (shouldSkipEchoConfirm(agent.kind, agent.channelProvenAgeMs())) return true;
     const deadline = Date.now() + ECHO_CONFIRM_MS;
     for (;;) {
-      if (containsEcho(agent.scrollbackSince(mark), renderedBody)) {
+      if (containsEcho(agent.scrollbackSince(mark), payload, undefined, echoTag)) {
         agent.markChannelProven();
         return true;
       }
@@ -363,16 +461,34 @@ export class Registry {
   remove(id: string): boolean {
     const agent = this.agents.get(id);
     if (!agent) return false;
+    // PTY 注入キューに滞留したまま消える分（旧実装は警告すら出さず無言で破棄していた）。
+    const abandoned = agent.drainInjectQueue();
     agent.kill();
     this.agents.delete(id);
     // 破棄した agent 宛の mailbox 状態（pending/購読待ち）も片付ける（届けようがないため）。
     // 未回収の pending があれば「配送できずに失われた」ことをログに出す（黙って消さない）。
     const dropped = this.mailbox?.clear(id) ?? [];
     if (dropped.length > 0) {
-      console.warn(
-        `[registry] ${id} を除去。未配送 ${dropped.length} 件を破棄: ` +
+      logDelivery({
+        event: "dropped-pending",
+        msg:
+          `${id} を除去。mailbox 未配送 ${dropped.length} 件を破棄: ` +
           dropped.map((m) => `[from:${m.from}] ${m.message.slice(0, 60)}`).join(" / "),
-      );
+        id,
+        count: dropped.length,
+        messages: dropped.map((m) => ({ from: m.from, kind: m.kind, message: m.message.slice(0, 200) })),
+      });
+    }
+    if (abandoned.length > 0) {
+      logDelivery({
+        event: "dropped-inject-queue",
+        msg:
+          `${id} を除去。busy 滞留中の PTY 注入 ${abandoned.length} 件を破棄: ` +
+          abandoned.map((b) => b.slice(0, 60)).join(" / "),
+        id,
+        count: abandoned.length,
+        messages: abandoned.map((b) => b.slice(0, 200)),
+      });
     }
     void this.dump();
     return true;
@@ -412,7 +528,7 @@ export class Registry {
       targets.forEach((a, i) => {
         const o = outcomes[i]!;
         result.delivered.push(a.id);
-        result.details.push({ id: a.id, via: o.via, confirmed: o.confirmed });
+        result.details.push({ id: a.id, via: o.via, confirmed: o.confirmed, queued: o.queued });
       });
       return result;
     }
@@ -433,7 +549,7 @@ export class Registry {
     }
     const o = await this.deliver(agent.id, from, message);
     result.delivered.push(agent.id);
-    result.details.push({ id: agent.id, via: o.via, confirmed: o.confirmed });
+    result.details.push({ id: agent.id, via: o.via, confirmed: o.confirmed, queued: o.queued });
     return result;
   }
 
@@ -484,7 +600,7 @@ export class Registry {
 
     const o = await this.deliver(toAgent, fromAgent, message, kind);
     result.delivered.push(toAgent);
-    result.details.push({ id: toAgent, via: o.via, confirmed: o.confirmed });
+    result.details.push({ id: toAgent, via: o.via, confirmed: o.confirmed, queued: o.queued });
     return result;
   }
 

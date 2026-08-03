@@ -71,6 +71,26 @@ export function isNotifySubscribeEnabled(raw: string | undefined): boolean {
 /** 自分の agent id（index.ts が spawn 時に全経路で launch env へ注入する）。 */
 const EBI_ID = process.env.EBI_ID ?? null;
 
+/**
+ * 購読者トークン（このブリッジ・プロセス 1 本を一意に識別する）。
+ *
+ * 【2026-08-04 二重購読の可視化・拒否】
+ * 同じ EBI_ID を名乗る別プロセス（claude デーモンの予備セッションが業務用 MCP 設定を抱えたまま
+ * claim された、など）が購読すると、旧実装では 2 本が互いを蹴り出し合い、メッセージが
+ * coin flip でどちらかに配られていた（master 宛の約半分が幽霊側へ吸われた実障害）。
+ * サーバはこのトークンで購読の所有権を管理し、後着を 409 で拒否する。
+ * pid だけだと再起動で衝突しうるので、起動時乱数を足して一意にする。
+ */
+const SUBSCRIBER_TOKEN = `${process.pid}-${Math.random().toString(36).slice(2, 10)}`;
+
+/**
+ * 二重購読として拒否（409）されたときの再試行間隔（ms）。
+ * 正規の所有者が生きている限り拒否され続けるので、短間隔で叩き続けない
+ * （＝旧実装の「互いに蹴り出し合って CPU が張り付く」の再来を防ぐ）。
+ * 所有者が消えれば所有権は失効し、この再試行で正しく引き継げる。
+ */
+const DUPLICATE_RETRY_MS = Number(process.env.EBI_DUPLICATE_RETRY_MS) || 60000;
+
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
@@ -425,10 +445,25 @@ async function subscribeLoop(): Promise<void> {
   let backoffMs = 500;
   for (;;) {
     try {
-      const qs = new URLSearchParams({ id: EBI_ID, timeoutMs: String(SUBSCRIBE_TIMEOUT_MS) });
+      const qs = new URLSearchParams({
+        id: EBI_ID,
+        timeoutMs: String(SUBSCRIBE_TIMEOUT_MS),
+        token: SUBSCRIBER_TOKEN,
+      });
       const res = await fetch(`${CONTROL_URL}/control/subscribe?${qs.toString()}`, {
         signal: AbortSignal.timeout(SUBSCRIBE_TIMEOUT_MS + 5000),
       });
+      if (res.status === 409) {
+        // 二重購読として拒否された＝同じ id を名乗る別プロセスが先に座っている。
+        // 蹴り合いにならないよう長めに待ってから再試行する（所有者が消えれば引き継げる）。
+        const detail = await res.text().catch(() => "");
+        console.error(
+          `[ebi-control-mcp] id=${EBI_ID} の購読を拒否されました（二重購読）。` +
+            `${DUPLICATE_RETRY_MS}ms 後に再試行します。詳細: ${detail}`,
+        );
+        await sleep(DUPLICATE_RETRY_MS);
+        continue;
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = (await res.json()) as {
         messages?: Array<{ id?: number; from: string; message: string; kind?: string; ts: number }>;

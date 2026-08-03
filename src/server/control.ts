@@ -78,6 +78,11 @@ export type SendMessageOutcome =
       status: string;
       /** 実際に使った配送経路（"notify" / "pty-fallback" / "pty"）。 */
       via?: string;
+      /**
+       * PTY 注入が busy で滞留した（idle 復帰時に flush される）か。
+       * true の間は「送信済み」ではあっても「相手が受け取った」ではない。
+       */
+      queued?: boolean;
     }
   | { ok: false; error: string; spawned: boolean };
 
@@ -97,7 +102,7 @@ export interface ControlDeps {
   ) => Promise<{
     delivered: string[];
     rejected: { id: string; reason: string }[];
-    details: { id: string; via: string; confirmed: boolean }[];
+    details: { id: string; via: string; confirmed: boolean; queued: boolean }[];
   }>;
   /**
    * 統一送信（送信先が無ければ spawn し、ready まで待ってから確実に送信する）。
@@ -121,8 +126,16 @@ export interface ControlDeps {
    * （src/mcp/control-server.ts）が起動時にこれへ接続し、届いたメッセージを
    * notifications/claude/channel として自セッションへ注入する。
    * pending があれば即返し、無ければ timeoutMs 待って空配列（=再接続を促す）を返す。
+   *
+   * token はブリッジの一意識別子（pid＋起動時乱数）。同一 id を別トークンが同時に購読しようと
+   * した場合は「二重購読」として拒否する（rejected を返す＝ HTTP 409）。signal はコネクション
+   * 断の通知で、切れたら待ちを解いて購読所有権を解放する。
    */
-  subscribe: (id: string, timeoutMs: number) => Promise<MailboxMessage[]>;
+  subscribe: (
+    id: string,
+    timeoutMs: number,
+    opts?: { token?: string | null; signal?: AbortSignal },
+  ) => Promise<{ messages: MailboxMessage[] } | { rejected: { reason: string; holder: unknown } }>;
   /**
    * viewer（読み取り専用の md/txt プレビュー）を開く。パス検証・ファイル読取・登録を行い、
    * viewers の broadcast まで済ませて登録された ViewerRecord を返す。
@@ -399,8 +412,22 @@ export function createControlApi(deps: ControlDeps) {
         const timeoutRaw = Number(query.get("timeoutMs"));
         const timeoutMs =
           Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? Math.min(Math.max(timeoutRaw, 1000), 60000) : 25000;
-        const messages = await subscribe(id, timeoutMs);
-        sendJson(res, 200, { messages });
+        // 購読者トークン（ブリッジの pid＋起動時乱数）。同一 id の二重購読を検出・拒否するための鍵。
+        // 旧ブリッジは送ってこないので必須にはしない（その場合は所有権の管理対象外＝従来挙動）。
+        const token = query.get("token");
+        // long-poll の途中でコネクションが切れたら待ちを解いて購読所有権を返す
+        // （ブリッジが死んだのに席だけ残り、再起動した正規ブリッジが締め出されるのを防ぐ）。
+        const ctrl = new AbortController();
+        res.on("close", () => {
+          if (!res.writableEnded) ctrl.abort();
+        });
+        const result = await subscribe(id, timeoutMs, { token, signal: ctrl.signal });
+        if ("rejected" in result) {
+          // 409 Conflict: 後着の二重購読。ブリッジ側はこれを受けたら長めに待って再試行する。
+          sendJson(res, 409, { error: result.rejected.reason, holder: result.rejected.holder });
+          return true;
+        }
+        sendJson(res, 200, { messages: result.messages });
         return true;
       }
 
