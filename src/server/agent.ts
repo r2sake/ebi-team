@@ -115,6 +115,24 @@ const GATE_SETTLE_MS = Number(process.env.EBI_GATE_SETTLE_MS) || 20000;
 const ECHO_NEEDLE_LEN = Number(process.env.EBI_ECHO_NEEDLE_LEN) || 24;
 
 /**
+ * エコー照合の針の総長の上限（compact 後の文字数）。TUI は 1 行に収まる分しか描画しないため、
+ * これを超える針は「切り詰めで永久に一致しない」＝検知漏れ（無駄な PTY フォールバック）になる。
+ * 実測（80 桁）で compact 後 40 文字強まで描画される。env `EBI_ECHO_NEEDLE_MAX` で調整可。
+ */
+const ECHO_NEEDLE_MAX = Number(process.env.EBI_ECHO_NEEDLE_MAX) || 40;
+
+/** タグが長すぎて本文の取り分が潰れた場合でも、最低限これだけは本文から照合する。 */
+const ECHO_NEEDLE_MIN_BODY = 8;
+
+/**
+ * PTY 注入の結果。
+ * - "sent": 今この場で stdin へ書いた（相手の入力欄に入った）
+ * - "queued": 相手が busy のため injectQueue に滞留した（idle 復帰時に flush される。
+ *   この時点では相手はまだ本文を見ていない ＝ 到達確認済みとは呼べない）
+ */
+export type InjectState = "sent" | "queued";
+
+/**
  * ANSI/OSC エスケープと空白を全除去して素文へ畳む。
  * claude(Ink) TUI は単語間を空白でなくカーソル移動エスケープで描画することがあるため、
  * 「空白を全部落とした文字列同士」で照合する（detectStartupGate と同じ流儀）。
@@ -128,20 +146,47 @@ export function compactPlain(raw: string): string {
 }
 
 /**
- * 配送本文（`[from:x] 本文`）から「セッション到達を照合するための針」を作る純関数。
- * compact 後の先頭 `len` コードポイントを返す（サロゲートペアを割らないよう Array.from で切る）。
+ * 配送本文から「セッション到達を照合するための針」を作る純関数。
+ *
+ * 【2026-08-04 タグ長オフセット】
+ * 描画は `[from:master] [reply] 本文…` の形になるため、針を「先頭 len 文字」で取ると
+ * タグ（compact 後でも 12〜20 文字）に食われ、実質「本文の先頭数文字」しか照合しない状態だった
+ * （`[from:ebi-1] [reply] ` で 19 文字消費 → 本文は 5 文字程度。同じエビの別メッセージの
+ * 描画で偽陽性になりうる）。そこで **タグ長ぶんオフセットして本文から len 文字を取る**。
+ *
+ * 針は「本文（タグを除いた部分）の先頭 len 文字」。描画は タグ＋本文 の連結なので、
+ * 本文だけの針もそのまま部分文字列として一致する。ただしタグに圧迫されて描画の切り詰めに
+ * かかると永久に一致しなくなるため、取り分は max - タグ長 で頭打ちにする
+ * （それでも最低 ECHO_NEEDLE_MIN_BODY 文字は照合する）。
+ *
+ * サロゲートペアを割らないよう Array.from で切る。
  */
-export function echoNeedle(body: string, len: number = ECHO_NEEDLE_LEN): string {
-  return Array.from(compactPlain(body)).slice(0, len).join("");
+export function echoNeedle(
+  body: string,
+  len: number = ECHO_NEEDLE_LEN,
+  tag = "",
+  max: number = ECHO_NEEDLE_MAX,
+): string {
+  const b = Array.from(compactPlain(body));
+  if (b.length === 0) return "";
+  const budget = max - compactPlain(tag).length;
+  const take = Math.min(len, Math.max(budget, ECHO_NEEDLE_MIN_BODY));
+  return b.slice(0, take).join("");
 }
 
 /**
  * scrollback 断片に配送本文のエコー（＝ claude セッションが channel 本文を実際に描画したこと）が
  * 含まれるかを判定する純関数。TUI の空白潰し・行折返しに耐えるよう compact 同士で照合する。
  * needle が空（本文が空白のみ等）なら常に false（誤検知させない）。
+ * tag には描画時に本文の前へ付く固定部（`[from:x] [reply] ` 等）を渡す。
  */
-export function containsEcho(scrollbackChunk: string, body: string, len: number = ECHO_NEEDLE_LEN): boolean {
-  const needle = echoNeedle(body, len);
+export function containsEcho(
+  scrollbackChunk: string,
+  body: string,
+  len: number = ECHO_NEEDLE_LEN,
+  tag = "",
+): boolean {
+  const needle = echoNeedle(body, len, tag);
   if (needle.length === 0) return false;
   return compactPlain(scrollbackChunk).includes(needle);
 }
@@ -382,10 +427,13 @@ export class Agent {
    * このエビの channel 受信が「セッションに実際に届く」ことを一度でも確認できたか。
    * 未確認のうちは deliver() が配送のたびに本文エコーを scrollback で照合し、
    * 出なければ PTY 注入へフォールバックする（spawn 直後の取りこぼし根治）。
-   * 一度確認できたら以降は照合をスキップする（既存セッションへの再送は元々取りこぼさないため、
-   * 無駄な待ちと重複配送を作らない）。
+   * 確認できたら暫くは照合をスキップする（既存セッションへの再送は元々取りこぼさないため、
+   * 無駄な待ちと重複配送を作らない）。ただし「永久に信用する」ことはしない（channelProvenAt 参照）。
    */
   private channelProven = false;
+
+  /** 直近に channel 到達を確認できた時刻（epoch ms）。null は未確認。 */
+  private channelProvenAt: number | null = null;
 
   constructor(
     id: string,
@@ -595,9 +643,19 @@ export class Agent {
     return this.channelProven;
   }
 
-  /** channel 受信のセッション到達が確認できたことを記録する（以降のエコー照合を省く）。 */
+  /**
+   * 直近に channel 到達を確認できた時刻（epoch ms）。未確認なら null。
+   * 「一度成功したら永久に信用する」を避け、一定時間が経ったら再確認するために使う
+   * （長寿命の master ほど、購読の乗っ取り・ブリッジ死亡で静かに壊れうる）。
+   */
+  channelProvenAgeMs(nowMs = Date.now()): number | null {
+    return this.channelProvenAt === null ? null : nowMs - this.channelProvenAt;
+  }
+
+  /** channel 受信のセッション到達が確認できたことを記録する（直近確認時刻を更新する）。 */
   markChannelProven(): void {
     this.channelProven = true;
+    this.channelProvenAt = Date.now();
   }
 
   /** PTY 出力チャンクをリングバッファに追記し、上限超過分を古い方から捨てる。 */
@@ -701,20 +759,36 @@ export class Agent {
 
   /**
    * 送信元タグ付き注入。idle なら即送信、busy ならキューへ。
+   * 戻り値で「今 stdin へ送った（sent）／busy で滞留した（queued）」を区別する。
+   * 滞留は idle 復帰まで相手の目に触れないため、呼び出し側はこれを confirmed と区別する。
    * フォーマット: 本文 `[from:<from>] <message>` を書き、少し待ってから Enter を別 write で送る
    * （TUI のペースト検知で送信されない問題を回避＝送信まで担保）。キューは本文(改行なし)を保持。
    */
-  inject(from: string, message: string): void {
+  inject(from: string, message: string): InjectState {
     const body = `[from:${from}] ${message}`;
     if (this.getStatus() === "idle") {
       void this.sendLine(body);
-    } else {
-      this.injectQueue.push(body);
-      this.handlers.onNotice(
-        this.id,
-        `busy のため注入をキューに保留（待ち ${this.injectQueue.length} 件）`,
-      );
+      return "sent";
     }
+    this.injectQueue.push(body);
+    this.handlers.onNotice(
+      this.id,
+      `busy のため注入をキューに保留（待ち ${this.injectQueue.length} 件）`,
+    );
+    return "queued";
+  }
+
+  /** 現在 busy で滞留している注入の件数（可視化・破棄ログ用）。 */
+  pendingInjectCount(): number {
+    return this.injectQueue.length;
+  }
+
+  /**
+   * 滞留中の注入を全て取り出して空にする（agent 破棄時に「何が失われたか」を記録するため）。
+   * 破棄側でログ化しないと、キューの中身は警告すら出さず消える（旧挙動）。
+   */
+  drainInjectQueue(): string[] {
+    return this.injectQueue.splice(0);
   }
 
   /** 本文を stdin へ書き、ENTER_DELAY_MS 待ってから Enter(`\r`) を別 write で送って送信を確定させる。 */

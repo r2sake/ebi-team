@@ -240,8 +240,13 @@ claude プロセス（エージェント本体）
 
 - 配送先が**今**購読 live（直近に long-poll 接続がある）かで経路を選ぶ。過去に一度購読しただけの相手（=購読が既に死んでいる相手）へは notification に載せず、最初から PTY 注入する。
 - notification に載せた場合は、ブリッジが emit 後に返す **end-to-end ACK**（`/control/ack`）を待つ。ACK が取れれば到達確認済み。**取れなければ自動で PTY 注入へフォールバック**する。
-- 配送結果はツール応答の `details`（宛先ごとの `via` = `notify` / `pty-fallback` / `pty`、`confirmed`）で確認できる。「delivered と言いつつ実は消えていた」を防ぐための正直な内訳です。
-- 取りこぼし（未回収の pending）は `GET /control/pending` で可視化でき、agent 破棄時に未配送が残っていればサーバログに出ます（黙って失われない）。
+- ACK が取れても、**セッションが本文を実際に描画したか**（harness が channel を honor したか）を scrollback のエコーで確認する。確認できなければ PTY 注入へフォールバックする。この確認結果には鮮度があり、一定時間で再確認する（master は既定で毎回確認）。
+- 配送結果はツール応答の `details`（宛先ごとの `via` = `notify` / `pty-fallback` / `pty`、`confirmed`、`queued`）で確認できる。「delivered と言いつつ実は消えていた」を防ぐための正直な内訳です。**相手が busy で PTY 注入がキューに積まれただけの場合は `confirmed:false` / `queued:true`** になります（まだ相手の目に触れていないため）。
+- 取りこぼし（未回収の pending・破棄された注入キュー）は `GET /control/pending` で可視化でき、agent 破棄時に残っていれば配送ログに出ます（黙って失われない）。
+
+**二重購読の拒否**: 各ブリッジは購読時に一意トークン（pid＋起動時乱数）を送り、サーバは id ごとに**先着 1 本だけ**を購読者として認めます。同じ `EBI_ID` を名乗る別プロセス（例: 業務用 MCP 設定を抱いたまま claim された無関係セッション）が購読しようとすると **409 で拒否**し、配送ログに記録します。所有者の long-poll が切れた時点、または無音が `EBI_SUBSCRIBER_TAKEOVER_MS` を超えた時点で所有権は解放されるので、正当な再起動が締め出されることはありません。
+
+**配送ログ**: フォールバック・二重購読・注入の滞留/破棄は `.ebi-team/delivery.log` に JSONL で追記されます（`EBI_DELIVERY_LOG_PATH` で変更、`off` で無効）。tty のスクロールバックが流れても事後追跡できます。
 
 **制約と運用上の注意**: ACK は「ブリッジがセッションへ確かに転送した」ことの確認です。harness がその notification を honor するか（会話へ実際に差し込むか）は別レイヤで、環境（claude のバージョン・セッションが background job かどうか等）に依存します。**無人運用や background job として動く常駐セッション（master 含む）で notification の honor が不安定な場合は、受信を PTY 固定にするのが最も確実です**。固定エビ単位なら config の `notifySubscribe: false`、サーバ全体なら `EBI_INJECT_MODE=pty` で旧 PTY 方式へ全面ロールバックできます。
 
@@ -253,8 +258,14 @@ claude プロセス（エージェント本体）
 | `EBI_DELIVER_ACK_TIMEOUT_MS` | `5000` | notification の ACK 到達確認を待つ時間。超過で PTY フォールバック |
 | `EBI_LIVENESS_WINDOW_MS` | `40000` | 「購読が今 live か」の判定窓。ブリッジ側 `EBI_SUBSCRIBE_TIMEOUT_MS`（既定 25s）を上げたらこちらも合わせて上げる |
 | `EBI_NOTIFY_SUBSCRIBE` | `on` | エビ側ブリッジで `off` にすると購読しない（外部チャンネル待機セッション等・受信 PTY 固定） |
+| `EBI_ECHO_CONFIRM_MS` | `8000` | セッション到達（本文エコー）を待つ上限。`0` 以下で確認を無効化 |
+| `EBI_ECHO_RECONFIRM_MS` | `600000` | 一度確認できた到達をこの時間だけ再利用する（過ぎたら再確認）。`0` 以下で「一度確認したら永久に信用」へロールバック |
+| `EBI_ECHO_ALWAYS_MASTER` | `on` | master 宛は毎回セッション到達を確認する。`off` で鮮度ベースに落とす |
+| `EBI_SUBSCRIBER_TAKEOVER_MS` | `30000` | 購読所有権が失効するまでの無音時間。これを過ぎたら別トークンが引き継げる |
+| `EBI_DUPLICATE_RETRY_MS` | `60000` | ブリッジ側。二重購読で 409 を受けたときの再試行間隔 |
+| `EBI_DELIVERY_LOG_PATH` | `.ebi-team/delivery.log` | 配送ログ（JSONL）の出力先。`off` でファイル出力を無効化 |
 
-配送信頼性の再現・回帰テスト: `npm run e2e:notify-fallback`（別ポートの実サーバ＋実 PTY で「ブリッジ死亡→PTY フォールバック→実到達」を実証。実 claude 不要）。notification が実 claude セッションで honor されるところまでの疎通は `node scripts/e2e-notify-channel.mjs`（実 claude/haiku を使用）。
+配送信頼性の再現・回帰テスト: `npm run e2e:delivery-hardening`（二重購読の拒否・所有権の解放・配送ログ・queued 区別を別ポートの実サーバで実証）、`npm run e2e:notify-fallback`（別ポートの実サーバ＋実 PTY で「ブリッジ死亡→PTY フォールバック→実到達」を実証。実 claude 不要）。notification が実 claude セッションで honor されるところまでの疎通は `node scripts/e2e-notify-channel.mjs`（実 claude/haiku を使用）。
 
 ---
 
