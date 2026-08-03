@@ -41,7 +41,36 @@ export interface MailboxMessage {
 interface Waiter {
   resolve: (msgs: MailboxMessage[]) => void;
   timer: NodeJS.Timeout;
+  /** この waiter を張っている購読者トークン（不明なら null）。 */
+  token: string | null;
+  /** signal 連携の後始末（購読が解けたら必ず呼ぶ）。 */
+  cleanup?: () => void;
 }
+
+/** 購読者（ブリッジ）1 本の所有権レコード。 */
+interface SubscriberOwner {
+  /** 一意トークン（ブリッジの pid ＋起動時乱数）。 */
+  token: string;
+  /** 直近に long-poll を張った時刻。 */
+  lastPollAt: number;
+  /** 所有を開始した時刻。 */
+  since: number;
+  /** この所有者が居るために拒否した後着の数（可視化用）。 */
+  rejected: number;
+}
+
+/**
+ * 購読要求の判定結果。ok:false なら「後着の二重購読」として拒否されたことを表す。
+ * mode: held=所有者の再接続 / claimed=新規所有 / takeover=失効した所有者からの引き継ぎ /
+ *       untracked=トークン未提示（旧ブリッジ互換。所有権管理の対象外）
+ */
+export type ClaimResult =
+  | { ok: true; mode: "held" | "claimed" | "takeover" | "untracked"; previousToken?: string }
+  | {
+      ok: false;
+      reason: string;
+      holder: { token: string; heldMs: number; lastPollAgoMs: number; rejected: number };
+    };
 
 interface AckWaiter {
   resolve: (acked: boolean) => void;
@@ -89,7 +118,86 @@ export class Mailbox {
    */
   static readonly DEFAULT_LIVENESS_WINDOW_MS = 40_000;
 
-  constructor(private readonly livenessWindowMs = Mailbox.DEFAULT_LIVENESS_WINDOW_MS) {}
+  /**
+   * 購読所有権が失効するまでの無音時間（ms）。所有者の long-poll が切れて（プロセス消滅・
+   * ネットワーク断など）この時間 1 度も再接続が来なければ、後着が所有権を引き継げる。
+   * long-poll は timeout（既定 25s）ごとに必ず張り直されるため、生きている所有者が
+   * 誤って失効することはない。
+   */
+  static readonly DEFAULT_SUBSCRIBER_TAKEOVER_MS = 30_000;
+
+  /** id ごとの購読所有者（二重購読の検出・拒否に使う）。 */
+  private readonly owners = new Map<string, SubscriberOwner>();
+
+  constructor(
+    private readonly livenessWindowMs = Mailbox.DEFAULT_LIVENESS_WINDOW_MS,
+    private readonly subscriberTakeoverMs = Mailbox.DEFAULT_SUBSCRIBER_TAKEOVER_MS,
+  ) {}
+
+  /**
+   * 購読所有権を主張する（subscribe の前段）。
+   *
+   * 【2026-08-04 二重購読の根治】
+   * 旧実装は subscribe() で同一 id の既存 waiter を**黙って追い出して**自分が座っていた。
+   * そのため、無関係なプロセスが同じ EBI_ID を名乗って購読すると 2 本のブリッジが互いを
+   * 蹴り出し合い、push の瞬間にどちらが座っていたかで宛先が coin flip になる
+   * （実障害: master 宛の約半分を幽霊プロセスが横取りし、ACK まで返すため送信側には
+   * 「配信確認済み」と見えていた。tmp/delivery-investigation-2026-08-04.md）。
+   *
+   * そこで購読者に一意トークン（ブリッジの pid ＋起動時乱数）を持たせ、**先着が所有者**、
+   * 後着は拒否する。所有者が無音（long-poll の張り直しが来ない）のまま
+   * subscriberTakeoverMs を過ぎたら、後着が所有権を引き継げる（正当な再起動・再接続の救済）。
+   *
+   * token 未提示（旧ブリッジ）は所有権の管理対象外にして従来どおり通す（互換のため）。
+   */
+  claimSubscriber(id: string, token: string | null | undefined, nowMs = Date.now()): ClaimResult {
+    if (!token) return { ok: true, mode: "untracked" };
+    const owner = this.owners.get(id);
+    if (!owner) {
+      this.owners.set(id, { token, lastPollAt: nowMs, since: nowMs, rejected: 0 });
+      return { ok: true, mode: "claimed" };
+    }
+    if (owner.token === token) {
+      owner.lastPollAt = nowMs;
+      return { ok: true, mode: "held" };
+    }
+    const silentMs = nowMs - owner.lastPollAt;
+    if (silentMs >= this.subscriberTakeoverMs) {
+      this.owners.set(id, { token, lastPollAt: nowMs, since: nowMs, rejected: 0 });
+      return { ok: true, mode: "takeover", previousToken: owner.token };
+    }
+    owner.rejected += 1;
+    return {
+      ok: false,
+      reason:
+        `id=${id} は既に別の購読者（token=${owner.token}）が保持しています` +
+        `（二重購読の拒否。正当な再接続なら所有者が ${this.subscriberTakeoverMs}ms 無音になった後に引き継げます）`,
+      holder: {
+        token: owner.token,
+        heldMs: nowMs - owner.since,
+        lastPollAgoMs: silentMs,
+        rejected: owner.rejected,
+      },
+    };
+  }
+
+  /** 現在の購読所有者トークン（未管理なら null）。可視化・テスト用。 */
+  subscriberToken(id: string): string | null {
+    return this.owners.get(id)?.token ?? null;
+  }
+
+  /**
+   * 購読所有権を明示的に手放す（long-poll のコネクションが切れた＝ブリッジが消えた時）。
+   * これにより、正当なブリッジが再起動したとき失効待ち（subscriberTakeoverMs）を待たずに
+   * 座り直せる。トークンが現所有者と一致するときだけ解放する（他人の席を奪わない）。
+   */
+  releaseSubscriber(id: string, token: string | null | undefined): boolean {
+    if (!token) return false;
+    const owner = this.owners.get(id);
+    if (!owner || owner.token !== token) return false;
+    this.owners.delete(id);
+    return true;
+  }
 
   /** 一度でも subscribe（購読の長poll接続）が来た id か。※配送ゲートには使わない（isLive を使う）。 */
   everSubscribed(id: string): boolean {
@@ -120,6 +228,7 @@ export class Mailbox {
     const waiter = this.waiters.get(id);
     if (waiter) {
       clearTimeout(waiter.timer);
+      waiter.cleanup?.();
       this.waiters.delete(id);
       waiter.resolve([full]);
       return seqId;
@@ -135,10 +244,21 @@ export class Mailbox {
    * pending が既にあれば即座にそれを返す（消費して空にする）。
    * 無ければ最大 timeoutMs 待ち、その間に push があればそれを返す。
    * timeout したら空配列を返す（ブリッジ側は空配列を受けたら即再接続するループを回す）。
-   * 同一 id で二重に subscribe された場合、古い方は空配列で即解決してから差し替える
-   * （ブリッジの再接続レース対策）。
+   * 同一 id・同一トークンで二重に subscribe された場合（同一ブリッジの再接続レース）は、
+   * 古い方を空配列で即解決してから差し替える。
+   *
+   * 別トークンの後着はここへ来る前に claimSubscriber() で拒否される想定
+   * （呼び出し側 = control API が 409 を返す）。
+   *
+   * opts.signal を渡すと、long-poll のコネクションが切れた時点で待ちを解いて所有権も解放する
+   * （ブリッジが死んだのに席だけ残り、再起動した正規ブリッジが締め出されるのを防ぐ）。
    */
-  subscribe(id: string, timeoutMs: number): Promise<MailboxMessage[]> {
+  subscribe(
+    id: string,
+    timeoutMs: number,
+    opts?: { token?: string | null; signal?: AbortSignal },
+  ): Promise<MailboxMessage[]> {
+    const token = opts?.token ?? null;
     this.subscribed.add(id);
     this.lastPollAt.set(id, Date.now());
 
@@ -151,15 +271,36 @@ export class Mailbox {
     const existing = this.waiters.get(id);
     if (existing) {
       clearTimeout(existing.timer);
+      existing.cleanup?.();
+      this.waiters.delete(id);
       existing.resolve([]);
     }
 
     return new Promise<MailboxMessage[]>((resolve) => {
-      const timer = setTimeout(() => {
-        this.waiters.delete(id);
-        resolve([]);
-      }, timeoutMs);
-      this.waiters.set(id, { resolve, timer });
+      const signal = opts?.signal;
+      const finish = (msgs: MailboxMessage[]) => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        if (this.waiters.get(id)?.resolve === resolve) this.waiters.delete(id);
+        resolve(msgs);
+      };
+      const onAbort = () => {
+        // コネクション断＝そのブリッジは居なくなった。席（所有権）も返す。
+        this.releaseSubscriber(id, token);
+        finish([]);
+      };
+      const timer = setTimeout(() => finish([]), timeoutMs);
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener("abort", onAbort, { once: true });
+      this.waiters.set(id, {
+        resolve,
+        timer,
+        token,
+        cleanup: () => signal?.removeEventListener("abort", onAbort),
+      });
     });
   }
 
@@ -279,11 +420,14 @@ export class Mailbox {
     const w = this.waiters.get(id);
     if (w) {
       clearTimeout(w.timer);
+      w.cleanup?.();
       this.waiters.delete(id);
       w.resolve([]);
     }
     this.subscribed.delete(id);
     this.lastPollAt.delete(id);
+    // agent が消えたので購読所有権も解放する（同じ id で再 spawn したブリッジが即座に座れる）。
+    this.owners.delete(id);
     // この id 宛の ack 待ちも全て false 解決して破棄する。
     for (const [key, aw] of this.ackWaiters) {
       if (key.startsWith(`${id} `)) {
