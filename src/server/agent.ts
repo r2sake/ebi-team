@@ -1,6 +1,22 @@
 import * as pty from "node-pty";
 import { IdleDetector } from "./idleDetector.ts";
 import type { AgentRecord, AgentStatus, AgentMode, AgentKind } from "../shared/protocol.ts";
+import {
+  CLAUDE_BACKEND,
+  getBackend,
+  resolveBackendOrDefault,
+  type BackendId,
+  type StartupGateKind,
+  type StartupGateSpec,
+} from "./backends/index.ts";
+
+// 起動ゲート判定・dev channel 許可リストは Claude バックエンド（backends/claude.ts）が SoT。
+// 既存の import 元（index.ts / test/gate.test.ts）を壊さないよう再エクスポートする。
+export {
+  BASE_ALLOWED_DEV_CHANNELS,
+  detectStartupGate,
+  isDevChannelsAutoAnswerEligible,
+} from "./backends/index.ts";
 
 /**
  * 注入時、本文を書いてから Enter(`\r`) を別 write で送るまでの待ち時間(ms)。
@@ -27,16 +43,6 @@ const MIN_BOOT_MS = Number(process.env.EBI_MIN_BOOT_MS) || 1500;
 const REPLY_SUPPRESS_MS = Number(process.env.EBI_REPLY_SUPPRESS_MS) || 5000;
 
 /**
- * 起動ゲート自動応答を許可する dev channel 値の「組込み（既定）許可リスト」。
- * ここに載っている**正確値**（完全一致）だけを自動応答対象にする。
- * ワイルドカード・前方一致・部分一致は一切しない（意図せぬ承認を防ぐ）。
- * 運用者が config（ebi-team.config.json の top-level "devChannelsAllowlist"）で
- * 追加の正確値を足せる（例: 外部チャンネル待機セッションの plugin:slack@<marketplace>）。
- * その追加分は index.ts が SpawnConfig.devChannelsAllowlist にマージして Agent に渡す。
- */
-export const BASE_ALLOWED_DEV_CHANNELS: readonly string[] = ["server:ebi-control"];
-
-/**
  * 起動ゲート（trust / dev-channels 警告）自動応答を受け付ける「起動フェーズ」の時間窓(ms)。
  * spawn からこの時間内に出たダイアログにだけ応答する。
  * 注意: これらダイアログはセッションを入力待ちで沈黙させ、その沈黙を idle 検出器が拾って
@@ -45,58 +51,6 @@ export const BASE_ALLOWED_DEV_CHANNELS: readonly string[] = ["server:ebi-control
  * 数秒で出るので十分広めに取る。env `EBI_GATE_WINDOW_MS` で調整可。
  */
 const GATE_WINDOW_MS = Number(process.env.EBI_GATE_WINDOW_MS) || 90000;
-
-/**
- * spawn 引数を見て「起動ゲート（trust / dev-channels 警告）の自動応答を有効化してよいか」を判定する。
- *
- * 安全限定（正確値の許可リスト方式）: `--dangerously-load-development-channels` の値が
- * **1個以上あり、そのすべてが `allowlist` の正確値（完全一致）である**ときだけ true。
- * 許可リストに無い値が1つでも混ざる／フラグ自体が無い場合は false
- * （＝自動で危険確認を承認しない。設定書き換えによる意図せぬ承認を防ぐ）。
- * 照合は完全一致のみ。ワイルドカード・前方一致・部分一致は一切導入しない
- * （`plugin:slack@*` のような値は許可リストに正確一致しない限り必ず false）。
- *
- * `allowlist` 未指定時は組込みの BASE_ALLOWED_DEV_CHANNELS（server:ebi-control のみ）を使う。
- * 当該フラグは variadic（`<servers...>`）で、次の `--flag` までの全トークンを値として取る。
- */
-export function isDevChannelsAutoAnswerEligible(
-  args: readonly string[],
-  allowlist: readonly string[] = BASE_ALLOWED_DEV_CHANNELS,
-): boolean {
-  const flagIdx = args.indexOf("--dangerously-load-development-channels");
-  if (flagIdx === -1) return false;
-  const values: string[] = [];
-  for (let i = flagIdx + 1; i < args.length; i++) {
-    if (args[i].startsWith("--")) break;
-    values.push(args[i]);
-  }
-  // 値が1個以上あり、そのすべてが許可リストに完全一致することを要求する。
-  return values.length >= 1 && values.every((v) => allowlist.includes(v));
-}
-
-/**
- * 起動フェーズの対話ダイアログ種別を、素文スキャンバッファから判定する純関数。
- *
- * claude(Ink) TUI は単語間を空白でなくカーソル移動エスケープで描画するため、ANSI 除去後は
- * "Iamusingthisforlocaldevelopment" のように空白が消えることがある（TUI が空白なしで
- * 描画する既知の罠）。よって照合は**空白を全除去した文字列**に対して**空白なしパターン**で行う。
- * これにより空白あり／なしどちらの描画でも同じく検知できる。
- *
- * 戻り値:
- *  - "devChannels": development channels 警告（--dangerously-load-development-channels 使用時）
- *  - "trust": workspace trust 確認（初見 cwd）
- *  - null: どちらのダイアログも検知できない
- */
-export function detectStartupGate(rawScanBuffer: string): "devChannels" | "trust" | null {
-  const compact = rawScanBuffer.replace(/\s+/g, "");
-  if (/Loadingdevelopmentchannels|localchanneldevelopment|Iamusingthisforlocaldevelopment/i.test(compact)) {
-    return "devChannels";
-  }
-  if (/trustthisfolder|Isthisaprojectyou(created|trust)/i.test(compact)) {
-    return "trust";
-  }
-  return null;
-}
 
 /**
  * 起動ゲート自動応答が有効な agent で、「dev-channels ゲートへの応答が済むまで ready 昇格を
@@ -162,19 +116,9 @@ const IDLE_NOTIFY_ENABLED = !["off", "0", "false"].includes(
 );
 
 /**
- * TUI を「代替スクリーン（alternate screen）」ではなく通常バッファへインライン描画させるための
- * 既定 env。ブラウザ側 xterm.js のスクロールバックを機能させるために必須。
- *
- * 背景（実測 claude 2.1.198）:
- * - claude CLI は起動直後に `ESC[?1049h`（代替スクリーン ON）＋ `ESC[?1000h/1002h/1006h`
- *   （マウストラッキング ON）を送り、セッション中 `ESC[?1049l` を送らない。
- * - 代替スクリーンでは xterm.js は **スクロールバックを一切持たない**（仕様）。さらにマウス
- *   トラッキング中はホイールが端末側スクロールではなくアプリへ転送される。
- *   結果、ブラウザのペインは「claude 内部ビューの見えている範囲」しか見られなくなり、
- *   /compact のような全画面再描画（内部ビューのリセット）が走ると過去ログを辿れなくなる。
- *   タッチ端末はホイールが無いためスクロール手段が完全に消える（既知バックログと同根）。
- * - `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` を与えると 1049/1000/1002/1006 を一切送らず、
- *   通常バッファへインライン追記する（実測で確認）。これで xterm.js の scrollback が効く。
+ * バックエンド既定 env（TUI をインライン描画させる env 等）を注入するか。
+ * 何を敷くかは backend が決める（Claude なら CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN 等。
+ * 背景の詳細は backends/claude.ts のコメントを参照）。
  *
  * env `EBI_INLINE_TUI` を "off"/"0"/"false" にすると注入しない（従来挙動へ戻す非常口）。
  * 親 env / launch.env で同名キーを明示指定した場合はそちらが優先される。
@@ -183,24 +127,21 @@ const INLINE_TUI_ENABLED = !["off", "0", "false"].includes(
   (process.env.EBI_INLINE_TUI ?? "on").toLowerCase(),
 );
 
-/** INLINE_TUI_ENABLED のときに既定値として注入する env。 */
-const INLINE_TUI_ENV: Record<string, string> = {
-  CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: "1",
-  // 代替スクリーン OFF なら現行版はマウス報告を送らないが、将来版でホイールを奪われないよう保険。
-  CLAUDE_CODE_DISABLE_MOUSE: "1",
-};
-
 /**
  * pty に渡す env を組み立てる純関数。優先度は低い順に
- * 「インライン TUI 既定 < 親 env < launch.env」。
+ * 「バックエンド既定 env < 親 env < launch.env」。
  * 親 env に同名キーがあればユーザーの明示指定として尊重する。
+ *
+ * backendEnv 未指定時は Claude バックエンドの既定を使う。EBI_COMMAND=bash 等の
+ * スタブ起動でも従来どおり同じ env が敷かれる（外形ゼロ差分のため意図的）。
  */
 export function buildSpawnEnv(
   parentEnv: Record<string, string | undefined>,
   launchEnv?: Record<string, string>,
   inlineTui: boolean = INLINE_TUI_ENABLED,
+  backendEnv: Record<string, string> = CLAUDE_BACKEND.buildEnv(),
 ): Record<string, string> {
-  const merged: Record<string, string> = inlineTui ? { ...INLINE_TUI_ENV } : {};
+  const merged: Record<string, string> = inlineTui ? { ...backendEnv } : {};
   // 値が undefined のキーで既定を握り潰さない（spread だと undefined でも上書きされてしまう）。
   for (const [key, value] of Object.entries(parentEnv)) {
     if (value !== undefined) merged[key] = value;
@@ -259,6 +200,12 @@ export interface LaunchParams {
    * 未指定なら親 env をそのまま使う。
    */
   env?: Record<string, string>;
+  /**
+   * このエビを動かすバックエンド id（起動引数/env/起動ゲート/通信路の性質を決める）。
+   * 未指定なら command から解決する（さらに一致しなければ既定 "claude"）。
+   * PR1 時点で実装済みの値は "claude" のみ。
+   */
+  backend?: BackendId;
 }
 
 /** Agent からのイベントを購読するためのコールバック束。 */
@@ -303,6 +250,8 @@ export class Agent {
   readonly notifySubscribe: boolean = true;
   /** 表示用モデル名（alias/full ID）。未指定 spawn なら null。 */
   readonly model: string | null = null;
+  /** このエビを動かしているバックエンド id（PR1 時点では常に "claude"）。 */
+  readonly backend: BackendId;
   /**
    * 起動に使った実パラメータ。自動再起動（固定エビ）でそのまま再 spawn するために保持する。
    */
@@ -351,10 +300,10 @@ export class Agent {
   //  自動応答しない＝設定書き換えによる意図せぬ承認を防ぐ）。運用者の承認のもと有効化。
   /** この agent で起動ゲート自動応答を有効化してよいか（上記の安全限定を満たすか）。 */
   private readonly autoAnswerStartupGates: boolean;
-  /** workspace trust ダイアログへ既に応答したか（多重送信防止）。 */
-  private trustGateAnswered = false;
-  /** development channels 警告へ既に応答したか（多重送信防止）。 */
-  private devChannelsGateAnswered = false;
+  /** バックエンドの起動ゲート定義（文言・応答・許可リスト）。ゲートを出さない backend は null。 */
+  private readonly gateSpec: StartupGateSpec | null;
+  /** 既に応答済みのゲート種別（多重送信防止）。 */
+  private readonly answeredGates = new Set<StartupGateKind>();
   /** ダイアログはチャンクを跨いで描画されるため、ready 前の出力を素文で溜めて走査する（上限付き）。 */
   private gateScanBuffer = "";
 
@@ -404,10 +353,18 @@ export class Agent {
     this.notifySubscribe = opts?.notifySubscribe ?? true;
     this.handlers = handlers;
     this.scrollbackBytes = config.scrollbackBytes;
-    this.autoAnswerStartupGates = isDevChannelsAutoAnswerEligible(
-      launch.args,
-      config.devChannelsAllowlist ?? BASE_ALLOWED_DEV_CHANNELS,
-    );
+    // バックエンドは launch.backend（明示） > command からの解決 > 既定(claude) の順で決める。
+    const backend = launch.backend
+      ? getBackend(launch.backend)
+      : resolveBackendOrDefault(launch.command);
+    this.backend = backend.id;
+    this.gateSpec = backend.startupGates;
+    this.autoAnswerStartupGates = this.gateSpec
+      ? this.gateSpec.isAutoAnswerEligible(
+          launch.args,
+          config.devChannelsAllowlist ?? this.gateSpec.baseAllowlist,
+        )
+      : false;
 
     this.detector = new IdleDetector(
       config.idleThresholdMs,
@@ -418,7 +375,12 @@ export class Agent {
     // 引数配列方式で起動（シェル非経由）。長文の --append-system-prompt も安全に渡る。
     // launch.env があれば親 env にマージする（engineer の EBI_ID 等。子の stdio MCP が継承する）。
     // さらに TUI をインライン描画させる既定 env を最下位優先で敷く（xterm.js のスクロール確保）。
-    const spawnEnv = buildSpawnEnv(process.env, launch.env);
+    const spawnEnv = buildSpawnEnv(
+      process.env,
+      launch.env,
+      INLINE_TUI_ENABLED,
+      backend.buildEnv({ agentId: id }),
+    );
     this.proc = pty.spawn(launch.command, launch.args, {
       name: "xterm-color",
       cols: 80,
@@ -549,7 +511,15 @@ export class Agent {
     // 無いのに本文を注入して吸われる／channel も未登録で捨てられる、の温床）。
     // 保険: GATE_SETTLE_MS を過ぎてもゲートを検知できなければ従来判定へ degrade する
     // （将来 claude がダイアログを出さなくなっても永久に ready にならない事故を防ぐ）。
-    if (this.autoAnswerStartupGates && !this.devChannelsGateAnswered && elapsed < GATE_SETTLE_MS) return;
+    const readyBlockingGate = this.gateSpec?.readyBlockingGate ?? null;
+    if (
+      this.autoAnswerStartupGates &&
+      readyBlockingGate !== null &&
+      !this.answeredGates.has(readyBlockingGate) &&
+      elapsed < GATE_SETTLE_MS
+    ) {
+      return;
+    }
     if (this.getStatus() !== "idle") return;
     this.hasBeenReady = true;
     this.handlers.onNotice(this.id, "ready（入力受付になりました）");
@@ -663,10 +633,12 @@ export class Agent {
    * 溜めてから判定する。応答したら、どのダイアログへ何を送ったかをサーバログに残す。
    */
   private maybeAnswerStartupGates(chunk: string): void {
-    if (this.disposed || !this.autoAnswerStartupGates) return;
+    const spec = this.gateSpec;
+    if (this.disposed || !this.autoAnswerStartupGates || spec === null) return;
     // 起動フェーズ限定（spawn からの時間窓）。ready フラグは沈黙で誤昇格するため使わない。
     if (Date.now() - this.spawnedAt > GATE_WINDOW_MS) return;
-    if (this.trustGateAnswered && this.devChannelsGateAnswered) return;
+    // このバックエンドが出しうるゲートに全部応答済みなら走査を打ち切る。
+    if (spec.kinds.every((k) => this.answeredGates.has(k))) return;
 
     // ANSI/OSC を除去して素文にし、直近ぶんだけ保持（ダイアログ全文は数百字に収まる）。
     const plain = chunk
@@ -674,29 +646,17 @@ export class Agent {
       .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
       .replace(/\x1b[()][A-Z0-9]/g, "");
     this.gateScanBuffer = (this.gateScanBuffer + plain).slice(-4096);
-    // 空白なし照合は detectStartupGate（純関数）に集約している（TUI が空白なしで描画する罠に対応）。
-    const gate = detectStartupGate(this.gateScanBuffer);
+    // 空白なし照合等の固有ロジックは backend の detect（純関数）に集約している
+    // （claude TUI が空白なしで描画する罠への対応は backends/claude.ts 参照）。
+    const gate = spec.detect(this.gateScanBuffer);
+    if (gate === null || this.answeredGates.has(gate)) return;
 
-    // development channels 警告（許可リストに正確一致した dev channel を持つ起動でのみ自動許可）。
-    if (gate === "devChannels" && !this.devChannelsGateAnswered) {
-      this.devChannelsGateAnswered = true;
-      this.proc.write("1\r");
-      this.gateScanBuffer = ""; // 次のダイアログ検知のため一旦クリア
-      const msg = `起動ゲート自動応答: development channels 警告に "1"+Enter を送信（許可リスト限定・ready 前）`;
-      console.log(`[ebi-team] [${this.id}] ${msg}`);
-      this.handlers.onNotice(this.id, msg);
-      return;
-    }
-
-    // workspace trust 確認。
-    if (gate === "trust" && !this.trustGateAnswered) {
-      this.trustGateAnswered = true;
-      this.proc.write("1\r");
-      this.gateScanBuffer = "";
-      const msg = `起動ゲート自動応答: workspace trust 確認に "1"+Enter を送信（ready 前）`;
-      console.log(`[ebi-team] [${this.id}] ${msg}`);
-      this.handlers.onNotice(this.id, msg);
-    }
+    this.answeredGates.add(gate);
+    this.proc.write(spec.answerFor(gate));
+    this.gateScanBuffer = ""; // 次のダイアログ検知のため一旦クリア
+    const msg = spec.noticeFor(gate);
+    console.log(`[ebi-team] [${this.id}] ${msg}`);
+    this.handlers.onNotice(this.id, msg);
   }
 
   /**
@@ -739,6 +699,7 @@ export class Agent {
       pinned: this.pinned,
       model: this.model,
       role: this.role,
+      backend: this.backend,
     };
   }
 

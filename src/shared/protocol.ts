@@ -118,6 +118,11 @@ export interface AgentRecord {
    * UI のバッジ表示に使う（kind は増やさず role で種別を表す）。
    */
   role?: string | null;
+  /**
+   * このエビを動かしているバックエンド（エージェント CLI）の id。
+   * 現状は "claude" のみ（マルチバックエンド化の足場。将来 "codex" 等が入る）。
+   */
+  backend?: string;
 }
 
 // ===== クライアント → サーバ =====

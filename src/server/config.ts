@@ -13,17 +13,18 @@ import { isAbsolute, resolve, dirname } from "node:path";
 import { homedir } from "node:os";
 import type { AgentKind } from "../shared/protocol.ts";
 import type { LaunchParams } from "./agent.ts";
+import {
+  buildLaunchArgs,
+  DEFAULT_BACKEND_ID,
+  PERMISSION_MODES,
+  type BackendId,
+  type PermissionMode,
+} from "./backends/index.ts";
 
-/** claude --permission-mode が受け付ける値（`claude --help` で確認済み）。 */
-export const PERMISSION_MODES = [
-  "acceptEdits",
-  "auto",
-  "bypassPermissions",
-  "default",
-  "dontAsk",
-  "plan",
-] as const;
-export type PermissionMode = (typeof PERMISSION_MODES)[number];
+// permission-mode の語彙は backends/types.ts（バックエンド非依存の抽象語彙）が SoT。
+// 既存の import 元（roles.ts / index.ts / control-server.ts 等）を壊さないよう再エクスポートする。
+export { PERMISSION_MODES };
+export type { PermissionMode };
 
 /**
  * 全エビ共通の permission-mode 既定。
@@ -140,17 +141,25 @@ export interface FixedEbiSpec {
 export interface ConfigDefaults {
   /** command 未指定の固定エビに使う既定コマンド（EBI_COMMAND 由来）。 */
   command: string;
+  /**
+   * サーバ既定のバックエンド id（config.defaultBackend / env EBI_BACKEND 解決済み）。
+   * 未指定なら "claude"。PR1 時点では常に "claude"。
+   */
+  backend?: BackendId;
 }
 
 /**
- * claude 起動引数を組み立てる共通ヘルパー。
- * 固定エビ（config 経由）と動的 engineer エビ（制御API 経由）の双方で使う。
+ * 制御MCP ブリッジ無しの起動引数を組み立てる共通ヘルパー（固定エビ config 経由の起動）。
  *
  * 起動引数の組み立て順:
  *   [--model M]? [--permission-mode P]? [--append-system-prompt S]? ...任意 args
  *
- * テスト等で command を bash 等に差し替えた場合は claude 固有フラグを付けない
- * （bash が解釈できず即終了→crashloop になるのを防ぐ）。
+ * 実体は backends/index.ts の buildLaunchArgs（バックエンド抽象の唯一の入口）。
+ * command に一致するバックエンドが無い場合（テストで bash 等に差し替えた場合）は
+ * 固有フラグを付けない（bash が解釈できず即終了→crashloop になるのを防ぐ）。
+ *
+ * 注: 固定エビは `--mcp-config` を config の args に直書きする運用のため、ここでは
+ * mcpConfigPath を渡さない（args はそのまま extraArgs として末尾に付く＝従来どおり）。
  */
 export function buildClaudeArgs(opts: {
   command: string;
@@ -159,16 +168,14 @@ export function buildClaudeArgs(opts: {
   appendSystemPrompt?: string | null;
   extraArgs?: string[];
 }): string[] {
-  const { command, model, permissionMode, appendSystemPrompt, extraArgs = [] } = opts;
-  const isClaude = command === "claude" || command.endsWith("/claude");
-  const args: string[] = [];
-  if (isClaude) {
-    if (model) args.push("--model", model);
-    if (permissionMode) args.push("--permission-mode", permissionMode);
-    if (appendSystemPrompt) args.push("--append-system-prompt", appendSystemPrompt);
-  }
-  args.push(...extraArgs);
-  return args;
+  return buildLaunchArgs(opts.command, {
+    model: opts.model ?? null,
+    permissionMode: opts.permissionMode ?? null,
+    systemPrompt: opts.appendSystemPrompt ?? null,
+    mcpConfigPath: null,
+    notifyMode: false,
+    extraArgs: opts.extraArgs ?? [],
+  });
 }
 
 /** permissionMode 文字列を検証して返す。不正なら throw。 */
@@ -276,7 +283,12 @@ function normalizeOne(raw: RawFixedEbi, configDir: string, defaults: ConfigDefau
   // notifySubscribe（既定 true）。false は「受信を PTY 注入に固定」する印。
   const notifySubscribe = raw.notifySubscribe === undefined ? true : asBoolean(raw.notifySubscribe, id);
 
-  return { id, kind, launch: { command, args, cwd, model }, notifySubscribe };
+  return {
+    id,
+    kind,
+    launch: { command, args, cwd, model, backend: defaults.backend ?? DEFAULT_BACKEND_ID },
+    notifySubscribe,
+  };
 }
 
 /**
