@@ -79,7 +79,8 @@ export const BUILTIN_ROLES: Record<string, EbiRole> = {
     emoji: "🛠",
     mcpRole: "engineer",
     permissionMode: "bypassPermissions",
-    defaultModel: "opus",
+    // 既定は明示ID運用（"opus" などのエイリアスは CLI 版依存で解決先が変わるため）。
+    defaultModel: "claude-opus-5",
     appendSystemPrompt: ENGINEER_APPEND_SYSTEM_PROMPT,
   },
 };

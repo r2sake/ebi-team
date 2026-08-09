@@ -129,8 +129,47 @@ const ECHO_NEEDLE_MIN_BODY = 8;
  * - "sent": 今この場で stdin へ書いた（相手の入力欄に入った）
  * - "queued": 相手が busy のため injectQueue に滞留した（idle 復帰時に flush される。
  *   この時点では相手はまだ本文を見ていない ＝ 到達確認済みとは呼べない）
+ * - "suppressed": echo guard により注入を取りやめた（同じ本文が channel 経由で既に
+ *   セッションへ到達していた ＝ 注入すると二重配送になる。EchoGuard 参照）
  */
-export type InjectState = "sent" | "queued";
+export type InjectState = "sent" | "queued" | "suppressed";
+
+/**
+ * 注入直前に「同じ本文が channel 経由で既にセッションへ描画されていないか」を照合するための印。
+ *
+ * 【2026-08-09 二重配送の根治】
+ * deliver() のセッション到達確認（本文エコー）は ECHO_CONFIRM_MS（既定 8s）で打ち切って
+ * PTY 注入へフォールバックする。しかし宛先が **busy** のときは、ACK 済みの channel 本文を
+ * harness がターン境界まで抱えて描画しないため、8s では原理的に間に合わない
+ * （実測: master 宛 reply が 8.05s ちょうどで echo-timeout → PTY へ載せ替え）。
+ * その PTY 注入も相手が busy なので injectQueue に滞留し、idle 復帰時に流れる。
+ * 結果、master には「channel タグ付きの 1 通目」と「数分後に生テキストの 2 通目」が届いていた。
+ *
+ * そこで、フォールバック注入には guard を持たせ、**実際に stdin へ書く直前**（idle 時は即座、
+ * busy 滞留時は flush 時）にエコーを再照合する。既に描画されていれば注入を取りやめる。
+ * 「取りこぼしより重複の方がマシ」という従来の判断は据え置きつつ、判定を 8s 後ではなく
+ * 「書く直前」まで遅らせることで、実際には届いていたケースの重複だけを消す。
+ */
+export interface EchoGuard {
+  /** 照合する本文（タグを除いた素の本文）。 */
+  payload: string;
+  /** 描画時に本文の前へ付く固定部（`[from:x] [reply] ` 等）。針の長さ計算に使う。 */
+  tag: string;
+  /** 照合開始位置（push 直前に取った scrollbackMark）。これ以降の出力だけを見る。 */
+  mark: number;
+  /** 抑止したときに呼ばれる通知（配送ログ用。best-effort）。 */
+  onSuppress?: () => void;
+}
+
+/**
+ * guard 付き注入を「書く直前」に待てる猶予（ms）。flush（idle 復帰）の瞬間はまだ channel 本文の
+ * 描画が終わっていないことがあるため、この時間だけエコーを待ってから最終判断する。
+ * 0 以下で待たない。env `EBI_ECHO_FLUSH_GRACE_MS` で調整可。
+ */
+const ECHO_FLUSH_GRACE_MS = Number(process.env.EBI_ECHO_FLUSH_GRACE_MS ?? 4000);
+
+/** guard 照合のポーリング間隔（ms）。 */
+const ECHO_FLUSH_POLL_MS = 250;
 
 /**
  * ANSI/OSC エスケープと空白を全除去して素文へ畳む。
@@ -205,6 +244,56 @@ const IDLE_NOTIFY_COOLDOWN_MS = Number(process.env.EBI_IDLE_NOTIFY_COOLDOWN_MS) 
 const IDLE_NOTIFY_ENABLED = !["off", "0", "false"].includes(
   (process.env.EBI_IDLE_NOTIFY ?? "on").toLowerCase(),
 );
+
+/**
+ * TUI を「代替スクリーン（alternate screen）」ではなく通常バッファへインライン描画させるための
+ * 既定 env。ブラウザ側 xterm.js のスクロールバックを機能させるために必須。
+ *
+ * 背景（実測 claude 2.1.198）:
+ * - claude CLI は起動直後に `ESC[?1049h`（代替スクリーン ON）＋ `ESC[?1000h/1002h/1006h`
+ *   （マウストラッキング ON）を送り、セッション中 `ESC[?1049l` を送らない。
+ * - 代替スクリーンでは xterm.js は **スクロールバックを一切持たない**（仕様）。さらにマウス
+ *   トラッキング中はホイールが端末側スクロールではなくアプリへ転送される。
+ *   結果、ブラウザのペインは「claude 内部ビューの見えている範囲」しか見られなくなり、
+ *   /compact のような全画面再描画（内部ビューのリセット）が走ると過去ログを辿れなくなる。
+ *   タッチ端末はホイールが無いためスクロール手段が完全に消える（既知バックログと同根）。
+ * - `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` を与えると 1049/1000/1002/1006 を一切送らず、
+ *   通常バッファへインライン追記する（実測で確認）。これで xterm.js の scrollback が効く。
+ *
+ * env `EBI_INLINE_TUI` を "off"/"0"/"false" にすると注入しない（従来挙動へ戻す非常口）。
+ * 親 env / launch.env で同名キーを明示指定した場合はそちらが優先される。
+ */
+const INLINE_TUI_ENABLED = !["off", "0", "false"].includes(
+  (process.env.EBI_INLINE_TUI ?? "on").toLowerCase(),
+);
+
+/** INLINE_TUI_ENABLED のときに既定値として注入する env。 */
+const INLINE_TUI_ENV: Record<string, string> = {
+  CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: "1",
+  // 代替スクリーン OFF なら現行版はマウス報告を送らないが、将来版でホイールを奪われないよう保険。
+  CLAUDE_CODE_DISABLE_MOUSE: "1",
+};
+
+/**
+ * pty に渡す env を組み立てる純関数。優先度は低い順に
+ * 「インライン TUI 既定 < 親 env < launch.env」。
+ * 親 env に同名キーがあればユーザーの明示指定として尊重する。
+ */
+export function buildSpawnEnv(
+  parentEnv: Record<string, string | undefined>,
+  launchEnv?: Record<string, string>,
+  inlineTui: boolean = INLINE_TUI_ENABLED,
+): Record<string, string> {
+  const merged: Record<string, string> = inlineTui ? { ...INLINE_TUI_ENV } : {};
+  // 値が undefined のキーで既定を握り潰さない（spread だと undefined でも上書きされてしまう）。
+  for (const [key, value] of Object.entries(parentEnv)) {
+    if (value !== undefined) merged[key] = value;
+  }
+  for (const [key, value] of Object.entries(launchEnv ?? {})) {
+    if (value !== undefined) merged[key] = value;
+  }
+  return merged;
+}
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -312,8 +401,8 @@ export class Agent {
   private readonly proc: pty.IPty;
   private readonly detector: IdleDetector;
   private readonly handlers: AgentHandlers;
-  /** busy 中に保留された注入文字列（送信フォーマット済み・末尾改行付き）。 */
-  private readonly injectQueue: string[] = [];
+  /** busy 中に保留された注入（本文＋任意の echo guard）。 */
+  private readonly injectQueue: { body: string; guard?: EchoGuard }[] = [];
   private disposed = false;
 
   // ===== readiness（ready 判定）=====
@@ -415,9 +504,8 @@ export class Agent {
 
     // 引数配列方式で起動（シェル非経由）。長文の --append-system-prompt も安全に渡る。
     // launch.env があれば親 env にマージする（engineer の EBI_ID 等。子の stdio MCP が継承する）。
-    const spawnEnv = launch.env
-      ? { ...(process.env as Record<string, string>), ...launch.env }
-      : (process.env as { [key: string]: string });
+    // さらに TUI をインライン描画させる既定 env を最下位優先で敷く（xterm.js のスクロール確保）。
+    const spawnEnv = buildSpawnEnv(process.env, launch.env);
     this.proc = pty.spawn(launch.command, launch.args, {
       name: "xterm-color",
       cols: 80,
@@ -715,13 +803,18 @@ export class Agent {
    * フォーマット: 本文 `[from:<from>] <message>` を書き、少し待ってから Enter を別 write で送る
    * （TUI のペースト検知で送信されない問題を回避＝送信まで担保）。キューは本文(改行なし)を保持。
    */
-  inject(from: string, message: string): InjectState {
+  inject(from: string, message: string, guard?: EchoGuard): InjectState {
     const body = `[from:${from}] ${message}`;
     if (this.getStatus() === "idle") {
+      // guard 付き（notify フォールバック由来）は、書く直前に「もう届いていないか」を確認する。
+      if (guard && this.isEchoed(guard)) {
+        guard.onSuppress?.();
+        return "suppressed";
+      }
       void this.sendLine(body);
       return "sent";
     }
-    this.injectQueue.push(body);
+    this.injectQueue.push({ body, guard });
     this.handlers.onNotice(
       this.id,
       `busy のため注入をキューに保留（待ち ${this.injectQueue.length} 件）`,
@@ -739,7 +832,30 @@ export class Agent {
    * 破棄側でログ化しないと、キューの中身は警告すら出さず消える（旧挙動）。
    */
   drainInjectQueue(): string[] {
-    return this.injectQueue.splice(0);
+    return this.injectQueue.splice(0).map((e) => e.body);
+  }
+
+  /** guard の本文が mark 以降の scrollback に描画済みか（＝ channel 経由で既に到達したか）。 */
+  private isEchoed(guard: EchoGuard): boolean {
+    return containsEcho(this.scrollbackSince(guard.mark), guard.payload, undefined, guard.tag);
+  }
+
+  /**
+   * guard 付き注入を書いてよいかの最終判断。既に描画済みなら false（抑止）。
+   * まだなら graceMs だけ待って再照合する（flush の瞬間は描画が終わっていないことがあるため）。
+   */
+  private async shouldWriteGuarded(
+    guard: EchoGuard,
+    graceMs: number = ECHO_FLUSH_GRACE_MS,
+  ): Promise<boolean> {
+    if (this.isEchoed(guard)) return false;
+    const deadline = Date.now() + graceMs;
+    while (Date.now() < deadline) {
+      await sleep(ECHO_FLUSH_POLL_MS);
+      if (this.disposed) return false;
+      if (this.isEchoed(guard)) return false;
+    }
+    return true;
   }
 
   /** 本文を stdin へ書き、ENTER_DELAY_MS 待ってから Enter(`\r`) を別 write で送って送信を確定させる。 */
@@ -828,12 +944,23 @@ export class Agent {
   private async flushQueue(): Promise<void> {
     if (this.injectQueue.length === 0) return;
     const count = this.injectQueue.length;
+    let sent = 0;
+    let suppressed = 0;
     while (this.injectQueue.length > 0) {
-      const body = this.injectQueue.shift()!;
-      await this.sendLine(body);
+      const entry = this.injectQueue.shift()!;
+      // guard 付き（notify フォールバック由来）は、書く直前に channel 経由の到達を再確認する。
+      // busy 中に harness が抱えていた本文はこの前後で描画されるため、ここで初めて正しく判定できる。
+      if (entry.guard && !(await this.shouldWriteGuarded(entry.guard))) {
+        suppressed += 1;
+        entry.guard.onSuppress?.();
+        continue;
+      }
+      await this.sendLine(entry.body);
+      sent += 1;
       // 次の件と混ざらないよう、送信確定後に間隔を空ける。
       if (this.injectQueue.length > 0) await sleep(ENTER_DELAY_MS);
     }
-    this.handlers.onNotice(this.id, `idle 復帰: 保留していた注入 ${count} 件を flush`);
+    const detail = suppressed > 0 ? `（送信 ${sent} 件・重複抑止 ${suppressed} 件）` : "";
+    this.handlers.onNotice(this.id, `idle 復帰: 保留していた注入 ${count} 件を flush${detail}`);
   }
 }

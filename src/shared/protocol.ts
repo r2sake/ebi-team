@@ -54,6 +54,11 @@ export interface ViewerRecord {
   format: ViewerFormat;
   /** ファイル内容（open 時点のスナップショット・UTF-8）。 */
   content: string;
+  /**
+   * 開いた時刻（epoch ms）。viewers.json への永続化・再起動後の並び順復元に使う。
+   * 永続化を使わない構成の互換のため optional。
+   */
+  openedAt?: number;
 }
 
 /**

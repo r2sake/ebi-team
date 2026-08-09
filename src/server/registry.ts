@@ -1,6 +1,13 @@
 import { writeFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import { Agent, containsEcho, type SpawnConfig, type AgentHandlers, type LaunchParams } from "./agent.ts";
+import {
+  Agent,
+  containsEcho,
+  type EchoGuard,
+  type SpawnConfig,
+  type AgentHandlers,
+  type LaunchParams,
+} from "./agent.ts";
 import { Mailbox } from "./mailbox.ts";
 import { logDelivery } from "./deliveryLog.ts";
 import {
@@ -291,6 +298,25 @@ export class Registry {
       // （過去の同種メッセージの描画を到達と誤認しないため）。
       const mark = agent.scrollbackMark();
       const msgId = this.mailbox!.push(id, { from, message: body, kind: kind ?? "message", ts: Date.now() });
+      // フォールバック注入に持たせる echo guard。「ブリッジが既に emit した本文」は harness が
+      // 遅れて（相手のターン境界で）描画しうるため、注入を書く直前に再照合して重複を消す。
+      const guard = (reason: string): EchoGuard => ({
+        payload: message,
+        tag: echoTag,
+        mark,
+        onSuppress: () =>
+          logDelivery({
+            event: "duplicate-suppressed",
+            level: "info",
+            msg:
+              `${id} 宛 PTY フォールバック注入を取りやめ（${reason}後に channel 本文の到達を` +
+              `確認したため。二重配送の抑止・from=${from}）`,
+            id,
+            from,
+            msgId,
+            reason,
+          }),
+      });
       const acked = await this.mailbox!.waitForAck(id, msgId, ACK_TIMEOUT_MS);
       if (acked) {
         // ブリッジ ACK は「stdout へ書いた」までの保証。セッション到達（harness が channel を
@@ -308,12 +334,13 @@ export class Registry {
           msgId,
           subscriberToken: this.mailbox!.subscriberToken(id),
         });
-        return this.injectFallback(agent, from, body, "pty-fallback", msgId);
+        return this.injectFallback(agent, from, body, "pty-fallback", msgId, guard("echo-timeout"));
       }
       // ACK 取れず＝ブリッジが転送できていない可能性。まだ pending に残っていれば回収し、
       // PTY 注入へフォールバックする（回収できなくても＝既にブリッジが拾って emit 済みでも、
-      // 取りこぼしの方が害が大きいので PTY にも載せて確実に届ける。多少の重複は許容）。
-      this.mailbox!.take(id, msgId);
+      // 取りこぼしの方が害が大きいので PTY にも載せて確実に届ける）。
+      // 回収できた（＝まだ誰も emit していない）なら重複はありえないので guard は付けない。
+      const reclaimed = this.mailbox!.take(id, msgId) !== null;
       logDelivery({
         event: "ack-timeout",
         msg: `${id} 宛 notification の ACK が ${ACK_TIMEOUT_MS}ms 以内に取れず PTY 注入へフォールバック（from=${from}）`,
@@ -321,8 +348,16 @@ export class Registry {
         from,
         msgId,
         subscriberToken: this.mailbox!.subscriberToken(id),
+        reclaimed,
       });
-      return this.injectFallback(agent, from, body, "pty-fallback", msgId);
+      return this.injectFallback(
+        agent,
+        from,
+        body,
+        "pty-fallback",
+        msgId,
+        reclaimed ? undefined : guard("ack-timeout"),
+      );
     }
     return this.injectFallback(agent, from, body, "pty", null);
   }
@@ -338,8 +373,14 @@ export class Registry {
     body: string,
     via: DeliverOutcome["via"],
     msgId: number | null,
+    guard?: EchoGuard,
   ): DeliverOutcome {
-    const state = agent.inject(from, body);
+    const state = agent.inject(from, body, guard);
+    if (state === "suppressed") {
+      // 書く直前の再照合で channel 到達が確認できた＝ notify 経路で届いていた。
+      // 注入していないので via は notify、confirmed:true（ログは guard.onSuppress が出す）。
+      return { ok: true, via: "notify", confirmed: true, queued: false };
+    }
     if (state === "queued") {
       logDelivery({
         event: "inject-queued",
