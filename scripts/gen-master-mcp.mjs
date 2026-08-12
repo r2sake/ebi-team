@@ -58,10 +58,14 @@ const engineerPath = genConfig("engineer", dev ? "engineer-control.dev.mcp.json"
 
 console.log(`生成(master):   ${masterPath}`);
 console.log(`生成(engineer): ${engineerPath}`);
-console.log(`ebi-team.config.json の master args に追加してください:`);
-console.log(`  "args": ["--strict-mcp-config", "--mcp-config", "${masterPath}"]`);
-console.log(`  加えて master 定義に "notifySubscribe": false を付け、受信を PTY 注入に固定します。`);
-console.log(`各役割は spawn 時にサーバが自動で役割別 --mcp-config を付与します（EBI_ID は env 継承）。`);
+console.log(`ebi-team.config.json への手書きは不要です:`);
+console.log(`  master / 各役割エビとも、spawn 時にサーバが役割別 --mcp-config を自動付与します`);
+console.log(`  （master は --strict-mcp-config 付きで上記 master 用パスを、dev/本番のファイル名差は`);
+console.log(`   サーバが __dirname から判定して吸収します。EBI_ID は env 継承）。`);
+console.log(`  master args に --mcp-config を手書きすると自動付与は行われません（明示指定が優先）。`);
+console.log(`  過去に手書きしていた場合は削除してください（dev/本番でファイル名が食い違い、claude が`);
+console.log(`  起動即死 → 約15秒で crashloop 停止する事故が実際に起きています）。`);
+console.log(`受信方式は master 定義の "notifySubscribe" で選びます（PTY 注入に固定するなら false）。`);
 console.log(``);
 console.log(`※ master args には --dangerously-load-development-channels を付けないでください。付けると`);
 console.log(`  harness が master セッションを『開発チャンネルをロードする＝バックグラウンドジョブ/サブ`);

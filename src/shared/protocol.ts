@@ -304,6 +304,15 @@ export interface NoticeMessage {
   type: "notice";
   id: string;
   text: string;
+  /**
+   * 過去 notice の再送か（新規 WS 接続時の replay）。
+   * 接続前に流れた固定エビの crashloop 停止通知等を後から見せるため、サーバが直近 N 件を
+   * リングバッファに保持して接続直後に送る（src/server/noticeBuffer.ts）。
+   * クライアントは replay 時に副作用（要約ローディング解除・モーダル表示）を起こさない。
+   */
+  replay?: boolean;
+  /** 発生時刻（epoch ms）。replay のときに当時の時刻で表示するために付く。 */
+  ts?: number;
 }
 
 /** エラー通知。 */

@@ -26,8 +26,11 @@ import {
   validatePermissionMode,
   DEFAULT_PERMISSION_MODE,
 } from "./config.ts";
-import { EBI_ROLES, resolveRole, registerCustomRoles, type EbiMcpRole } from "./roles.ts";
-import { FixedEbiManager } from "./fixedEbi.ts";
+import { EBI_ROLES, resolveRole, registerCustomRoles } from "./roles.ts";
+import { isRunningFromSrc, mcpConfigPathFor, type McpConfigRole } from "./mcpConfigPath.ts";
+import { FixedEbiManager, applyMasterMcpConfig } from "./fixedEbi.ts";
+import { configureFixedEbiLog, fixedEbiLogPath } from "./fixedEbiLog.ts";
+import { NoticeBuffer, DEFAULT_NOTICE_BUFFER_SIZE } from "./noticeBuffer.ts";
 import { createControlApi, type GeneralizedSpawnParams } from "./control.ts";
 import { UsageStore } from "./usageStore.ts";
 import { ViewerRegistry } from "./viewerRegistry.ts";
@@ -86,6 +89,13 @@ const DELIVERY_LOG_PATH =
     ? null
     : (process.env.EBI_DELIVERY_LOG_PATH ?? join(process.cwd(), ".ebi-team", "delivery.log"));
 configureDeliveryLog(DELIVERY_LOG_PATH);
+// 固定エビ（master/supervisor）のライフサイクル恒久ログ（JSONL）。spawn 失敗・短命死・
+// crashloop 停止をここに残す（配送ログとは別系統。env EBI_FIXED_EBI_LOG_PATH で変更、"off" で無効）。
+const FIXED_EBI_LOG_PATH =
+  process.env.EBI_FIXED_EBI_LOG_PATH === "off"
+    ? null
+    : (process.env.EBI_FIXED_EBI_LOG_PATH ?? join(process.cwd(), ".ebi-team", "fixed-ebi.log"));
+configureFixedEbiLog(FIXED_EBI_LOG_PATH);
 // 再アタッチ用スクロールバックのリングバッファ上限（バイト相当・既定 1MB）。
 // インライン TUI 化（agent.ts の INLINE_TUI_ENV）以降、ここには代替スクリーンの再描画ノイズでは
 // なく「実ログ」が積まれるため、リロード後に十分遡れるよう既定を広げている。
@@ -95,16 +105,18 @@ const CONFIG_PATH = process.env.EBI_CONFIG_PATH ?? join(process.cwd(), "ebi-team
 // 役割別 MCP config（reply_to_master 等の最小権限）のパス。
 // dev（tsx 実行・src 起点）か本番（dist 起点）かを __dirname で判定して既定を選ぶ。
 // env EBI_ENGINEER_MCP_CONFIG で明示上書き可（テスト/特殊配置用）。
-const RUNNING_FROM_SRC = __dirname.includes(`${join("src", "server")}`);
-function defaultMcpConfigPath(mcpRole: EbiMcpRole): string {
-  return join(
-    process.cwd(),
-    ".ebi-team",
-    RUNNING_FROM_SRC ? `${mcpRole}-control.dev.mcp.json` : `${mcpRole}-control.mcp.json`,
-  );
+// ファイル名規約（dev: <role>-control.dev.mcp.json / 本番: <role>-control.mcp.json）は
+// 生成側スクリプトと共有するため mcpConfigPath.ts に切り出してある。
+const RUNNING_FROM_SRC = isRunningFromSrc(__dirname);
+function defaultMcpConfigPath(mcpRole: McpConfigRole): string {
+  return mcpConfigPathFor(mcpRole, { fromSrc: RUNNING_FROM_SRC, baseDir: process.cwd() });
 }
-const ROLE_MCP_CONFIG: Record<EbiMcpRole, string> = {
+// master 分も同じ仕組みで持つ（2026-08-12: master だけ config 手書きだったため npm start で
+// 存在しない .dev パスを指し、claude が起動即死 → crashloop 停止していた。fixedEbi.ts の
+// applyMasterMcpConfig が spawn 時にこの値を付与する）。
+const ROLE_MCP_CONFIG: Record<McpConfigRole, string> = {
   engineer: process.env.EBI_ENGINEER_MCP_CONFIG ?? defaultMcpConfigPath("engineer"),
+  master: process.env.EBI_MASTER_MCP_CONFIG ?? defaultMcpConfigPath("master"),
 };
 // --dangerously-load-development-channels に渡す channel 指定子。
 // 手動設定の MCP サーバは `server:<mcpServersキー名>` 形式でタグ付けが必須
@@ -160,6 +172,16 @@ const viewerRegistry = new ViewerRegistry({ storePath: VIEWERS_PATH });
 // ===== 接続中の WebSocket クライアント集合 =====
 const clients = new Set<WebSocket>();
 
+// broadcast した notice の直近履歴。新規接続時に replay して「開いた時には消えている」を防ぐ
+// （固定エビの再起動 / crashloop 停止通知は起動から十数秒で流れ終わるため）。
+// EBI_NOTICE_BUFFER_SIZE=0 で無効化できる。
+const NOTICE_BUFFER_SIZE = Number(
+  process.env.EBI_NOTICE_BUFFER_SIZE ?? DEFAULT_NOTICE_BUFFER_SIZE,
+);
+const noticeBuffer = new NoticeBuffer(
+  Number.isFinite(NOTICE_BUFFER_SIZE) ? NOTICE_BUFFER_SIZE : DEFAULT_NOTICE_BUFFER_SIZE,
+);
+
 // ===== per-pane 購読（output の購読制）=====
 // 各 WS 接続が「どの agent の output を受け取るか」を保持する。
 // output はこの集合に含まれる agent の分だけ各接続へ送る。
@@ -181,6 +203,8 @@ function send(ws: WebSocket, msg: ServerMessage): void {
 }
 
 function broadcast(msg: ServerMessage): void {
+  // notice は直近分をリングバッファに残す（接続前に流れた通知を新規接続へ replay するため）。
+  if (msg.type === "notice") noticeBuffer.push(msg.id, msg.text);
   const text = JSON.stringify(msg);
   for (const ws of clients) {
     if (ws.readyState === WebSocket.OPEN) ws.send(text);
@@ -477,6 +501,11 @@ wss.on("connection", (ws) => {
   send(ws, usageStore.snapshot());
   // 接続直後に現在の viewer 一覧も送る（再接続時に開いている viewer を復元するため）。
   send(ws, { type: "viewers", viewers: viewerRegistry.list() });
+  // 接続前に broadcast された notice を古い順に replay する（replay:true・当時の ts 付き）。
+  // 起動直後に固定エビが crashloop 停止しても、後からブラウザを開いた人が気づけるようにする。
+  for (const n of noticeBuffer.list()) {
+    send(ws, { type: "notice", id: n.id, text: n.text, ts: n.ts, replay: true });
+  }
 
   ws.on("message", (raw) => {
     let msg: ClientMessage;
@@ -959,7 +988,10 @@ async function handleSummarize(ws: WebSocket, id: string): Promise<void> {
  */
 async function startFixedEbi(): Promise<void> {
   try {
-    const specs = await loadFixedEbi(CONFIG_PATH, { command: COMMAND });
+    const raw = await loadFixedEbi(CONFIG_PATH, { command: COMMAND });
+    // master には役割別 MCP config を spawn 直前に自動付与する（config への手書きを不要にし、
+    // dev / 本番のファイル名差分をサーバ側で吸収する）。args に明示があればそちらを優先。
+    const specs = raw.map((s) => applyMasterMcpConfig(s, ROLE_MCP_CONFIG.master));
     if (specs.length === 0) {
       console.log(`[ebi-team] 固定エビ: なし（${CONFIG_PATH} 未配置または fixedEbi 空）`);
       return;
@@ -1050,6 +1082,8 @@ httpServer.listen(PORT, HOST, () => {
       `${viewerRestore.skipped.length > 0 ? ` / skip ${viewerRestore.skipped.length}件` : ""}）`,
   );
   console.log(`[ebi-team] 配送ログ: ${deliveryLogPath() ?? "（無効・console のみ）"}`);
+  console.log(`[ebi-team] 固定エビログ: ${fixedEbiLogPath() ?? "（無効・console のみ）"}`);
+  console.log(`[ebi-team] master MCP config: ${ROLE_MCP_CONFIG.master}`);
   // 監督機能の状態のみ表示。キー値は出さない。
   console.log(`[ebi-team] ${supervisor.describeStartup()}`);
   console.log(`[ebi-team] dev フロント: http://localhost:5173 （Vite）`);
