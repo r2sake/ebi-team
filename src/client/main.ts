@@ -173,11 +173,14 @@ function handleServerMessage(msg: ServerMessage): void {
       break;
     }
     case "notice":
-      // 要約待ちだった agent への notice なら、要約ボタンのローディングを解除する。
-      if (msg.id === summarizingId) clearSummarizing();
-      // ファイルピッカー由来のオープン失敗（id="viewer-open"）はモーダル内にも表示する。
-      if (msg.id === "viewer-open") filePicker.notifyOpenError(msg.text);
-      addNotice(msg.id, msg.text);
+      // replay（接続前に流れた過去 notice の再送）は通知欄に出すだけで副作用を起こさない。
+      if (!msg.replay) {
+        // 要約待ちだった agent への notice なら、要約ボタンのローディングを解除する。
+        if (msg.id === summarizingId) clearSummarizing();
+        // ファイルピッカー由来のオープン失敗（id="viewer-open"）はモーダル内にも表示する。
+        if (msg.id === "viewer-open") filePicker.notifyOpenError(msg.text);
+      }
+      addNotice(msg.id, msg.text, msg.ts);
       break;
     case "error":
       addNotice("system", `エラー: ${msg.text}`);
@@ -466,9 +469,10 @@ function cell(text: string, cls?: string): HTMLTableCellElement {
   return td;
 }
 
-function addNotice(id: string, text: string): void {
+/** ts 指定時はその時刻で表示する（replay された過去 notice を「今」に見せないため）。 */
+function addNotice(id: string, text: string, ts?: number): void {
   const li = document.createElement("li");
-  const time = new Date().toLocaleTimeString("ja-JP");
+  const time = new Date(ts ?? Date.now()).toLocaleTimeString("ja-JP");
   li.textContent = `[${time}] ${id}: ${text}`;
   noticeList.prepend(li);
   // 直近 50 件のみ保持。

@@ -9,6 +9,32 @@
 import type { Registry } from "./registry.ts";
 import type { AgentHandlers } from "./agent.ts";
 import type { FixedEbiSpec } from "./config.ts";
+import { logFixedEbi } from "./fixedEbiLog.ts";
+
+/**
+ * master の固定エビに役割別 MCP config（--strict-mcp-config --mcp-config <path>）を自動付与する。
+ *
+ * 背景（2026-08-12 の master 起動不能インシデント）: master だけが config 手書きで
+ * `--mcp-config .../master-control.dev.mcp.json` を持っており、`npm start`（本番・非 dev の
+ * ファイル名で生成）では実在しないパスを指して claude が起動直後に死んでいた。engineer 側は
+ * index.ts の defaultMcpConfigPath() が dev/本番を自動判定して付与しているので、master も
+ * 同じ仕組みに寄せる＝config からパスを消し、サーバが spawn 時に解決したパスを付ける。
+ *
+ * - kind が master 以外、または claude 以外の command（テストの bash 等）には何もしない。
+ * - args に既に `--mcp-config` があるときは手動指定を尊重して何もしない（上書きの余地を残す）。
+ * - `--strict-mcp-config` は既にあれば重複させない。
+ */
+export function applyMasterMcpConfig(spec: FixedEbiSpec, mcpConfigPath: string): FixedEbiSpec {
+  if (spec.kind !== "master") return spec;
+  const { command, args } = spec.launch;
+  const isClaude = command === "claude" || command.endsWith("/claude");
+  if (!isClaude) return spec;
+  if (args.includes("--mcp-config")) return spec;
+  const extra = args.includes("--strict-mcp-config")
+    ? ["--mcp-config", mcpConfigPath]
+    : ["--strict-mcp-config", "--mcp-config", mcpConfigPath];
+  return { ...spec, launch: { ...spec.launch, args: [...args, ...extra] } };
+}
 
 /** crashloop 判定・バックオフのパラメータ。 */
 export interface RestartPolicy {
@@ -106,6 +132,20 @@ export class FixedEbiManager {
       s.consecutiveFailures = 0;
     } else {
       s.consecutiveFailures += 1;
+      // 短命死は「起動引数が壊れている」ことの最有力サイン。PTY ごと消える（タイルが残らない）
+      // ため、ここで恒久ログに残しておかないと事後に何も辿れない。
+      logFixedEbi({
+        event: "short-lived-exit",
+        msg:
+          `固定エビ "${id}" が起動 ${aliveMs}ms で終了しました` +
+          `（連続 ${s.consecutiveFailures}/${this.policy.maxConsecutiveFailures} 回目）`,
+        id,
+        aliveMs,
+        consecutiveFailures: s.consecutiveFailures,
+        command: s.spec.launch.command,
+        args: s.spec.launch.args,
+        cwd: s.spec.launch.cwd,
+      });
     }
 
     if (s.consecutiveFailures >= this.policy.maxConsecutiveFailures) {
@@ -115,7 +155,19 @@ export class FixedEbiManager {
         `固定エビ "${id}" が短時間に ${s.consecutiveFailures} 回連続で終了したため` +
           `自動再起動を停止しました（crashloop 防止）。設定を確認してください。`,
       );
-      console.warn(`[fixed-ebi] ${id} crashloop により自動再起動を停止`);
+      // console だけだと事後に追えないため恒久ログにも残す（console 出力もこの中で行う）。
+      logFixedEbi({
+        event: "crashloop-stopped",
+        msg:
+          `固定エビ "${id}" が短時間（各 ${this.policy.minHealthyMs}ms 未満）に ` +
+          `${s.consecutiveFailures} 回連続で終了したため自動再起動を停止しました。` +
+          `起動引数・MCP config のパスを確認してください`,
+        id,
+        consecutiveFailures: s.consecutiveFailures,
+        command: s.spec.launch.command,
+        args: s.spec.launch.args,
+        cwd: s.spec.launch.cwd,
+      });
       return;
     }
 
@@ -147,13 +199,30 @@ export class FixedEbiManager {
         launch,
         notifySubscribe: s.spec.notifySubscribe,
       });
-      console.log(
-        `[fixed-ebi] 起動: ${s.spec.id} (${s.spec.kind}) ` +
+      // 起動も記録する（解決済み args を残す＝MCP config パス等の事後検証がログだけで済む）。
+      logFixedEbi({
+        event: "spawned",
+        level: "info",
+        msg:
+          `起動: ${s.spec.id} (${s.spec.kind}) ` +
           `model=${s.spec.launch.model ?? "-"} cwd=${s.spec.launch.cwd}`,
-      );
+        id: s.spec.id,
+        kind: s.spec.kind,
+        command: s.spec.launch.command,
+        args: s.spec.launch.args,
+        cwd: s.spec.launch.cwd,
+      });
     } catch (err) {
       // spawn 自体の失敗も「失敗」として扱い、再起動フローに乗せる。
-      console.warn(`[fixed-ebi] ${s.spec.id} の spawn に失敗:`, err);
+      logFixedEbi({
+        event: "spawn-failed",
+        msg: `固定エビ "${s.spec.id}" の spawn に失敗: ${(err as Error).message}`,
+        id: s.spec.id,
+        command: s.spec.launch.command,
+        args: s.spec.launch.args,
+        cwd: s.spec.launch.cwd,
+        stack: (err as Error).stack,
+      });
       handlers.onNotice(s.spec.id, `固定エビ "${s.spec.id}" の起動に失敗: ${(err as Error).message}`);
       // exit イベントは来ないので、ここで明示的に再起動判定を回す。
       this.onExit(s.spec.id, handlers);
