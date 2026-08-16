@@ -5,7 +5,7 @@
 // 「配信確認済み」と報告されながら永久に届かなかった。本テストはその恒久対策 5 点を固定する:
 //   1. 二重購読の検出・拒否（Mailbox.claimSubscriber / releaseSubscriber）
 //   2. channelProven の鮮度化（shouldSkipEchoConfirm）
-//   3. エコー needle のタグ長オフセット（echoNeedle / containsEcho）
+//   3. エコー needle の msgId タグ照合（echoNeedle / containsEcho・2026-08-16 に本文照合から置換）
 //   4. confirmed と queued の区別（deliver / Agent.inject）
 //   5. 配送 warn の恒久ログ化（deliveryLog）
 //
@@ -27,6 +27,7 @@ const { Mailbox } = await import("../src/server/mailbox.ts");
 const { echoNeedle, containsEcho } = await import("../src/server/agent.ts");
 const { configureDeliveryLog, logDelivery, flushDeliveryLog } = await import("../src/server/deliveryLog.ts");
 import type { SpawnConfig, AgentHandlers } from "../src/server/agent.ts";
+import { deliveryTag } from "../src/shared/deliveryTag.ts";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -123,36 +124,40 @@ test("channelProven: alwaysMaster を切ると master も鮮度ベースにな�
   assert.equal(shouldSkipEchoConfirm("master", 1001, opts), false);
 });
 
-// ===== 3. エコー needle のタグ長オフセット =====
+// ===== 3. エコー needle の msgId タグ照合（2026-08-16 に本文照合から置換）=====
 
-test("echoNeedle: タグ長ぶんオフセットして本文から照合する（実質5文字問題の解消）", () => {
-  const tag = "[from:ebi-1] [reply] "; // compact 後 19 文字。
-  const body = "タスクAの結果を報告します";
-  const needle = echoNeedle(body, 24, tag);
-  assert.ok(!needle.startsWith("["), "タグを針に含めない（本文から取る）");
-  assert.ok(needle.length >= 12, `本文から十分な長さを照合する（実際: ${needle.length} 文字）`);
-  assert.ok(body.startsWith(needle));
+test("echoNeedle: 針は msgId 入りの行頭タグ（本文の長さ・言語に依存しない）", () => {
+  const needle = echoNeedle(deliveryTag("ebi-1", 42));
+  assert.equal(needle, "[from:ebi-1#42]");
+  assert.ok(needle.length <= 24, `針は必ず行頭に収まる短さ（実際: ${needle.length} 文字）`);
 });
 
-test("回帰: 同じエビの別メッセージの描画を到達と誤認しない（タグに食われた偽陽性）", () => {
-  const tag = "[from:ebi-1] [reply] ";
-  // 直前に描画された別メッセージ。旧実装は先頭 24 文字のうち 19 文字をタグに食われ、
-  // 本文が数文字しか照合されないため、これを「到達」と誤判定しうる状態だった。
-  const rendered = `ebi-control: ${tag}タスクAの結果を報告します`;
-  assert.equal(containsEcho(rendered, "タスクAの結果を報告します", 24, tag), true, "本人の描画は到達と判定");
-  assert.equal(
-    containsEcho(rendered, "タスクBの調査結果をまとめました", 24, tag),
-    false,
-    "別本文を到達と誤認しない",
+test("回帰: 同じエビの別メッセージの描画を到達と誤認しない（msgId で一意に切り分ける）", () => {
+  // 直前に描画された別メッセージ。旧実装は本文先頭を針にしていたため、タグに食われて
+  // 本文が数文字しか照合されず「到達」と誤判定しうる状態だった。msgId が違えば必ず外れる。
+  const rendered = `ebi-control: ${deliveryTag("ebi-1", 41)}タスクAの結果を報告します`;
+  assert.equal(containsEcho(rendered, deliveryTag("ebi-1", 41)), true, "本人の描画は到達と判定");
+  assert.equal(containsEcho(rendered, deliveryTag("ebi-1", 42)), false, "別メッセージを到達と誤認しない");
+});
+
+test("回帰: 和文長文でも針が描画の切り詰めに掛からない（本文照合時代の 100% 不一致の根治）", () => {
+  // 【2026-08-16 実障害】TUI の channel 1 行描画は表示カラム基準（80 桁端末で約 56 桁）で
+  // 切り詰める。旧実装の針は文字数基準（24 文字）だったため、1 文字 2 カラムの和文では
+  // 描画される本文（21〜23 文字）を必ず超えて一致しなかった（echo-timeout 94 件 / 抑止 0 件）。
+  const tag = deliveryTag("master", 66);
+  const body = "【ボス目視フィードバック・修正2点】スキル倉庫の左ペイン一覧: 1. 未入手の帯は削除";
+  // 実機同様、タグ＋本文の先頭だけが描画され、残りは切り詰められた scrollback。
+  const rendered = `ebi-control:${tag}${body.slice(0, 22)}…`;
+  assert.equal(containsEcho(rendered, tag), true, "タグは行頭なので切り詰めの影響を受けない");
+  assert.ok(
+    !rendered.includes(body.slice(0, 24)),
+    "前提確認: 本文先頭 24 文字は描画に現れない（旧方式なら必ず不一致だった）",
   );
 });
 
-test("echoNeedle: タグが長くても描画の切り詰め上限を超える針を作らない", () => {
-  const longTag = "[from:very-long-agent-id-here] [reply] ";
-  const body = "あ".repeat(100);
-  const needle = echoNeedle(body, 24, longTag, 40);
-  assert.ok(needle.length <= 40 - "[from:very-long-agent-id-here][reply]".length + 8);
-  assert.ok(needle.length >= 8, "最低限の照合長は確保する");
+test("echoNeedle: id が長くても針は行頭タグだけで完結する", () => {
+  const needle = echoNeedle(deliveryTag("very-long-agent-id-here", 7));
+  assert.equal(needle, "[from:very-long-agent-id-here#7]");
 });
 
 // ===== 4. confirmed と queued の区別 =====

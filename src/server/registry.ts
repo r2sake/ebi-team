@@ -16,6 +16,7 @@ import {
   type AgentRecord,
   type AgentKind,
 } from "../shared/protocol.ts";
+import { deliveryTag } from "../shared/deliveryTag.ts";
 
 /**
  * 配送方式の切り替え。**既定は notify**（notification 注入。購読者がいるエビのみで、
@@ -286,9 +287,6 @@ export class Registry {
     const agent = this.agents.get(id);
     if (!agent) return { ok: false, via: "none", confirmed: false, queued: false };
     const body = kind === "idle" ? `[idle] ${message}` : kind === "reply" ? `[reply] ${message}` : message;
-    // TUI 描画時に本文の前へ付く固定部。エコー照合の針をこの長さだけオフセットして
-    // 「実質 5 文字しか照合していない」状態を解消する（agent.echoNeedle 参照）。
-    const echoTag = `[from:${from}] ${kind ? `[${kind}] ` : ""}`;
     // notifySubscribe:false のエビ（外部チャンネル待機セッション・受信 PTY 固定）は、たとえ
     // 何らかの理由で購読者として登録されていても notification 経路に載せない。自セッションに
     // ebi-control channel が無く notification が harness に黙って捨てられるため（全配送経路
@@ -298,10 +296,13 @@ export class Registry {
       // （過去の同種メッセージの描画を到達と誤認しないため）。
       const mark = agent.scrollbackMark();
       const msgId = this.mailbox!.push(id, { from, message: body, kind: kind ?? "message", ts: Date.now() });
+      // 照合の針になる行頭タグ。notification 経路（control-server.ts）と PTY 注入（agent.inject）が
+      // **同じ deliveryTag() で同じ表記**を作るのが不変条件（ズレると抑止が静かに壊れる）。
+      // msgId で一意なので、本文の言語・長さ・TUI の表示幅に依存せず照合できる。
+      const echoTag = deliveryTag(from, msgId);
       // フォールバック注入に持たせる echo guard。「ブリッジが既に emit した本文」は harness が
       // 遅れて（相手のターン境界で）描画しうるため、注入を書く直前に再照合して重複を消す。
       const guard = (reason: string): EchoGuard => ({
-        payload: message,
         tag: echoTag,
         mark,
         onSuppress: () =>
@@ -321,13 +322,13 @@ export class Registry {
       if (acked) {
         // ブリッジ ACK は「stdout へ書いた」までの保証。セッション到達（harness が channel を
         // honor してモデルに見せた）まで確認できて初めて配送成立とみなす。
-        if (await this.confirmSessionEcho(agent, echoTag, message, mark)) {
+        if (await this.confirmSessionEcho(agent, echoTag, mark)) {
           return { ok: true, via: "notify", confirmed: true, queued: false };
         }
         logDelivery({
           event: "echo-timeout",
           msg:
-            `${id} 宛 notification は ACK されたがセッションへの到達（本文エコー）を` +
+            `${id} 宛 notification は ACK されたがセッションへの到達（タグエコー）を` +
             `${ECHO_CONFIRM_MS}ms 以内に確認できず PTY 注入へフォールバック（from=${from}）`,
           id,
           from,
@@ -366,6 +367,9 @@ export class Registry {
    * PTY 注入を行い、その結果（即送信 or busy 滞留）を DeliverOutcome へ正直に写す。
    * 滞留（queued）は「まだ相手の目に触れていない」ので confirmed:false とし、恒久ログにも残す
    * （滞留したまま agent が消えると内容は失われるため、事後追跡できる必要がある）。
+   *
+   * msgId は注入本文の行頭タグへ埋め込む（notification 側と同一表記にするため）。PTY 専用経路は
+   * null を渡し、従来どおり `[from:<from>] ` になる。
    */
   private injectFallback(
     agent: Agent,
@@ -375,7 +379,7 @@ export class Registry {
     msgId: number | null,
     guard?: EchoGuard,
   ): DeliverOutcome {
-    const state = agent.inject(from, body, guard);
+    const state = agent.inject(from, body, guard, msgId);
     if (state === "suppressed") {
       // 書く直前の再照合で channel 到達が確認できた＝ notify 経路で届いていた。
       // 注入していないので via は notify、confirmed:true（ログは guard.onSuppress が出す）。
@@ -399,21 +403,20 @@ export class Registry {
   }
 
   /**
-   * notification 配送が「セッションに到達した」ことを本文エコーで確認する。
+   * notification 配送が「セッションに到達した」ことを行頭タグのエコーで確認する。
    *
-   * claude TUI は channel 受信を `ebi-control: [from:master] <本文先頭>…` と描画するため、
-   * mark 以降の scrollback に本文先頭が現れれば到達とみなせる。逆に、channel が未登録で
-   * harness に捨てられた場合はこの描画が一切出ない（＝この関数が唯一の見分け手段）。
+   * claude TUI は channel 受信を `ebi-control: [from:master#90] <本文先頭>…` と描画するため、
+   * mark 以降の scrollback に **msgId 入りの行頭タグ**が現れれば到達とみなせる。逆に、channel が
+   * 未登録で harness に捨てられた場合はこの描画が一切出ない（＝この関数が唯一の見分け手段）。
+   *
+   * 【2026-08-16】針を本文先頭から行頭タグへ変更。本文先頭を針にしていた旧実装は、TUI の
+   * 切り詰めが表示カラム基準・針が文字数基準だったため和文で必ず不一致になっていた
+   * （src/shared/deliveryTag.ts 冒頭）。
    *
    * スキップ条件は shouldSkipEchoConfirm() を参照（一度の成功で永久に信用することはしない）。
    * ECHO_CONFIRM_MS <= 0 なら確認を行わない（旧挙動へのロールバック口）。
    */
-  private async confirmSessionEcho(
-    agent: Agent,
-    echoTag: string,
-    payload: string,
-    mark: number,
-  ): Promise<boolean> {
+  private async confirmSessionEcho(agent: Agent, echoTag: string, mark: number): Promise<boolean> {
     if (ECHO_CONFIRM_MS <= 0) return true;
     // channel 本文を描画するのは claude セッション（制御MCP ブリッジ持ち）だけ。
     // それ以外（bash 等のテスト起動）はエコーが原理上出ないため確認対象外とする。
@@ -421,7 +424,7 @@ export class Registry {
     if (shouldSkipEchoConfirm(agent.kind, agent.channelProvenAgeMs())) return true;
     const deadline = Date.now() + ECHO_CONFIRM_MS;
     for (;;) {
-      if (containsEcho(agent.scrollbackSince(mark), payload, undefined, echoTag)) {
+      if (containsEcho(agent.scrollbackSince(mark), echoTag)) {
         agent.markChannelProven();
         return true;
       }
@@ -514,7 +517,7 @@ export class Registry {
         event: "dropped-pending",
         msg:
           `${id} を除去。mailbox 未配送 ${dropped.length} 件を破棄: ` +
-          dropped.map((m) => `[from:${m.from}] ${m.message.slice(0, 60)}`).join(" / "),
+          dropped.map((m) => `${deliveryTag(m.from, m.id)}${m.message.slice(0, 60)}`).join(" / "),
         id,
         count: dropped.length,
         messages: dropped.map((m) => ({ from: m.from, kind: m.kind, message: m.message.slice(0, 200) })),

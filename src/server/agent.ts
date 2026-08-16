@@ -1,6 +1,7 @@
 import * as pty from "node-pty";
 import { IdleDetector } from "./idleDetector.ts";
 import type { AgentRecord, AgentStatus, AgentMode, AgentKind } from "../shared/protocol.ts";
+import { deliveryText } from "../shared/deliveryTag.ts";
 
 /**
  * 注入時、本文を書いてから Enter(`\r`) を別 write で送るまでの待ち時間(ms)。
@@ -107,24 +108,6 @@ export function detectStartupGate(rawScanBuffer: string): "devChannels" | "trust
 const GATE_SETTLE_MS = Number(process.env.EBI_GATE_SETTLE_MS) || 20000;
 
 /**
- * notification（channel）配送の「セッション到達」確認に使う、本文エコー照合の長さ（文字数・compact 後）。
- * claude TUI は channel 受信を `ebi-control: [from:master] <本文先頭>…` と**先頭を切り詰めて**描画するため、
- * 本文全体ではなく先頭のこの長さだけを照合する。短すぎると誤検知、長すぎると切り詰めで検知漏れになる。
- * 実測（80 桁）では compact 後 40 文字強まで描画される。env `EBI_ECHO_NEEDLE_LEN` で調整可。
- */
-const ECHO_NEEDLE_LEN = Number(process.env.EBI_ECHO_NEEDLE_LEN) || 24;
-
-/**
- * エコー照合の針の総長の上限（compact 後の文字数）。TUI は 1 行に収まる分しか描画しないため、
- * これを超える針は「切り詰めで永久に一致しない」＝検知漏れ（無駄な PTY フォールバック）になる。
- * 実測（80 桁）で compact 後 40 文字強まで描画される。env `EBI_ECHO_NEEDLE_MAX` で調整可。
- */
-const ECHO_NEEDLE_MAX = Number(process.env.EBI_ECHO_NEEDLE_MAX) || 40;
-
-/** タグが長すぎて本文の取り分が潰れた場合でも、最低限これだけは本文から照合する。 */
-const ECHO_NEEDLE_MIN_BODY = 8;
-
-/**
  * PTY 注入の結果。
  * - "sent": 今この場で stdin へ書いた（相手の入力欄に入った）
  * - "queued": 相手が busy のため injectQueue に滞留した（idle 復帰時に flush される。
@@ -135,25 +118,29 @@ const ECHO_NEEDLE_MIN_BODY = 8;
 export type InjectState = "sent" | "queued" | "suppressed";
 
 /**
- * 注入直前に「同じ本文が channel 経由で既にセッションへ描画されていないか」を照合するための印。
+ * 注入直前に「同じメッセージが channel 経由で既にセッションへ描画されていないか」を照合するための印。
  *
- * 【2026-08-09 二重配送の根治】
- * deliver() のセッション到達確認（本文エコー）は ECHO_CONFIRM_MS（既定 8s）で打ち切って
- * PTY 注入へフォールバックする。しかし宛先が **busy** のときは、ACK 済みの channel 本文を
- * harness がターン境界まで抱えて描画しないため、8s では原理的に間に合わない
+ * 【2026-08-09 二重配送の根治（判定タイミング）】
+ * deliver() のセッション到達確認は ECHO_CONFIRM_MS（既定 8s）で打ち切って PTY 注入へ
+ * フォールバックする。しかし宛先が **busy** のときは、ACK 済みの channel 本文を harness が
+ * ターン境界まで抱えて描画しないため、8s では原理的に間に合わない
  * （実測: master 宛 reply が 8.05s ちょうどで echo-timeout → PTY へ載せ替え）。
  * その PTY 注入も相手が busy なので injectQueue に滞留し、idle 復帰時に流れる。
- * 結果、master には「channel タグ付きの 1 通目」と「数分後に生テキストの 2 通目」が届いていた。
+ * 結果、master には「channel 経由の 1 通目」と「数分後に PTY の 2 通目」が届いていた。
+ * そこで guard を持たせ、**実際に stdin へ書く直前**（idle 時は即座、busy 滞留時は flush 時）
+ * に再照合し、既に描画されていれば注入を取りやめる。
  *
- * そこで、フォールバック注入には guard を持たせ、**実際に stdin へ書く直前**（idle 時は即座、
- * busy 滞留時は flush 時）にエコーを再照合する。既に描画されていれば注入を取りやめる。
- * 「取りこぼしより重複の方がマシ」という従来の判断は据え置きつつ、判定を 8s 後ではなく
- * 「書く直前」まで遅らせることで、実際には届いていたケースの重複だけを消す。
+ * 【2026-08-16 二重配送の根治（判定手段）】
+ * 上の修正でもタグ無しの二重着弾が続いた。真因は判定**手段**（本文の先頭 N 文字を針にする）で、
+ * 針が文字数ベース・TUI の切り詰めが表示カラムベースだったため和文では原理的に一致しなかった
+ * （詳細は src/shared/deliveryTag.ts の冒頭）。針を「msgId 入りの行頭タグそのもの」へ変更し、
+ * 本文の言語・長さ・表示幅に依存しない照合にした。
  */
 export interface EchoGuard {
-  /** 照合する本文（タグを除いた素の本文）。 */
-  payload: string;
-  /** 描画時に本文の前へ付く固定部（`[from:x] [reply] ` 等）。針の長さ計算に使う。 */
+  /**
+   * 照合する行頭タグ（`deliveryTag(from, msgId)` の戻り値）。msgId で一意なので、
+   * これが mark 以降に描画されていれば「この配送が届いた」と断定できる。
+   */
   tag: string;
   /** 照合開始位置（push 直前に取った scrollbackMark）。これ以降の出力だけを見る。 */
   mark: number;
@@ -185,47 +172,29 @@ export function compactPlain(raw: string): string {
 }
 
 /**
- * 配送本文から「セッション到達を照合するための針」を作る純関数。
+ * 配送の「セッション到達を照合するための針」を作る純関数。
  *
- * 【2026-08-04 タグ長オフセット】
- * 描画は `[from:master] [reply] 本文…` の形になるため、針を「先頭 len 文字」で取ると
- * タグ（compact 後でも 12〜20 文字）に食われ、実質「本文の先頭数文字」しか照合しない状態だった
- * （`[from:ebi-1] [reply] ` で 19 文字消費 → 本文は 5 文字程度。同じエビの別メッセージの
- * 描画で偽陽性になりうる）。そこで **タグ長ぶんオフセットして本文から len 文字を取る**。
+ * 【2026-08-16 本文照合 → タグ照合】
+ * 針は `deliveryTag(from, msgId)` が返す行頭タグ（`[from:master#90] `）を compact したもの。
+ * 旧実装は「本文の先頭 N 文字」を針にしていたが、claude TUI の channel 1 行描画は
+ * **表示カラム**（実測 80 桁端末で約 56 桁）で切り詰めるのに対し針は**文字数**（既定 24）
+ * で作られていたため、1 文字 = 2 カラムの和文では針が原理的に描画長を超え、照合が
+ * 100% 失敗していた（詳細と実測は src/shared/deliveryTag.ts の冒頭）。
  *
- * 針は「本文（タグを除いた部分）の先頭 len 文字」。描画は タグ＋本文 の連結なので、
- * 本文だけの針もそのまま部分文字列として一致する。ただしタグに圧迫されて描画の切り詰めに
- * かかると永久に一致しなくなるため、取り分は max - タグ長 で頭打ちにする
- * （それでも最低 ECHO_NEEDLE_MIN_BODY 文字は照合する）。
- *
- * サロゲートペアを割らないよう Array.from で切る。
+ * タグなら必ず行頭にあり切り詰めの影響を受けず、msgId で一意なので本文の言語・長さ・
+ * 表示幅に一切依存しない。空文字（タグ無し＝照合すべきものが無い）なら空を返す。
  */
-export function echoNeedle(
-  body: string,
-  len: number = ECHO_NEEDLE_LEN,
-  tag = "",
-  max: number = ECHO_NEEDLE_MAX,
-): string {
-  const b = Array.from(compactPlain(body));
-  if (b.length === 0) return "";
-  const budget = max - compactPlain(tag).length;
-  const take = Math.min(len, Math.max(budget, ECHO_NEEDLE_MIN_BODY));
-  return b.slice(0, take).join("");
+export function echoNeedle(tag: string): string {
+  return compactPlain(tag);
 }
 
 /**
- * scrollback 断片に配送本文のエコー（＝ claude セッションが channel 本文を実際に描画したこと）が
+ * scrollback 断片に配送のエコー（＝ claude セッションがそのメッセージを実際に描画したこと）が
  * 含まれるかを判定する純関数。TUI の空白潰し・行折返しに耐えるよう compact 同士で照合する。
- * needle が空（本文が空白のみ等）なら常に false（誤検知させない）。
- * tag には描画時に本文の前へ付く固定部（`[from:x] [reply] ` 等）を渡す。
+ * tag には `deliveryTag(from, msgId)` の戻り値を渡す。針が空なら常に false（誤検知させない）。
  */
-export function containsEcho(
-  scrollbackChunk: string,
-  body: string,
-  len: number = ECHO_NEEDLE_LEN,
-  tag = "",
-): boolean {
-  const needle = echoNeedle(body, len, tag);
+export function containsEcho(scrollbackChunk: string, tag: string): boolean {
+  const needle = echoNeedle(tag);
   if (needle.length === 0) return false;
   return compactPlain(scrollbackChunk).includes(needle);
 }
@@ -800,11 +769,16 @@ export class Agent {
    * 送信元タグ付き注入。idle なら即送信、busy ならキューへ。
    * 戻り値で「今 stdin へ送った（sent）／busy で滞留した（queued）」を区別する。
    * 滞留は idle 復帰まで相手の目に触れないため、呼び出し側はこれを confirmed と区別する。
-   * フォーマット: 本文 `[from:<from>] <message>` を書き、少し待ってから Enter を別 write で送る
-   * （TUI のペースト検知で送信されない問題を回避＝送信まで担保）。キューは本文(改行なし)を保持。
+   * フォーマット: 本文 `[from:<from>#<msgId>] <message>` を書き、少し待ってから Enter を別 write で
+   * 送る（TUI のペースト検知で送信されない問題を回避＝送信まで担保）。キューは本文(改行なし)を保持。
+   *
+   * msgId は mailbox 採番の一意 id。notification 経路（control-server.ts）が emit する本文と
+   * **完全に同じ表記**になるよう deliveryTag() を共用する（ここがズレると二重配送の抑止が
+   * 静かに壊れる。test/dupDelivery.test.ts で錠前を掛けてある）。PTY 専用経路は採番が無いので
+   * msgId を省略し、従来どおり `[from:<from>] ` になる。
    */
-  inject(from: string, message: string, guard?: EchoGuard): InjectState {
-    const body = `[from:${from}] ${message}`;
+  inject(from: string, message: string, guard?: EchoGuard, msgId?: number | null): InjectState {
+    const body = deliveryText(from, message, msgId);
     if (this.getStatus() === "idle") {
       // guard 付き（notify フォールバック由来）は、書く直前に「もう届いていないか」を確認する。
       if (guard && this.isEchoed(guard)) {
@@ -835,9 +809,9 @@ export class Agent {
     return this.injectQueue.splice(0).map((e) => e.body);
   }
 
-  /** guard の本文が mark 以降の scrollback に描画済みか（＝ channel 経由で既に到達したか）。 */
+  /** guard のタグが mark 以降の scrollback に描画済みか（＝ channel 経由で既に到達したか）。 */
   private isEchoed(guard: EchoGuard): boolean {
-    return containsEcho(this.scrollbackSince(guard.mark), guard.payload, undefined, guard.tag);
+    return containsEcho(this.scrollbackSince(guard.mark), guard.tag);
   }
 
   /**
