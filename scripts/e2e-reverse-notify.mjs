@@ -3,7 +3,7 @@
 //
 //  A. 明示リプライ疎通
 //     - POST /control/reverse-inject { from:"ebi-1", message:"test" }
-//       → master(bash) の scrollback に `[from:ebi-1] [reply] test` が出る
+//       → master(bash) の scrollback に `[from:ebi-1#<msgId>] [reply] test` が出る
 //     - 自己送信（from===to）/ 宛先なし が 4xx で拒否される
 //
 //  B. engineer MCP のロール出し分け
@@ -133,8 +133,9 @@ async function main() {
     }
     await sleep(1000);
     const sb = await masterScrollback();
-    if (sb.includes("[from:ebi-1] [reply] test")) {
-      ok("master scrollback に `[from:ebi-1] [reply] test`");
+    // 行頭タグは msgId 付き（`[from:ebi-1#3] `）になりうる（2026-08-16 二重配送の根治）。
+    if (/\[from:ebi-1(#\d+)?\] \[reply\] test/.test(sb)) {
+      ok("master scrollback に `[from:ebi-1(#n)] [reply] test`");
     } else {
       fail("master に届いていない: " + sb.slice(-200));
     }
@@ -190,8 +191,8 @@ async function main() {
     }
     await sleep(1000);
     const sb = await masterScrollback();
-    if (sb.includes("[from:ebi-eng-7] [reply] engineer done")) {
-      ok("EBI_ID 継承確認: master に `[from:ebi-eng-7] [reply] engineer done`");
+    if (/\[from:ebi-eng-7(#\d+)?\] \[reply\] engineer done/.test(sb)) {
+      ok("EBI_ID 継承確認: master に `[from:ebi-eng-7(#n)] [reply] engineer done`");
     } else {
       fail("EBI_ID 継承/配送が不正: " + sb.slice(-200));
     }
@@ -239,8 +240,8 @@ async function main() {
     await postJson("/control/inject", { to: engId, message: "echo TICK" });
     await sleep(1500); // 出力 → idle へ。B 発火を待つ。
     let sb = await masterScrollback();
-    if (sb.includes(`[from:${engId}] [idle] 待機に入りました`)) {
-      ok(`idle 自動通知: master に \`[from:${engId}] [idle] 待機に入りました…\``);
+    if (new RegExp(`\\[from:${engId}(#\\d+)?\\] \\[idle\\] 待機に入りました`).test(sb)) {
+      ok(`idle 自動通知: master に \`[from:${engId}(#n)] [idle] 待機に入りました…\``);
     } else {
       fail("idle 自動通知が届かない: " + sb.slice(-300));
     }

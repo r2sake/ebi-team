@@ -27,6 +27,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { EBI_ROLES, registerCustomRoles, type EbiRoleId } from "../server/roles.ts";
 import { loadRawCustomRoles } from "../server/config.ts";
+import { deliveryText } from "../shared/deliveryTag.ts";
 
 const CONTROL_URL = (process.env.EBI_CONTROL_URL ?? "http://127.0.0.1:8787").replace(/\/$/, "");
 
@@ -471,6 +472,9 @@ async function subscribeLoop(): Promise<void> {
       backoffMs = 500; // 成功したらバックオフをリセット。
       const ackIds: number[] = [];
       for (const m of data.messages ?? []) {
+        // 行頭タグは deliveryTag() で組み立てる。PTY 注入経路（src/server/agent.ts inject()）と
+        // **完全に同じ表記**にするのが不変条件で、これが二重配送抑止の照合キーそのものになる
+        // （ここだけ書式を変えると抑止が静かに壊れる。詳細は src/shared/deliveryTag.ts 冒頭）。
         // 現行の [from:xxx] タグ相当の情報を content にも残しつつ、meta にも構造化して積む
         // （content はセッションへそのまま見える本文・meta は将来の機械的な判別用）。
         // 前提条件（どちらか欠けると harness に静かに skip される。registry.ts 参照）:
@@ -480,11 +484,12 @@ async function subscribeLoop(): Promise<void> {
         await server.server.notification({
           method: "notifications/claude/channel",
           params: {
-            content: `[from:${m.from}] ${m.message}`,
+            content: deliveryText(m.from, m.message, m.id),
             meta: {
               from: m.from,
               kind: m.kind ?? "message",
               ts: String(m.ts),
+              ...(typeof m.id === "number" ? { msgId: String(m.id) } : {}),
             },
           },
         });

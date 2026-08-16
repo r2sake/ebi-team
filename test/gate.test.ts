@@ -16,6 +16,7 @@ import {
   BASE_ALLOWED_DEV_CHANNELS,
 } from "../src/server/agent.ts";
 import { isNotifySubscribeEnabled } from "../src/mcp/control-server.ts";
+import { deliveryTag } from "../src/shared/deliveryTag.ts";
 
 const FLAG = "--dangerously-load-development-channels";
 
@@ -128,40 +129,57 @@ test("購読: '1' や他の文字列 → 有効", () => {
   assert.equal(isNotifySubscribeEnabled("yes"), true);
 });
 
-// ---- containsEcho / echoNeedle: channel 本文のセッション到達照合（spawn 直後の消失根治）----
-// claude TUI は channel 受信を `ebi-control: [from:master] <本文先頭>…` と、空白を潰し
+// ---- containsEcho / echoNeedle: channel 配送のセッション到達照合（spawn 直後の消失根治）----
+// claude TUI は channel 受信を `ebi-control: [from:master#90] <本文先頭>…` と、空白を潰し
 // 先頭を切り詰めて描画する。この描画を「セッションに実際に届いた」唯一の観測点として使うため、
-// compact 同士の前方一致で照合する。
+// compact 同士で照合する。針は **msgId 入りの行頭タグ**（本文ではない）＝ 2026-08-16 の変更。
 
-test("containsEcho: TUI が空白を潰して先頭だけ描画しても到達と判定する", () => {
-  const body = "[from:master] # タスク 2（到達計測用・トークン ACKOK2XEAYS）\n本文が続く…";
+test("containsEcho: TUI が空白を潰して先頭だけ描画してもタグで到達と判定する", () => {
+  const tag = deliveryTag("master", 90);
   const rendered =
-    "\x1b[2m❯ ←\x1b[0mebi-control:[from:master]#タスク2（到達計測用・トークンACKOK2XEAYS…";
-  assert.equal(containsEcho(rendered, body), true);
+    "\x1b[2m❯ ←\x1b[0mebi-control:[from:master#90]#タスク2（到達計測用・トークンACKOK2XEAYS…";
+  assert.equal(containsEcho(rendered, tag), true);
 });
 
 test("containsEcho: 空白ありで描画された場合も到達と判定する", () => {
-  const body = "[from:master] hello world from ebi-team delivery";
-  assert.equal(containsEcho("ebi-control: [from:master] hello world from ebi-team…", body), true);
+  const tag = deliveryTag("master", 7);
+  assert.equal(
+    containsEcho("ebi-control: [from:master#7] hello world from ebi-team…", tag),
+    true,
+  );
 });
 
-test("containsEcho: channel が捨てられ本文が描画されない scrollback は未到達と判定する", () => {
-  const body = "[from:master] # タスク 1（到達計測用・トークン ACKOK1XRQX7）";
+test("containsEcho: 本文が和文で切り詰められてもタグは行頭なので到達と判定できる（回帰）", () => {
+  // 【2026-08-16 実障害】本文先頭を針にしていた旧実装は、TUI の切り詰めが表示カラム基準
+  // （80 桁端末で約 56 桁）・針が文字数基準（24）だったため、1 文字 2 カラムの和文では
+  // 針が原理的に描画長を超えて 100% 不一致になっていた。タグ照合ならこの影響を受けない。
+  const tag = deliveryTag("master", 90);
+  const rendered =
+    "ebi-control:[from:master#90]【ボス目視フィードバック・修正】スキル倉庫の…";
+  assert.equal(containsEcho(rendered, tag), true);
+});
+
+test("containsEcho: 別の msgId の描画を到達と誤認しない（#9 は #90 に一致しない）", () => {
+  const rendered = "ebi-control:[from:master#9]別のメッセージ…";
+  assert.equal(containsEcho(rendered, deliveryTag("master", 90)), false, "前方一致で誤検知しない");
+  assert.equal(containsEcho(rendered, deliveryTag("master", 9)), true, "本人のタグには一致する");
+});
+
+test("containsEcho: channel が捨てられ何も描画されない scrollback は未到達と判定する", () => {
   // 実際の失敗ラウンドの scrollback（harness が channel を honor できなかったときの表示）。
   const rendered =
     "▎server:ebi-control · no MCP server configured with that name" +
     "❯ Try \"refactor <filepath>\"⏵⏵ bypass permissions on";
-  assert.equal(containsEcho(rendered, body), false);
+  assert.equal(containsEcho(rendered, deliveryTag("master", 1)), false);
 });
 
-test("containsEcho: 本文が空/空白のみなら誤検知させない（常に false）", () => {
+test("containsEcho: タグが空/空白のみなら誤検知させない（常に false）", () => {
   assert.equal(containsEcho("なんでも描画されている", "   \n  "), false);
 });
 
-test("echoNeedle: compact 後の先頭 N コードポイントを返す（サロゲートペアを割らない）", () => {
-  assert.equal(echoNeedle("[from:master] ab cd", 15), "[from:master]ab");
-  // 絵文字（サロゲートペア）が境界に来ても壊れた半端文字を作らない。
-  const needle = echoNeedle("🛠🛠🛠", 2);
-  assert.equal(needle, "🛠🛠");
-  assert.equal(Array.from(needle).length, 2);
+test("echoNeedle: タグを compact したものを針にする（空白・ANSI を落とす）", () => {
+  assert.equal(echoNeedle(deliveryTag("master", 90)), "[from:master#90]");
+  // msgId 無し（PTY 専用経路）は従来書式のまま針になる。
+  assert.equal(echoNeedle(deliveryTag("master")), "[from:master]");
+  assert.equal(echoNeedle("\x1b[2m[from:ebi-1#3] \x1b[0m"), "[from:ebi-1#3]");
 });
