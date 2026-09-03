@@ -33,6 +33,7 @@ import { configureFixedEbiLog, fixedEbiLogPath } from "./fixedEbiLog.ts";
 import { NoticeBuffer, DEFAULT_NOTICE_BUFFER_SIZE } from "./noticeBuffer.ts";
 import { createControlApi, type GeneralizedSpawnParams } from "./control.ts";
 import { UsageStore } from "./usageStore.ts";
+import { ContextGuard, contextGuardConfigFromEnv, type GuardNotice } from "./contextGuard.ts";
 import { ViewerRegistry } from "./viewerRegistry.ts";
 import {
   loadAuthConfig,
@@ -229,6 +230,55 @@ function broadcastUsage(): void {
   broadcast(usageStore.snapshot());
 }
 
+// ===== コンテキスト枯渇ガード（context-guard）=====
+// master のコンテキスト使用率を監視し、自動 compact に食われて PM 文脈が消える前に「促す」。
+// **compact も /clear もサーバは実行しない**（既存方針どおり促すだけ）。設計は
+// docs/plans/context-guard-plan.md。判定本体は contextGuard.ts の純粋ステートマシン。
+const contextGuardConfig = contextGuardConfigFromEnv();
+const contextGuard = new ContextGuard(contextGuardConfig, (n) => onContextGuardNotice(n));
+
+/**
+ * ガードの発火を 2 経路へ流す（ボス裁定 X-2）:
+ *  - ebi-team UI の notice（NoticeBuffer に載るので、通知時にブラウザを開いていなくても replay される）
+ *  - master セッションへの inject（master は notifySubscribe:false ＝ PTY 注入固定で最も堅い）
+ * 発火履歴はデバッグ用に info ログへ残す。
+ */
+function onContextGuardNotice(n: GuardNotice): void {
+  console.info(
+    `[context-guard] fire kind=${n.kind} level=${n.level} pct=${n.usedPct ?? "null"} ` +
+      `quiescent=${n.quiescent} busyDynamic=${n.busyDynamic} target=${contextGuardConfig.targetId}`,
+  );
+  broadcast({ type: "notice", id: "context-guard", text: n.text });
+  // 到達確認（ACK 待ち）を含むため async。促すだけの通知なので投げっぱなしにする。
+  void registry
+    .reverseInject("context-guard", contextGuardConfig.targetId, n.text, "reply")
+    .then((result) => {
+      if (result.delivered.length === 0 && result.rejected.length > 0) {
+        console.warn(
+          `[context-guard] ${contextGuardConfig.targetId} への通知を配信できませんでした: ` +
+            `${result.rejected[0]?.reason}（UI notice には出ています）`,
+        );
+      }
+    })
+    .catch((err) => {
+      console.warn("[context-guard] 通知の配信中にエラー:", err);
+    });
+}
+
+/** usage 取り込みのたびに呼ぶ。監視対象の最新 usage だけをガードへ渡す。 */
+function observeContextGuard(ebiId: string): void {
+  if (!contextGuardConfig.enabled) return;
+  if (ebiId !== contextGuardConfig.targetId) return;
+  const target = usageStore.snapshot().agents.find((a) => a.id === contextGuardConfig.targetId);
+  if (!target) return;
+  try {
+    contextGuard.observe(target, registry.list());
+  } catch (err) {
+    // 監視の失敗で usage 取り込み自体を壊さない（best-effort）。
+    console.warn("[context-guard] 判定中にエラー:", err);
+  }
+}
+
 /** 現在の viewer 一覧を全クライアントへ broadcast する（open/close 時）。 */
 function broadcastViewers(): void {
   broadcast({ type: "viewers", viewers: viewerRegistry.list() });
@@ -329,6 +379,8 @@ const controlApi = createControlApi({
     usageStore.update(ebiId, json);
     // 更新のたびに全クライアントへ最新スナップショットを配信する。
     broadcastUsage();
+    // コンテキスト枯渇ガード（監視対象は既定 master）。判定は同期・通知は onNotice 経由。
+    observeContextGuard(ebiId);
   },
   // 各エビの制御MCP ブリッジが自分宛メッセージを long-poll 購読するための経路。
   // 初回購読の確立はサーバログに出す（notification 経路が生きているかの観測点）。
@@ -1077,6 +1129,11 @@ httpServer.listen(PORT, HOST, () => {
   console.log(`[ebi-team] デフォルト cwd: ${DEFAULT_CWD}`);
   console.log(`[ebi-team] idle しきい値: ${IDLE_THRESHOLD_MS}ms / registry ダンプ: ${DUMP_PATH}`);
   console.log(`[ebi-team] viewer 許可ルート: ${viewerRegistry.getRoots().join(", ")}`);
+  console.log(
+    `[ebi-team] context-guard: ${contextGuardConfig.enabled ? "on" : "off"}`
+      + ` / 監視対象=${contextGuardConfig.targetId}`
+      + ` / soft=${contextGuardConfig.softPct}% notify=${contextGuardConfig.hardPct}% critical=${contextGuardConfig.criticalPct}%`,
+  );
   console.log(
     `[ebi-team] viewer 永続化: ${VIEWERS_PATH}（復元 ${viewerRestore.restored.length}件` +
       `${viewerRestore.skipped.length > 0 ? ` / skip ${viewerRestore.skipped.length}件` : ""}）`,
