@@ -716,7 +716,15 @@ function handleClientMessage(ws: WebSocket, msg: ClientMessage): void {
  */
 async function handleSpawn(ws: WebSocket, msg: SpawnMessage): Promise<void> {
   try {
-    await spawnAgent({ id: msg.id, cwd: msg.cwd, useWorktree: msg.useWorktree, repoPath: msg.repoPath, branch: msg.branch });
+    await spawnAgent({
+      id: msg.id,
+      cwd: msg.cwd,
+      useWorktree: msg.useWorktree,
+      repoPath: msg.repoPath,
+      branch: msg.branch,
+      // UI からの backend 指定（セレクトの実装は PR-E。未指定ならサーバ既定）。
+      backend: msg.backend,
+    });
   } catch (err) {
     send(ws, { type: "error", text: `spawn 失敗: ${(err as Error).message}` });
   }
@@ -749,6 +757,14 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     : (role?.permissionMode ?? DEFAULT_PERMISSION_MODE);
   const appendSystemPrompt = params.appendSystemPrompt ?? role?.appendSystemPrompt ?? null;
   const model = params.model ?? role?.defaultModel ?? null;
+
+  // バックエンド解決: spawn 引数 > 役割既定（PR-E で EbiRole.backend を足す）> サーバ既定
+  //（サーバ既定 BACKEND_ID は config.defaultBackend / env EBI_BACKEND 解決済み）。
+  // 未実装 backend（codex / gemini）を明示指定された場合はここで throw し、制御API が
+  // 400 相当のエラーで返す（黙って claude に落とさない）。
+  const backendId = params.backend
+    ? resolveBackendId({ explicit: params.backend })
+    : BACKEND_ID;
 
   // 役割付きなら ebi-control MCP（最小権限・reply_to_master 等）を追加する。
   // 「どのフラグをどう付けるか」はバックエンド実装（backends/claude.ts の buildArgs）に閉じており、
@@ -792,7 +808,7 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
       cwd,
       model,
       env: launchEnv,
-      backend: BACKEND_ID,
+      backend: backendId,
     };
     const agent = registry.spawn(cwd, handlers, { id: agentId, kind: params.kind, role: role?.id, launch });
     broadcast({ type: "spawned", agent: agent.toRecord() });
@@ -813,7 +829,7 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     cwd: wt.worktreePath,
     model,
     env: launchEnv,
-    backend: BACKEND_ID,
+    backend: backendId,
   };
   const agent = registry.spawn(wt.worktreePath, handlers, {
     id: agentId,
@@ -851,6 +867,8 @@ export interface SendMessageParams {
   branch?: string;
   /** spawnIfMissing で起動する際の役割（EBI_ROLES id。未指定は engineer）。 */
   role?: string;
+  /** spawnIfMissing で起動する際のバックエンド（未指定は役割の既定→サーバ既定）。 */
+  backend?: string;
   /** 【後方互換】spawnIfMissing で起動する際 engineer 役割にするか（既定 true 相当）。role が優先。 */
   asEngineer?: boolean;
 }
@@ -912,6 +930,7 @@ async function sendMessage(params: SendMessageParams): Promise<SendMessageResult
       branch: params.branch,
       kind: "dynamic",
       role: roleId,
+      backend: params.backend,
     });
     spawned = true;
     agent = registry.get(to);

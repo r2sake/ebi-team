@@ -119,8 +119,9 @@ export interface AgentRecord {
    */
   role?: string | null;
   /**
-   * このエビを動かしているバックエンド（エージェント CLI）の id。
-   * 現状は "claude" のみ（マルチバックエンド化の足場。将来 "codex" 等が入る）。
+   * このエビを動かしているバックエンド（エージェント CLI）の id
+   * （"claude" | "codex" | "gemini"）。実装済みは "claude" のみ（PR-B 時点）。
+   * UI のバッジ表示（🟣 claude / 🟢 codex / 🔵 gemini）と usage 欠測表示は PR-E で実装する。
    */
   backend?: string;
 }
@@ -140,6 +141,13 @@ export interface SpawnMessage {
   repoPath?: string;
   /** 生成する（または再利用する）ブランチ名。未指定なら `ebi/<agent-id>` を採番。 */
   branch?: string;
+  /**
+   * バックエンド（エージェント CLI）id。未指定ならサーバ既定（claude）。
+   * 値域は BackendId（"claude" | "codex" | "gemini"）だが、shared は server の型に依存させない
+   * ため string で持つ。未実装 id はサーバが明示エラーで弾く。
+   * spawn フォームの backend セレクト実装は PR-E。
+   */
+  backend?: string;
 }
 
 /** agent を kill して registry から除去する。 */
