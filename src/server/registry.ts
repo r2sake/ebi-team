@@ -10,6 +10,7 @@ import {
 } from "./agent.ts";
 import { Mailbox } from "./mailbox.ts";
 import { logDelivery } from "./deliveryLog.ts";
+import { resolveBackend } from "./backends/index.ts";
 import {
   BROADCAST_TARGET,
   type AgentMode,
@@ -122,15 +123,15 @@ export function isNotifyMode(): boolean {
 
 /**
  * agent が「制御MCP ブリッジを持つ（= notification 購読が期待できる）」か。
- * claude コマンドかつ起動引数に --mcp-config があるかで判定する
- * （役割付き動的エビ・master 固定エビが該当。bash テスト起動や役割なし dynamic は該当しない）。
+ * 判定はバックエンドへ委譲する（claude なら「claude コマンド＋起動引数に --mcp-config」）。
+ * 役割付き動的エビ・master 固定エビが該当。bash テスト起動や役割なし dynamic は該当しない。
  * spawn 直後にまだ初回 subscribe が来ていない相手を「待つ価値があるか」の
  * 事前判定に使う（無ければ PTY へ即フォールバックして無駄な待ちを作らない）。
  */
 export function hasControlBridge(agent: Pick<Agent, "launch">): boolean {
-  const { command, args } = agent.launch;
-  const isClaude = command === "claude" || command.endsWith("/claude");
-  return isClaude && args.includes("--mcp-config");
+  const { command, args, env } = agent.launch;
+  const backend = resolveBackend(command);
+  return backend !== null && backend.hasControlBridge(args, env ?? {});
 }
 
 /**

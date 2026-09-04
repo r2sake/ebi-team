@@ -15,14 +15,17 @@ import {
 import { Mailbox } from "./mailbox.ts";
 import { configureDeliveryLog, deliveryLogPath, logDelivery } from "./deliveryLog.ts";
 import type { SpawnConfig, AgentHandlers, LaunchParams } from "./agent.ts";
-import { BASE_ALLOWED_DEV_CHANNELS } from "./agent.ts";
+import {
+  BASE_ALLOWED_DEV_CHANNELS,
+  buildLaunchArgs,
+  resolveBackendId,
+} from "./backends/index.ts";
 import { addWorktree, removeWorktree } from "./git.ts";
 import { Supervisor } from "./supervisor.ts";
 import {
   loadFixedEbi,
   loadRawCustomRoles,
   loadDevChannelsAllowlist,
-  buildClaudeArgs,
   validatePermissionMode,
   DEFAULT_PERMISSION_MODE,
 } from "./config.ts";
@@ -69,6 +72,10 @@ const HOST = process.env.EBI_HOST ?? "127.0.0.1";
 const authConfig = loadAuthConfig();
 // spawn する対象コマンド。claude が PATH に無い環境では EBI_COMMAND=bash 等で fallback。
 const COMMAND = process.env.EBI_COMMAND ?? "claude";
+// サーバ既定のバックエンド id。優先度は spawn 引数 > 役割 > config.defaultBackend >
+// env EBI_BACKEND > "claude"（config.defaultBackend / 役割単位の指定は後続 PR で配線する）。
+// 未実装 id を指定されたら起動前に throw する（黙って claude に落とさない）。
+const BACKEND_ID = resolveBackendId({ env: process.env.EBI_BACKEND });
 const COMMAND_ARGS = process.env.EBI_ARGS ? process.env.EBI_ARGS.split(" ") : [];
 // agent のデフォルト cwd。
 const DEFAULT_CWD = process.env.EBI_DEFAULT_CWD ?? process.cwd();
@@ -119,11 +126,8 @@ const ROLE_MCP_CONFIG: Record<McpConfigRole, string> = {
   engineer: process.env.EBI_ENGINEER_MCP_CONFIG ?? defaultMcpConfigPath("engineer"),
   master: process.env.EBI_MASTER_MCP_CONFIG ?? defaultMcpConfigPath("master"),
 };
-// --dangerously-load-development-channels に渡す channel 指定子。
-// 手動設定の MCP サーバは `server:<mcpServersキー名>` 形式でタグ付けが必須
-// （素の "ebi-control" だと claude が起動時エラーで即終了する。実機で確認済み）。
-// キー名は gen-master-mcp.mjs の生成キー "ebi-control" と一致していること。
-const EBI_CONTROL_CHANNEL_SPEC = "server:ebi-control";
+// --dangerously-load-development-channels に渡す channel 指定子は backends/claude.ts が持つ
+// （EBI_CONTROL_CHANNEL_SPEC）。付与条件も含めてバックエンド実装に閉じている。
 
 const spawnConfig: SpawnConfig = {
   command: COMMAND,
@@ -747,16 +751,13 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   const model = params.model ?? role?.defaultModel ?? null;
 
   // 役割付きなら ebi-control MCP（最小権限・reply_to_master 等）を追加する。
-  // - claude command 時のみ --mcp-config を足す（bash 等の非 claude command には付けない＝
-  //   既存 buildClaudeArgs の「非 claude にフラグを付けない」方針と矛盾させない）。
-  // - --strict-mcp-config は付けない。作業に必要な既存 MCP 環境を保ちつつ、
-  //   ebi-control を「追加」で持たせたいため（strict だと他の MCP が落ちる）。
-  // - notify モードが有効なときだけ --dangerously-load-development-channels server:ebi-control
-  //   を足し、ebi-control MCP をセッションの channel として register する。これが無いと
-  //   `notifications/claude/channel` が harness の channels allowlist 判定で skip され、
-  //   notification 注入が成立しない（2026-07-11 harness バイナリ解析＋実機検証で確定。
-  //   capability 宣言は src/mcp/control-server.ts 側）。サーバ名は mcp-config の mcpServers キー
-  //   （scripts/gen-master-mcp.mjs の "ebi-control"）に一致させる。
+  // 「どのフラグをどう付けるか」はバックエンド実装（backends/claude.ts の buildArgs）に閉じており、
+  // ここでは抽象パラメータ（mcpConfigPath / notifyMode）を渡すだけにする。
+  // - 非対応 command（EBI_COMMAND=bash 等のスタブ起動）では buildLaunchArgs が固有フラグを
+  //   一切付けない（bash が解釈できず即終了→crashloop になるのを防ぐ、従来からの方針）。
+  // - notify モードが有効なときだけ dev-channels フラグが付き、ebi-control MCP がセッションの
+  //   channel として register される。これが無いと notification 注入が成立しない
+  //   （2026-07-11 harness バイナリ解析＋実機検証で確定。capability 宣言は control-server.ts 側）。
   //   このフラグを付けた claude は起動時に development channels 警告ダイアログを出すが、
   //   agent.ts の起動ゲート自動応答（maybeAnswerStartupGates）が "1"+Enter で越える
   //   （運用者承認のもと有効化・live e2e 19/20 OK）。安全限定＝dev-channels 値が
@@ -764,18 +765,7 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   //   既定は notify（isNotifyMode()=true）。EBI_INJECT_MODE=pty で旧方式へロールバック可。
   // - id は先に予約しておき、worktree 有無に関わらず EBI_ID として pty env に注入する
   //   （子の stdio MCP が継承し、reply_to_master の from が自分の id になる）。
-  const isClaude = command === "claude" || command.endsWith("/claude");
   const agentId = registry.reserveId(params.id);
-  const roleMcpArgs =
-    role && isClaude
-      ? [
-          "--mcp-config",
-          ROLE_MCP_CONFIG[role.mcpRole],
-          ...(isNotifyMode()
-            ? ["--dangerously-load-development-channels", EBI_CONTROL_CHANNEL_SPEC]
-            : []),
-        ]
-      : [];
   // EBI_ID は全 spawn 経路（master/supervisor/dynamic/engineer）で必ず注入する。
   // - engineer: 子の stdio MCP が継承し reply_to_master の from を自分の id にする。
   // - 全エビ共通: statusLine スクリプトがこの id で usage を /control/usage へ POST し、
@@ -783,24 +773,26 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   // command 種別に関わらず注入してよい（bash テストでも env 継承の確認ができる）。
   const launchEnv = { EBI_ID: agentId };
 
-  // claude フラグ（model/permission-mode/append-system-prompt）を組み立てる。
-  // bash 等の非 claude command 時は buildClaudeArgs 側でフラグを付けない。
-  const claudeArgs = buildClaudeArgs({
-    command,
+  // バックエンド固有の起動引数を組み立てる（claude なら
+  // --model / --permission-mode / --append-system-prompt / --mcp-config / dev-channels）。
+  const launchArgs = buildLaunchArgs(command, {
     model,
     permissionMode,
-    appendSystemPrompt,
-    extraArgs: [...roleMcpArgs, ...spawnConfig.args],
+    systemPrompt: appendSystemPrompt,
+    mcpConfigPath: role ? ROLE_MCP_CONFIG[role.mcpRole] : null,
+    notifyMode: isNotifyMode(),
+    extraArgs: [...spawnConfig.args],
   });
 
   // worktree なし: cwd 直指定で起動。
   if (!params.useWorktree) {
     const launch: LaunchParams = {
       command,
-      args: claudeArgs,
+      args: launchArgs,
       cwd,
       model,
       env: launchEnv,
+      backend: BACKEND_ID,
     };
     const agent = registry.spawn(cwd, handlers, { id: agentId, kind: params.kind, role: role?.id, launch });
     broadcast({ type: "spawned", agent: agent.toRecord() });
@@ -817,10 +809,11 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   if (wt.reused) broadcast({ type: "notice", id: agentId, text: wt.reused });
   const launch: LaunchParams = {
     command,
-    args: claudeArgs,
+    args: launchArgs,
     cwd: wt.worktreePath,
     model,
     env: launchEnv,
+    backend: BACKEND_ID,
   };
   const agent = registry.spawn(wt.worktreePath, handlers, {
     id: agentId,
@@ -1040,7 +1033,7 @@ async function handleSummarize(ws: WebSocket, id: string): Promise<void> {
  */
 async function startFixedEbi(): Promise<void> {
   try {
-    const raw = await loadFixedEbi(CONFIG_PATH, { command: COMMAND });
+    const raw = await loadFixedEbi(CONFIG_PATH, { command: COMMAND, backend: BACKEND_ID });
     // master には役割別 MCP config を spawn 直前に自動付与する（config への手書きを不要にし、
     // dev / 本番のファイル名差分をサーバ側で吸収する）。args に明示があればそちらを優先。
     const specs = raw.map((s) => applyMasterMcpConfig(s, ROLE_MCP_CONFIG.master));
