@@ -1,0 +1,37 @@
+[>4;0m[>5u╭──────────────────────────────────────────────────────────╮│ >_ OpenAI Codex (v0.146.0)                               ││                                                          ││ model:     loading   /model to change                    ││ directory: ~/…/ebi-team/.worktrees/ebi-ebiteam-poc-codex │╰──────────────────────────────────────────────────────────╯›Write tests for @filename[38;2;246;226;183;49mgpt-5.6-terra default · ~/workspace/GitHub/ebi-team/.worktrees/ebi-ebiteam-po…›Write tests for @filenamegpt-5.6-terra default · ~/workspace/GitHub/ebi-team/.worktrees/ebi-ebiteam-po…
+
+╭──────────────────────────────────────────────────────────╮
+
+│ >_ OpenAI Codex (v0.146.0)                               │
+
+│                                                          │
+
+│ model:     gpt-5.6-terra   /model to change              │
+
+│ directory: ~/…/ebi-team/.worktrees/ebi-ebiteam-poc-codex │
+
+╰──────────────────────────────────────────────────────────╯
+
+
+
+  Tip: New For a limited time, Codex is included in your plan for free – let’s
+
+  build together.
+
+
+
+
+
+› これは接続テストです。ツールは使わず、次の一語だけを返してください: READY-0
+
+
+
+
+
+⚠ MCP startup interrupted. The following servers were not initialized:
+
+  codex_apps, ebi-control•Working(0s • esc to interrupt)›Write tests for @filenamegpt-5.6-terra default · ~/workspace/GitHub/ebi-team/.worktrees/ebi-ebiteam-po…WWo•Wor•WorkWorki•Workin•Working•Working1•WorkingWorking•orking•rking•kinging•ngg2WWo•Wor•WorkWorki•Workin•Working•Working3•WorkingWorking•orking•rking•kinging•ng
+
+
+
+• READY-0›Write tests for @filenamegpt-5.6-terra default · ~/workspace/GitHub/ebi-team/.worktrees/ebi-ebiteam-po…
