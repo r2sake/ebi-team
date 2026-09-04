@@ -155,6 +155,28 @@ npm run test:unit                 # 純関数（buildArgs 外形固定・permiss
 npm run build && npm run e2e:codex # live e2e（実 codex を 10 回 spawn。ChatGPT サブスク枠を消費）
 ```
 
+### 7.1 現状の e2e 成績（未達・PR-D 時点）
+
+**連続 10 回の受け入れ基準は未達（実測 2/10）。** 失敗はすべて同じ型で、エビが
+「この環境では reply_to_master ツールが利用できません」と答えて終わる（＝静かな故障）。
+分かっていること:
+
+- **タイミングではない**: ready の追加猶予を 8s → 20s → 45s と上げても成績は変わらない（0/3）。
+- **MCP 登録自体は成立する**: サーバが組み立てたのと**同じ引数**を手で PTY 起動して `/mcp` を
+  叩くと `ebi-control: list_ebi, read_scrollback, reply_to_master` が出る。
+- **同じ経路の手動実行は通る**: 同じ dist・同じ制御API 呼び出し（spawn → send）を
+  シェルから 1 回ずつ行うと 3/3 で `reply_to_master` が master に着弾する。
+- 役割プロンプトに「ファイル編集・コマンド実行は一切しない」のような**全面禁止の一文**を
+  入れると失敗率が上がる（モデルが「ツール呼び出しも不可」と解釈する）。外しても 2/10。
+
+残っている仮説と次の一手（PR-E 以降）:
+1. モデル側のツール可視性のばらつき（同一セッション内でツール一覧を見失う）。
+   → ready 直後に `/mcp` を注入して ebi-control の登録を**サーバ側で確認**し、
+   出なければ 1 回だけ再 spawn する（`fatalPatterns` に「ツールが利用できません」を足す手も）。
+2. 連続 spawn による `~/.codex` セッション状態の競合（ラウンド間隔を空けても再現）。
+3. 最終手段: 報告経路を PTY 依存にしない（`<worktree>/.ebi-report.md` を watch する
+   ファイル受け渡し・設計書 R3 の代替案）。
+
 `npm run e2e:codex` は稼働サーバ（8787）に一切依存しない: 専用ポート（既定 8809）で control-server を
 自前起動し、master は bash の使い捨てエビ。各ラウンドで
 「spawn → ready → 役割プロンプト注入 → タスク注入 → `reply_to_master` 着弾 → idle → kill 後に残存 0」
