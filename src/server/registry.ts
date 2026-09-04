@@ -135,6 +135,17 @@ export function hasControlBridge(agent: Pick<Agent, "launch">): boolean {
 }
 
 /**
+ * agent の backend が notification（channel）注入に対応するか。
+ * 非対応（codex）の場合、購読は原理上確立しないので待たずに PTY 注入へ直行する
+ * （待つだけ無駄＝ notifySubscribe:false のエビと同じ扱い）。
+ * command がどの backend にも一致しないスタブ起動は従来どおり true（判定は hasControlBridge 側に任せる）。
+ */
+export function supportsChannelInject(agent: Pick<Agent, "launch">): boolean {
+  const backend = resolveBackend(agent.launch.command);
+  return backend === null ? true : backend.supportsChannelInject;
+}
+
+/**
  * 1 宛先への配送経路と到達確認の内訳。
  * - via: どの経路で配送したか
  *   - "notify": notification 経路で到達確認（ブリッジ ACK）が取れた

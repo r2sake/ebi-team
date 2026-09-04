@@ -279,18 +279,19 @@ test("envDenyList は ebi-team 自身が渡す env（launch.env / backend 既定
 
 // ===== 5. 未実装 / 未知 backend =====
 
-test("実装済みは claude のみ・型としては codex / gemini も既知", () => {
-  assert.deepEqual([...IMPLEMENTED_BACKEND_IDS], ["claude"]);
+test("実装済みは claude / codex（PR-D）・gemini は型としてのみ既知", () => {
+  assert.deepEqual([...IMPLEMENTED_BACKEND_IDS], ["claude", "codex"]);
   assert.deepEqual([...ALL_BACKEND_IDS], ["claude", "codex", "gemini"]);
-  assert.equal(isImplementedBackendId("codex"), false);
-  assert.equal(isKnownBackendId("codex"), true);
+  assert.equal(isImplementedBackendId("codex"), true);
+  assert.equal(isImplementedBackendId("gemini"), false);
+  assert.equal(isKnownBackendId("gemini"), true);
   assert.equal(isKnownBackendId("gpt"), false);
 });
 
 test("未実装 backend の明示指定は『未実装』と分かるエラーになる（claude に落とさない）", () => {
-  for (const id of ["codex", "gemini"]) {
+  for (const id of ["gemini"]) {
     assert.throws(() => resolveBackendId({ explicit: id }), /未実装/, `${id} が throw しない`);
-    assert.throws(() => getBackend(id as "codex"), /未実装/);
+    assert.throws(() => getBackend(id as "gemini"), /未実装/);
   }
 });
 
@@ -331,9 +332,10 @@ test("idleThresholdMs: 3 backend とも上書きなし＝サーバ既定 900ms�
   assert.equal(resolveIdleThresholdMs(2000, 900), 2000);
 });
 
-test("killProcessGroup: gemini のみ true（子 node の再 exec で孤児が残るため）", () => {
+test("killProcessGroup: 非 claude は true（子 MCP / 再 exec した node の孤児を残さない）", () => {
   assert.equal(BACKEND_TRAITS.claude.killProcessGroup, false);
-  assert.equal(BACKEND_TRAITS.codex.killProcessGroup, false);
+  // codex は組込み MCP codex_apps ＋ ebi-control の 2 本が子で立つ（PR-D）。
+  assert.equal(BACKEND_TRAITS.codex.killProcessGroup, true);
   assert.equal(BACKEND_TRAITS.gemini.killProcessGroup, true);
 });
 

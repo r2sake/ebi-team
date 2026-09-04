@@ -32,14 +32,18 @@ export const CLAUDE_TRAITS: BackendTraits = {
 /**
  * codex のプロファイル（PR0-C 実測・codex-cli 0.146.0）。
  * - 待機中の PTY 出力は 60 秒で 0 バイト → idleThresholdMs は上書き不要。
- * - 初回タスクは位置引数で渡せる。
+ * - 初回タスクは位置引数で「渡せる」（CLI 能力）。ただし ebi-team の運用としては使わない
+ *   （MCP 起動と競合するため ready 後に PTY 注入する。backends/codex.ts 参照＝能力と方針の分離）。
  * - 認証は `~/.codex/auth.json`（`codex login status` = Logged in using ChatGPT）。
+ * - kill はプロセスグループごと（PR-D 実測）: codex は組込み MCP `codex_apps` を常に 1 本立て、
+ *   ebi-control を足せば子 stdio MCP がもう 1 本増える。PTY リーダだけ落とすと孤児になりうるため、
+ *   node-pty が作る新セッション（= 子が pgid のリーダ）へまとめてシグナルを送る。
  */
 export const CODEX_TRAITS: BackendTraits = {
   envDenyList: [],
   reportsUsage: false,
   idleThresholdMs: null,
-  killProcessGroup: false,
+  killProcessGroup: true,
   preflight: {
     versionArgs: ["--version"],
     verifiedVersion: "0.146.0",
