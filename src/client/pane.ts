@@ -2,6 +2,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import type { AgentRecord, AgentStatus } from "../shared/protocol.ts";
+import { backendBadge } from "../shared/backendBadge.ts";
 
 /**
  * 粗ポインタ（タッチ端末）判定。
@@ -82,6 +83,17 @@ export class Pane {
       record.kind === "master" ? "👑 master" : record.kind === "supervisor" ? "🛡 supervisor" : "dynamic";
     if (record.model) badge.title = `model: ${record.model}`;
     idWrap.append(document.createTextNode(" "), badge);
+
+    // backend バッジ（🟣 claude / 🟢 codex / 🔵 gemini）。どの CLI で動いているエビかを
+    // ログ画面でも一目で分かるようにする（PR-E）。
+    const bb = backendBadge(record.backend);
+    const backendBadgeEl = document.createElement("span");
+    backendBadgeEl.className = `backend-badge backend-${bb.id}`;
+    backendBadgeEl.textContent = `${bb.emoji} ${bb.label}`;
+    backendBadgeEl.title = bb.reportsUsage
+      ? `backend: ${bb.label}`
+      : `backend: ${bb.label}（cost / context は未対応）`;
+    idWrap.append(document.createTextNode(" "), backendBadgeEl);
 
     // 固定エビ（pinned）は kill ボタンを出さない（削除不可）。動的エビのみ kill 可。
     if (!record.pinned) {

@@ -19,6 +19,11 @@
 // （Node 組込みモジュールのみに依存し、副作用の無い純粋な定数/関数）。
 
 import { DEFAULT_PERMISSION_MODE, validatePermissionMode, type PermissionMode } from "./config.ts";
+import {
+  backendIdError,
+  isImplementedBackendId,
+  type BackendId,
+} from "./backends/index.ts";
 
 /**
  * 役割 id。spawn 時に role として渡す。
@@ -53,6 +58,13 @@ export interface EbiRole {
   permissionMode: PermissionMode;
   /** 既定モデル（alias）。 */
   defaultModel: string;
+  /**
+   * 役割ごとの既定バックエンド（PR-E）。未指定なら「config.defaultBackend → env EBI_BACKEND
+   * → claude」へフォールバックする。
+   * 注意: defaultModel の語彙はバックエンドごとに別物（claude の "opus" は codex では通らない）
+   * ため、defaultModel は **この backend で spawn したときだけ**適用される（index.ts の spawnAgent）。
+   */
+  backend?: BackendId;
 }
 
 /**
@@ -81,6 +93,8 @@ export const BUILTIN_ROLES: Record<string, EbiRole> = {
     permissionMode: "bypassPermissions",
     // 既定は明示ID運用（"opus" などのエイリアスは CLI 版依存で解決先が変わるため）。
     defaultModel: "claude-opus-5",
+    // 実装役の既定は claude 固定（PR-E 時点。codex/gemini は明示指定 or カスタム役割で使う）。
+    backend: "claude",
     appendSystemPrompt: ENGINEER_APPEND_SYSTEM_PROMPT,
   },
 };
@@ -160,10 +174,23 @@ function normalizeCustomRole(id: string, raw: unknown): EbiRole {
     }
   }
 
-  const defaultModel = asOptionalString(r.defaultModel, "defaultModel", id) ?? CUSTOM_ROLE_DEFAULT_MODEL;
+  const backendRaw = asOptionalString(r.backend, "backend", id);
+  let backend: BackendId | undefined;
+  if (backendRaw !== undefined) {
+    if (!isImplementedBackendId(backendRaw)) {
+      throw new Error(`カスタム役割 "${id}" の ${backendIdError(backendRaw).message}`);
+    }
+    backend = backendRaw;
+  }
+
+  // defaultModel の既定はバックエンドで変わる。claude 以外は CLI 既定モデルに任せる
+  //（claude 語彙の "sonnet" を codex/gemini に渡すと毎ターン 400 になる）。
+  const defaultModel =
+    asOptionalString(r.defaultModel, "defaultModel", id) ??
+    (backend === undefined || backend === "claude" ? CUSTOM_ROLE_DEFAULT_MODEL : "");
   const appendSystemPrompt = asOptionalString(r.appendSystemPrompt, "appendSystemPrompt", id) ?? "";
 
-  return { id, label, emoji, mcpRole, permissionMode, defaultModel, appendSystemPrompt };
+  return { id, label, emoji, mcpRole, permissionMode, defaultModel, backend, appendSystemPrompt };
 }
 
 /**

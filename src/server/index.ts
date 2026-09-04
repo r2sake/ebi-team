@@ -36,13 +36,16 @@ import {
   loadFixedEbi,
   loadRawCustomRoles,
   loadDevChannelsAllowlist,
+  loadBackendSettings,
   validatePermissionMode,
   DEFAULT_PERMISSION_MODE,
+  EMPTY_BACKEND_SETTINGS,
+  type BackendSettings,
 } from "./config.ts";
 import { EBI_ROLES, resolveRole, registerCustomRoles } from "./roles.ts";
 import { isRunningFromSrc, mcpConfigPathFor, type McpConfigRole } from "./mcpConfigPath.ts";
 import { needsPreflight, runPreflight } from "./backendPreflight.ts";
-import { FixedEbiManager, applyMasterMcpConfig } from "./fixedEbi.ts";
+import { FixedEbiManager, applyMasterBackendFailsafe, applyMasterMcpConfig } from "./fixedEbi.ts";
 import { configureFixedEbiLog, fixedEbiLogPath } from "./fixedEbiLog.ts";
 import { NoticeBuffer, DEFAULT_NOTICE_BUFFER_SIZE } from "./noticeBuffer.ts";
 import { createControlApi, type GeneralizedSpawnParams } from "./control.ts";
@@ -83,10 +86,13 @@ const HOST = process.env.EBI_HOST ?? "127.0.0.1";
 const authConfig = loadAuthConfig();
 // spawn する対象コマンド。claude が PATH に無い環境では EBI_COMMAND=bash 等で fallback。
 const COMMAND = process.env.EBI_COMMAND ?? "claude";
-// サーバ既定のバックエンド id。優先度は spawn 引数 > 役割 > config.defaultBackend >
-// env EBI_BACKEND > "claude"（config.defaultBackend / 役割単位の指定は後続 PR で配線する）。
+// config 由来のバックエンド既定（top-level "defaultBackend" / "backends"）。
+// listen 前に loadAndApplyBackendSettings() が確定させる（それまでは「既定なし」）。
+let backendSettings: BackendSettings = EMPTY_BACKEND_SETTINGS;
+// サーバ既定のバックエンド id。優先度は spawn 引数 > 役割(EbiRole.backend) >
+// config.defaultBackend > env EBI_BACKEND > "claude"。
 // 未実装 id を指定されたら起動前に throw する（黙って claude に落とさない）。
-const BACKEND_ID = resolveBackendId({ env: process.env.EBI_BACKEND });
+let BACKEND_ID = resolveBackendId({ env: process.env.EBI_BACKEND });
 const COMMAND_ARGS = process.env.EBI_ARGS ? process.env.EBI_ARGS.split(" ") : [];
 // agent のデフォルト cwd。
 const DEFAULT_CWD = process.env.EBI_DEFAULT_CWD ?? process.cwd();
@@ -144,6 +150,11 @@ const ROLE_MCP_CONFIG: Record<McpConfigRole, string> = {
  * backend 別の追加起動引数。EBI_ARGS は claude 向けの設定なので非 claude には渡さず、
  * `EBI_CODEX_ARGS` を使う（フラグ体系が違うため取り違えると即起動失敗になる）。
  */
+/** 空文字を「未指定」として扱う（config / 役割の defaultModel は空文字を許容するため）。 */
+function nonEmpty(v: string | null | undefined): string | null {
+  return v != null && v !== "" ? v : null;
+}
+
 function extraArgsForBackend(id: BackendId): string[] {
   if (id === DEFAULT_BACKEND_ID) return [...spawnConfig.args];
   const raw = process.env[`EBI_${id.toUpperCase()}_ARGS`];
@@ -775,7 +786,7 @@ async function handleSpawn(ws: WebSocket, msg: SpawnMessage): Promise<void> {
       useWorktree: msg.useWorktree,
       repoPath: msg.repoPath,
       branch: msg.branch,
-      // UI からの backend 指定（セレクトの実装は PR-E。未指定ならサーバ既定）。
+      // UI ヘッダの backend セレクトからの指定（未指定なら役割/config/env の既定）。
       backend: msg.backend,
     });
   } catch (err) {
@@ -809,13 +820,16 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     : (role?.permissionMode ?? DEFAULT_PERMISSION_MODE);
   const appendSystemPrompt = params.appendSystemPrompt ?? role?.appendSystemPrompt ?? null;
 
-  // バックエンド解決: spawn 引数 > 役割既定（PR-E で EbiRole.backend を足す）> サーバ既定
-  //（サーバ既定 BACKEND_ID は config.defaultBackend / env EBI_BACKEND 解決済み）。
-  // 未実装 backend（codex / gemini）を明示指定された場合はここで throw し、制御API が
+  // バックエンド解決: spawn 引数 > 役割既定（EbiRole.backend）> config.defaultBackend >
+  // env EBI_BACKEND > claude（PR-E）。
+  // 実装済みでない backend を明示指定された場合はここで throw し、制御API が
   // 400 相当のエラーで返す（黙って claude に落とさない）。
-  const backendId = params.backend
-    ? resolveBackendId({ explicit: params.backend })
-    : BACKEND_ID;
+  const backendId = resolveBackendId({
+    explicit: params.backend,
+    role: role?.backend,
+    configDefault: backendSettings.defaultBackend,
+    env: process.env.EBI_BACKEND,
+  });
   const backend = getBackend(backendId);
 
   // モデル名の語彙は backend ごとに別物（claude の "opus"/"sonnet" は codex では通らず、
@@ -823,10 +837,17 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   // よって役割の defaultModel（claude 語彙）は claude にだけ効かせ、非 claude では
   //   明示指定 > EBI_<ID>_MODEL > 未指定（CLI 既定モデル）
   // の順で解決する（PR-D）。
+  // 役割の defaultModel は「役割の既定 backend で起動したとき」だけ効かせる（PR-E）。
+  // 役割 backend 未指定の役割は claude 語彙とみなす（従来どおり）。
+  const roleBackendId = role?.backend ?? DEFAULT_BACKEND_ID;
+  const roleModel = role && roleBackendId === backendId ? nonEmpty(role.defaultModel) : null;
   const model =
-    backendId === DEFAULT_BACKEND_ID
-      ? (params.model ?? role?.defaultModel ?? null)
-      : (params.model ?? process.env[`EBI_${backendId.toUpperCase()}_MODEL`] ?? null);
+    params.model ??
+    roleModel ??
+    nonEmpty(backendSettings.backends[backendId]?.defaultModel) ??
+    (backendId === DEFAULT_BACKEND_ID
+      ? null
+      : (process.env[`EBI_${backendId.toUpperCase()}_MODEL`] ?? null));
 
   // 起動バイナリの解決。サーバ既定 command（EBI_COMMAND / 既定 "claude"）がその backend の
   // ものでなければ backend の既定バイナリを使う（claude サーバから gemini/codex エビを起動する経路）。
@@ -836,7 +857,7 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   const command =
     serverBackend === null || serverBackend.id === backendId
       ? spawnConfig.command
-      : backend.defaultCommand;
+      : (backendSettings.backends[backendId]?.command ?? backend.defaultCommand);
 
   // 役割付きなら ebi-control MCP（最小権限・reply_to_master 等）を追加する。
   // 「どのフラグをどう付けるか」はバックエンド実装（backends/claude.ts の buildArgs）に閉じており、
@@ -1219,7 +1240,10 @@ async function startFixedEbi(): Promise<void> {
     const raw = await loadFixedEbi(CONFIG_PATH, { command: COMMAND, backend: BACKEND_ID });
     // master には役割別 MCP config を spawn 直前に自動付与する（config への手書きを不要にし、
     // dev / 本番のファイル名差分をサーバ側で吸収する）。args に明示があればそちらを優先。
-    const specs = raw.map((s) => applyMasterMcpConfig(s, ROLE_MCP_CONFIG.master));
+    // master は backend=claude に固定する（config/env で他 backend を既定にしても統括系は落とさない）。
+    const specs = raw.map((s) =>
+      applyMasterBackendFailsafe(applyMasterMcpConfig(s, ROLE_MCP_CONFIG.master)),
+    );
     if (specs.length === 0) {
       console.log(`[ebi-team] 固定エビ: なし（${CONFIG_PATH} 未配置または fixedEbi 空）`);
       return;
@@ -1276,7 +1300,34 @@ async function loadAndApplyDevChannelsAllowlist(): Promise<void> {
   }
 }
 
-// spawn 要求（WS / 制御API いずれも）を受け付ける前にカスタム役割・許可リストを確定させる。
+/**
+ * ebi-team.config.json の top-level "defaultBackend" / "backends" を読み、サーバ既定へ反映する。
+ * httpServer.listen()／固定エビ自動起動より前に完了させ、以降の spawn（および固定エビの
+ * backend 解決）が常に config 反映後の既定を見るようにする。
+ * config が無い/未指定なら何もしない。検証失敗時は警告のみで起動を継続する
+ *（env EBI_BACKEND → claude の従来経路で動く）。
+ */
+async function loadAndApplyBackendSettings(): Promise<void> {
+  try {
+    backendSettings = await loadBackendSettings(CONFIG_PATH);
+    BACKEND_ID = resolveBackendId({
+      configDefault: backendSettings.defaultBackend,
+      env: process.env.EBI_BACKEND,
+    });
+    if (backendSettings.defaultBackend || Object.keys(backendSettings.backends).length > 0) {
+      console.log(
+        `[ebi-team] バックエンド既定: ${BACKEND_ID}` +
+          `（config 設定あり: ${Object.keys(backendSettings.backends).join(", ") || "なし"}）`,
+      );
+    }
+  } catch (err) {
+    console.warn(`[ebi-team] backends 設定の読み込みに失敗（env/既定で継続）:`, err);
+  }
+}
+
+// spawn 要求（WS / 制御API いずれも）を受け付ける前にカスタム役割・許可リスト・
+// バックエンド既定を確定させる。
+await loadAndApplyBackendSettings();
 await loadAndRegisterCustomRoles();
 await loadAndApplyDevChannelsAllowlist();
 

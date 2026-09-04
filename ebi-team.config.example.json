@@ -1,10 +1,31 @@
 {
   "$comment": "固定エビ（削除不可・常駐）の宣言的定義。サーバ起動時に自動 spawn され、exit したら自動再起動される。cwd は $HOME/${VAR}/~ の展開と config 基準の相対解決に対応。command 未指定なら EBI_COMMAND（既定 claude）。claude 起動時のみ --model/--permission-mode/--append-system-prompt が付与される。このファイルは example です。実際に使う場合は ebi-team.config.json という名前でコピーして編集してください（.gitignore 済みなのでコミットされません）。",
   "_comment_customize": "ここに自分の人格・カスタムロールを書く。master/supervisor の appendSystemPrompt は自由に書き換えてよい。動的エビのカスタム役割（engineer 以外の役割）を増やしたい場合は下記の \"roles\" にエントリを追加する（コードを触る必要はない）。",
-  "_comment_roles": "roles は { 役割id: 定義 } の任意追加。各定義のフィールドはすべて省略可: label(表示名/既定=id), emoji(バッジ絵文字/既定=🧩), mcpRole(\"engineer\"のみ許容/既定\"engineer\"=動的エビの唯一の権限ティア), permissionMode(claudeの--permission-mode/既定はサーバ既定値), defaultModel(既定モデルalias/既定\"sonnet\"), appendSystemPrompt(--append-system-promptに渡す役割プロンプト/既定は空)。spawn_ebi/send_message の role にこの id を指定すると使える。組込みの \"engineer\" は同名キーで上書きはできるが削除はできない。",
+  "_comment_roles": "roles は { 役割id: 定義 } の任意追加。各定義のフィールドはすべて省略可: label(表示名/既定=id), emoji(バッジ絵文字/既定=🧩), mcpRole(\"engineer\"のみ許容/既定\"engineer\"=動的エビの唯一の権限ティア), permissionMode(claudeの--permission-mode/既定はサーバ既定値), defaultModel(既定モデルalias/既定\"sonnet\"。backend が claude 以外なら既定は空＝各CLIの既定モデル), backend(その役割の既定バックエンド claude/codex/gemini。未指定ならサーバ既定), appendSystemPrompt(--append-system-promptに渡す役割プロンプト/既定は空)。spawn_ebi/send_message の role にこの id を指定すると使える。組込みの \"engineer\" は同名キーで上書きはできるが削除はできない。",
   "_comment_devChannelsAllowlist": "起動ゲート（development channels 警告）自動応答を許可する dev channel 値の追加許可リスト（正確値・完全一致）。組込みの \"server:ebi-control\" に足す形。ワイルドカード・前方一致・部分一致は不可（列挙した正確値だけが自動 \"1\"+Enter の対象）。外部チャンネル待機セッション（Slack/Discord 秘書エビ等）を固定エビにする場合、その --dangerously-load-development-channels の値（例 \"plugin:slack@<自分の marketplace id>\"）をここに正確値で足すと、無人起動時のダイアログを自動で越えられる。下記は雛形（実際の marketplace id に置き換えて使う。非公開なら ebi-team.config.json 側にのみ書く）。",
   "devChannelsAllowlist": ["plugin:slack@<your-marketplace-id>"],
+  "_comment_backends": "マルチバックエンド（PR-E）。defaultBackend はサーバ既定のバックエンド id（claude/codex/gemini。env EBI_BACKEND より優先。未指定なら env → claude）。backends は backend 別の既定 { command?: 起動バイナリ, defaultModel?: そのバックエンドの既定モデル }。解決順は spawn 引数 backend > 役割の backend > defaultBackend > env EBI_BACKEND > claude。master は何を設定しても常に claude 固定（統括系を落とさない fail-safe）。model の語彙はバックエンドごとに別物（claude の opus/sonnet は codex/gemini では通らない）。詳細は docs/backends/*.md。",
+  "defaultBackend": "claude",
+  "backends": {
+    "codex": { "command": "codex", "defaultModel": "gpt-5.5" },
+    "gemini": { "command": "gemini", "defaultModel": "gemini-flash-latest" }
+  },
+  "_comment_role_backend": "役割に backend を書くと、その役割で spawn したエビは常にそのバックエンドで起動する（下記 researcher / engineer-codex）。defaultModel はその役割の backend で起動したときだけ適用される。組込みの engineer は claude 既定のまま。なお roles の中にコメント用のキーを足すと『役割定義』として検証され起動時エラーになるので、コメントは top-level に書くこと。",
   "roles": {
+    "researcher": {
+      "label": "調査",
+      "emoji": "🔎",
+      "backend": "gemini",
+      "permissionMode": "plan",
+      "appendSystemPrompt": "あなたは下調べ・読解専任の使い捨てセッション。コードや資料を読み、事実と出典を簡潔にまとめて reply_to_master で報告する。実装や破壊的操作は行わない。"
+    },
+    "engineer-codex": {
+      "label": "実装2nd",
+      "emoji": "🧪",
+      "backend": "codex",
+      "defaultModel": "gpt-5.5",
+      "appendSystemPrompt": "あなたは実装のセカンドオピニオン担当の使い捨てセッション。与えられたタスクを実装し、結論ファーストで reply_to_master に報告する。破壊的操作・git push・外部送信は行わない。"
+    },
     "reviewer": {
       "label": "レビュアー",
       "emoji": "🔍",

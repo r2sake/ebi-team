@@ -142,10 +142,48 @@ cp ebi-team.config.example.json ebi-team.config.json
 | `emoji` | UI バッジ絵文字 | `🧩` |
 | `mcpRole` | 動的エビに与える MCP 権限ティア。**`"engineer"` のみ許容**（動的エビが持つ唯一の最小権限ティアで、他エビの spawn/kill/操作はできません） | `"engineer"` |
 | `permissionMode` | Claude Code の権限モード | サーバの既定値 |
-| `defaultModel` | 起動モデル（`opus` / `sonnet` / `haiku` など） | `"sonnet"` |
+| `defaultModel` | 起動モデル（`opus` / `sonnet` / `haiku` など） | `"sonnet"`（`backend` が claude 以外なら空＝各 CLI の既定モデル） |
+| `backend` | その役割の既定バックエンド（`claude` / `codex` / `gemini`）。後述の「マルチバックエンド」参照 | 未指定（サーバ既定へフォールバック） |
 | `appendSystemPrompt` | その役割の人格・振る舞いのルールを注入するシステムプロンプト | 空（注入なし） |
 
 組込みの `engineer` は同名キーで上書きできますが、削除はできません（`roles` は既存レジストリへの追加/上書きのみです）。
+
+### マルチバックエンド (claude / codex / gemini)
+
+エビを動かすエージェント CLI（バックエンド）は **claude / codex / gemini** の 3 つから選べます。組込みの `engineer` 役割は `claude` 既定のままで、他バックエンドは「役割ごとの既定」か「spawn 時の明示指定」で使います。
+
+```jsonc
+{
+  "defaultBackend": "claude",            // サーバ既定（env EBI_BACKEND より優先）
+  "backends": {
+    "codex":  { "command": "codex",  "defaultModel": "gpt-5.5" },
+    "gemini": { "command": "gemini", "defaultModel": "gemini-flash-latest" }
+  },
+  "roles": {
+    "researcher":     { "backend": "gemini", "permissionMode": "plan" },   // 下調べ・読解役
+    "engineer-codex": { "backend": "codex",  "defaultModel": "gpt-5.5" }   // 実装セカンドオピニオン
+  }
+}
+```
+
+バックエンドの解決順は **spawn 引数 `backend` > 役割の `backend` > `defaultBackend` > env `EBI_BACKEND` > `claude`**。未実装・未知の id は黙って claude に落とさず明示エラーになります。**master（統括役）は何を設定しても常に claude 固定**です（統括系を落とさないための fail-safe）。
+
+spawn 時の明示指定は master の MCP ツール（`spawn_ebi` / `spawn_engineer` / `send_message` の `backend` 引数）、制御API（`POST /control/spawn` の `backend`）、UI ヘッダの backend セレクトから行えます。
+
+`permissionMode` は抽象語彙で、各 CLI のフラグへ写像されます（**`plan` の厳密な等価物は codex / gemini に無く近似**です）。
+
+| 抽象値 | claude | codex | gemini |
+| --- | --- | --- | --- |
+| `bypassPermissions` | `--permission-mode bypassPermissions` | `-s danger-full-access -a never` | `--approval-mode yolo` |
+| `acceptEdits` | 同名 | `-s workspace-write -a never` | `--approval-mode auto_edit` |
+| `plan` / `default` | 同名 | `-s read-only -a on-request` | `--approval-mode default`（read 寄り運用はプロンプトで担保） |
+| `auto` / `dontAsk` | 同名 | `-s workspace-write -a never` | `--approval-mode yolo` |
+
+`model` の語彙もバックエンドごとに別物です（claude の `opus` / `sonnet` は codex / gemini では通りません）。役割の `defaultModel` は **その役割の `backend` で起動したときだけ**適用され、他バックエンドでは `backends.<id>.defaultModel` → env `EBI_<ID>_MODEL` → CLI 既定の順で解決されます。
+
+UI では各エビに backend バッジ（🟣 claude / 🟢 codex / 🔵 gemini）が付きます。**codex / gemini は Claude の statusLine 相当の usage 報告経路を持たない**ため、ダッシュボードの cost / context は空欄ではなく **「—（未対応）」** と明示表示されます（欠測であって異常ではありません）。
+
+詳細は `docs/backends/codex.md` / `docs/backends/gemini.md` を参照してください。
 
 ### 外部チャンネル待機セッションを固定エビにする (external channel relay)
 

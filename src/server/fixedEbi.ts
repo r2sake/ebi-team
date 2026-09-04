@@ -36,6 +36,21 @@ export function applyMasterMcpConfig(spec: FixedEbiSpec, mcpConfigPath: string):
   return { ...spec, launch: { ...spec.launch, args: [...args, ...extra] } };
 }
 
+/**
+ * master の固定エビの backend を claude に固定する fail-safe（PR-E・設計 §4.3）。
+ *
+ * master（統括役）は何があっても落とせない。config.defaultBackend や env EBI_BACKEND を
+ * codex / gemini にした運用でも、master だけは claude の性質（channel 注入・statusLine・
+ * 起動ゲート応答）で動かす。実際に何の CLI を起動するかは launch.command（config 由来）が
+ * 決めるため、ここで直すのは「ebi-team 側が master をどう扱うか」の 1 点だけ。
+ * kind が master 以外の spec は素通しする。
+ */
+export function applyMasterBackendFailsafe(spec: FixedEbiSpec): FixedEbiSpec {
+  if (spec.kind !== "master") return spec;
+  if (spec.launch.backend === "claude") return spec;
+  return { ...spec, launch: { ...spec.launch, backend: "claude" } };
+}
+
 /** crashloop 判定・バックオフのパラメータ。 */
 export interface RestartPolicy {
   /** 初回バックオフ（ms）。以降 2 倍ずつ増やす。 */

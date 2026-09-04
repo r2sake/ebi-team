@@ -135,6 +135,27 @@ curl -s localhost:8787/control/spawn \
 EBI_BACKEND=codex npm start
 ```
 
+役割ごとの既定として使う場合（PR-E）。`ebi-team.config.json`:
+
+```jsonc
+{
+  "backends": { "codex": { "command": "codex", "defaultModel": "gpt-5.5" } },
+  "roles": {
+    "engineer-codex": {
+      "label": "実装2nd",
+      "backend": "codex",
+      "defaultModel": "gpt-5.5",
+      "appendSystemPrompt": "セカンドオピニオンの実装役。…"
+    }
+  }
+}
+```
+
+`spawn_ebi(role="engineer-codex")` のように役割 id を指定するだけで codex 起動になります
+（解決順は spawn 引数 > 役割 > `defaultBackend` > env > claude）。
+**組込みの `engineer` 役割は claude 既定のまま**です（codex の e2e 成績が確定するまで実装役の既定は変えない）。
+UI では 🟢 codex バッジが付き、cost / context は「—（未対応）」表示になります（`reportsUsage: false`）。
+
 関連 env:
 
 | env | 既定 | 意味 |

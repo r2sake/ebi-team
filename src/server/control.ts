@@ -33,7 +33,7 @@ export interface GeneralizedSpawnParams {
   /**
    * バックエンド（エージェント CLI）id。未検証文字列で受け、spawnAgent 側で検証する。
    * 未指定なら「役割の既定 → config.defaultBackend → env EBI_BACKEND → claude」。
-   * 未実装 backend（PR-B 時点では codex / gemini）は明示エラーで弾く。
+   * 実装済みでない backend id は明示エラーで弾く（黙って claude に落とさない）。
    */
   backend?: string;
   /** エビ種別（既定 dynamic）。 */

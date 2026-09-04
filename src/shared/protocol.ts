@@ -120,8 +120,10 @@ export interface AgentRecord {
   role?: string | null;
   /**
    * このエビを動かしているバックエンド（エージェント CLI）の id
-   * （"claude" | "codex" | "gemini"）。実装済みは "claude" のみ（PR-B 時点）。
-   * UI のバッジ表示（🟣 claude / 🟢 codex / 🔵 gemini）と usage 欠測表示は PR-E で実装する。
+   * （"claude" | "codex" | "gemini"）。3 つとも実装済み。
+   * UI はこの値でバッジ（🟣 claude / 🟢 codex / 🔵 gemini）と usage 欠測表示
+   *（reportsUsage=false の backend は cost/context を「—（未対応）」と明示）を出す。
+   * 表示メタの SoT は src/shared/backendBadge.ts。
    */
   backend?: string;
 }
@@ -145,7 +147,7 @@ export interface SpawnMessage {
    * バックエンド（エージェント CLI）id。未指定ならサーバ既定（claude）。
    * 値域は BackendId（"claude" | "codex" | "gemini"）だが、shared は server の型に依存させない
    * ため string で持つ。未実装 id はサーバが明示エラーで弾く。
-   * spawn フォームの backend セレクト実装は PR-E。
+   * UI ヘッダの backend セレクト（既定は空＝サーバ既定に任せる）から送られる。
    */
   backend?: string;
 }

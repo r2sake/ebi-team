@@ -106,12 +106,15 @@ const ROLE_IDS = Object.keys(EBI_ROLES) as [EbiRoleId, ...EbiRoleId[]];
 
 /**
  * spawn_ebi / spawn_engineer / send_message で指定できる backend id。
- * 型としては codex / gemini も受けるが、**実装は claude のみ**（PR-B 時点）。
- * 未実装 id を渡した場合はサーバ側（spawnAgent）が明示エラーで弾く。
+ * claude / codex / gemini とも実装済み（PR-C / PR-D）。実装済みでない id を渡した場合は
+ * サーバ側（spawnAgent → resolveBackendId）が明示エラーで弾く。
  */
 const BACKEND_IDS = [...ALL_BACKEND_IDS] as [string, ...string[]];
 const BACKEND_DESC =
-  "バックエンド（省略時は役割の既定 → サーバ既定 → claude）。claude のみ実装済みで、codex / gemini は未実装（指定するとエラー）";
+  "バックエンド（省略時は役割の既定 → config.defaultBackend → env EBI_BACKEND → claude）。" +
+  "claude / codex / gemini とも実装済み。" +
+  "codex / gemini は cost・context を報告しない（ダッシュボードは「—（未対応）」表示）ほか、" +
+  "model は backend ごとに語彙が違う（claude の opus/sonnet は codex/gemini では不可）";
 
 /** 制御API を呼ぶ共通ヘルパー。失敗時は { ok:false, error } を返す（throw しない）。 */
 async function callControl(
