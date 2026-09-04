@@ -32,6 +32,9 @@ const ROUND_TIMEOUT_MS = Number(process.env.EBI_E2E_ROUND_TIMEOUT_MS ?? 180000);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** 開始時点で動いていた control-server の本数（母艦の稼働環境ぶん）。 */
+let BASE_CONTROL_SERVERS = 0;
+
 function stripAnsi(s) {
   return s
     .replace(/\x1b\][^\x07]*\x07/g, "")
@@ -88,9 +91,15 @@ function writeConfig(dir) {
             label: "codex 疎通係",
             emoji: "🟢",
             permissionMode: "default",
+            // 本番の engineer 役割と同じく「報告は必ず reply_to_master ツールで」を明示する。
+            // これが弱いと、エビはトークンをチャットに書いて終わり master に届かない
+            // （codex + gpt-5.6-terra で実測。ツールの有無ではなく指示の強さの問題）。
+            // 「ファイル編集・コマンド実行は一切しない」のような**全面禁止の言い回しは入れない**。
+            // gpt-5.6-terra はこれを「ツール呼び出しも禁止／この環境にツールは無い」と解釈し、
+            // 「reply_to_master ツールが利用できません」と答えて終わる（PR-D で実測）。
             appendSystemPrompt:
-              "あなたはテスト用の疎通係。指示された PONG トークンを reply_to_master で" +
-              "master に送るだけ。ファイル編集・コマンド実行は一切しない。",
+              "あなたはテスト用の疎通係。master への報告は必ず reply_to_master ツールで送ること" +
+              "（チャットに書くだけでは master に届かない）。",
           },
         },
       },
@@ -200,18 +209,22 @@ async function runRound(i) {
     };
   }
   const id = sp.body.id;
-  // /control/spawn は非 claude backend では ready 到達まで待って返る（settleBackendSpawn）。
-  const readyMs = Date.now() - t0;
-
-  // 役割プロンプトの初回注入が流れ終わるのを待ってから本題を送る。
-  await sleep(1500);
+  // /control/spawn は ready を待たずに返る（ready 前 exit の監視は非ブロッキング）。
+  // 本文の配送側（sendMessage）が ready 到達まで待ってから PTY 注入するので、
+  // ここでは待たずに送って本番と同じ経路を通す。
+  const spawnMs = Date.now() - t0;
 
   // 極小タスク（ChatGPT 枠の消費を最小化）。先頭タグは厳守事項どおり [e2e-codex]。
   const message =
-    `[e2e-codex] reply_to_master を 1 回だけ呼び、message に ${token} とだけ入れて送ってください。` +
-    `他の作業・ファイル読み書きはしないこと。`;
+    `[e2e-codex] reply_to_master ツールを 1 回だけ呼び、message に ${token} とだけ入れて送ってください` +
+    `（チャットに書くだけでは master に届きません）。`;
   const snd = await api.post("/control/send", { to: id, from: "master", message });
   const via = snd.body?.via ?? null;
+
+  // 制御MCP（ebi-control）のプロセスが実際に立っているか（ツールが使えない失敗の切り分け用）。
+  // ready 到達後に投げているので、この時点で立っていなければ codex が MCP を起動していない。
+  await sleep(3000);
+  const mcpDuringRound = controlServerCount() - BASE_CONTROL_SERVERS;
 
   // master（bash）の scrollback に `[from:<id>#n] [reply] <token>` が出れば着弾。
   const hit = await waitForMaster(new RegExp(token), ROUND_TIMEOUT_MS - (Date.now() - t0));
@@ -226,11 +239,16 @@ async function runRound(i) {
   }
 
   // 失敗時（または EBI_E2E_DUMP=1）は当該エビの画面末尾を残す（原因追跡用）。
-  const ebiTail =
-    !hit.found || process.env.EBI_E2E_DUMP === "1" ? (await api.scrollback(id)).slice(-2500) : "";
+  const full = !hit.found || process.env.EBI_E2E_DUMP === "1" ? await api.scrollback(id) : "";
+  if (full) {
+    // 起動フェーズごと残す（MCP 起動の様子は末尾だけでは見えない）。
+    writeFileSync(`/tmp/e2e-codex-ebi-${i}.txt`, full);
+  }
+  const ebiTail = full.slice(-2500);
 
   await api.post("/control/kill", { id });
-  await sleep(3000);
+  // 次ラウンドまで少し空ける（前セッションの codex / 制御MCP の後始末が終わってから起動する）。
+  await sleep(8000);
   const codexAfter = codexProcCount();
 
   return {
@@ -241,10 +259,11 @@ async function runRound(i) {
     sendOk: snd.status === 200,
     via,
     replied: hit.found,
+    mcpDuringRound,
     idle,
     codexBefore,
     codexAfter,
-    readySec: Math.round(readyMs / 100) / 10,
+    spawnSec: Math.round(spawnMs / 100) / 10,
     replySec: Math.round(replyMs / 100) / 10,
     tail: hit.found ? "" : `master 末尾:\n${hit.txt.slice(-800)}\n--- エビ末尾:\n${ebiTail}`,
   };
@@ -255,6 +274,7 @@ async function main() {
   mkdirSync(tmpDir, { recursive: true });
   console.log(`tmpDir: ${tmpDir}  port: ${PORT}  rounds: ${ROUNDS}`);
   const baseControl = controlServerCount();
+  BASE_CONTROL_SERVERS = baseControl;
   console.log(
     `開始時のプロセス: codex=${codexProcCount()} control-server=${baseControl}（稼働環境の分を含むベースライン）`,
   );
@@ -271,7 +291,8 @@ async function main() {
       results.push(r);
       console.log(
         `  [round ${r.i}] ok=${r.ok} replied=${r.replied} idle=${r.idle} via=${r.via} ` +
-          `ready=${r.readySec}s reply=${r.replySec}s codex=${r.codexBefore}->${r.codexAfter}`,
+          `spawn=${r.spawnSec}s reply=${r.replySec}s mcp=${r.mcpDuringRound} ` +
+          `codex=${r.codexBefore}->${r.codexAfter}`,
       );
       if (!r.ok && r.tail) console.log(`  --- master scrollback 末尾 ---\n${r.tail}\n  ---`);
     }
@@ -300,7 +321,7 @@ async function main() {
   for (const r of results) {
     console.log(
       `  round ${r.i}: ok=${r.ok} replied=${r.replied} idle=${r.idle} ` +
-        `ready=${r.readySec}s reply=${r.replySec}s`,
+        `spawn=${r.spawnSec}s reply=${r.replySec}s`,
     );
   }
   const codexLeft = codexProcCount();

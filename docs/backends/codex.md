@@ -30,7 +30,8 @@ codex --no-alt-screen [-m <MODEL>] -s <sandbox> -a never \
   -c 'mcp_servers.ebi-control.cwd="<repo>"' \
   -c 'mcp_servers.ebi-control.default_tools_approval_mode="approve"' \
   -c 'mcp_servers.ebi-control.env={EBI_CONTROL_URL="http://127.0.0.1:8787",EBI_MCP_ROLE="engineer",EBI_ID="<agentId>",EBI_NOTIFY_SUBSCRIBE="off"}' \
-  -c 'mcp_servers.ebi-control.startup_timeout_sec=60'
+  -c 'mcp_servers.ebi-control.startup_timeout_sec=60' \
+  -c features.apps=false
 ```
 
 - cwd は **worktree ルート**（worktree 起動時）。位置引数のプロンプトは**使わない**（後述 §4）。
@@ -47,7 +48,8 @@ codex --no-alt-screen [-m <MODEL>] -s <sandbox> -a never \
 | `-c check_for_update_on_startup=false` | 起動直後に「✨ Update available!」ダイアログで停止（無人 spawn が死ぬ） |
 | `-c 'projects={...}'` | 「Do you trust the contents of this directory?」ゲートで停止。**ドット記法は黙って無視される**ので必ずインラインテーブル形式。worktree は git サブディレクトリ扱いなので **repo root と worktree の両方** |
 | `-c mcp_servers.ebi-control.default_tools_approval_mode="approve"` | MCP ツール呼び出しのたびに承認ダイアログで停止。**`-a never` では抑止されない**（承認系統が別）。値域は `auto`/`prompt`/`writes`/`approve` で、**`auto` ではダイアログが出る** |
-| `-c mcp_servers.ebi-control.startup_timeout_sec=60` | 制御MCP の起動待ちが短く、ツールが揃わないままセッションが始まる（`reply_to_master` が永久に飛ばない静かな故障）。env `EBI_CODEX_MCP_STARTUP_TIMEOUT_SEC` で調整可 |
+| `-c mcp_servers.ebi-control.startup_timeout_sec=60` | 制御MCP の起動待ちが短く、ツールが揃わないままセッションが始まる。env `EBI_CODEX_MCP_STARTUP_TIMEOUT_SEC` で調整可 |
+| `-c features.apps=false` | 組込み MCP `codex_apps`（ChatGPT アプリ連携）が起動し、MCP 群の起動完了が十数秒遅れる。その間のターンは**ツール無し**で走り、`reply_to_master` が使えない。ebi-team では使わない機能なので止める（子プロセスも 1 本減る） |
 
 **起動ゲートは「自動応答」ではなく「出させない」**方針（`startupGates: null`）。承認の自動クリックという危険な機構を増やさずに済む。
 
@@ -89,24 +91,29 @@ codex --no-alt-screen [-m <MODEL>] -s <sandbox> -a never \
   が出る（PoC §5）。
 - 役割プロンプトは **ready 到達後に PTY へ 1 回だけ注入**する（`LaunchParams.initialInject` →
   `Agent.sendInitialInject()`）。これが CLAUDE.md 相当のセキュリティ節を非 claude エビへ届ける経路（R7 対策）。
-- ready 判定は「バナー（`>_ OpenAI Codex (v…)`）の検知 ＋ boot 猶予 ＋ idle」。バナーを検知できない
-  まま出力が止まった場合は 60 秒（`EBI_READY_PATTERN_SETTLE_MS`）で従来判定へ degrade する。
-- ready 到達前に予期せず終了した場合は **1 回だけ再 spawn**し、それでも駄目なら明示エラー
-  （`settleBackendSpawn`）。PoC §6 の「起動 3.2 秒後の exit 0」対策。
+- ready 判定は「バナー（`>_ OpenAI Codex (v…)`）の検知 ＋ boot 猶予 ＋ idle」（PR-C の
+  `readyPattern` 機構に相乗り）。さらに **readyWarmupMs（既定 20 秒）** を boot 猶予に加算する。
+  TUI は 2〜3 秒でプロンプトを出すが **MCP ツールの登録はその後**で、間に 1 通目を投げると
+  エビはツール無しのターンを回す（「reply_to_master を利用できません」と答えて終わる＝静かな
+  故障。e2e で 10/10 再現し、ready + 12 秒なら安定することを実測）。
+- ready 到達前に予期せず終了した場合は **1 回だけ再 spawn**する（PR-C の `watchEarlyExit`・
+  `retryOnEarlyExit: true`）。PoC §6 の「起動 3.2 秒後の exit 0」対策。
+- 起動ゲート/更新ダイアログ/ログイン要求は `fatalPatterns` で検知し、notice とサーバログに
+  原因を 1 行で残す（黙って ready 待ちタイムアウトさせない）。
 
 ---
 
 ## 5. 既知の罠
 
 1. **サーバは本番同様 dist 起動で使うこと**（`npm run build` → `npm start`）。
-   dev 起動（`npm run dev` = tsx）だと制御MCP（ebi-control）の起動が codex のターン開始に
-   間に合わず、エビが「reply_to_master ツールが利用できません」と答えて**静かに失敗する**
-   （PR-D の e2e で実測。dist 起動では 10/10 成功）。spawn 時にサーバが警告を出す。
+   dev 起動（`npm run dev` = tsx）だと制御MCP（ebi-control）の起動が遅く、エビが
+   「reply_to_master ツールが利用できません」と答えて**静かに失敗する**ことがある
+   （PR-D の e2e で実測）。非 claude backend を dev サーバから spawn すると警告が出る。
 2. **`codex login status` の結果は stderr に出る**（0.146.0）。preflight は stdout+stderr を
-   連結して判定している（`preflightIo.ts`）。
-3. **`codex_apps` という組込み MCP が常に 1 本立つ**。kill はプロセスグループごと行う
-   （`CODEX_TRAITS.killProcessGroup = true` → `Agent.kill()` が pgid に SIGTERM→SIGKILL）。
-   後始末の確認は `pgrep -x codex`（0 件が正）。
+   連結して判定している（`src/server/backendPreflight.ts` の `loginCheck`）。
+3. **組込み MCP `codex_apps` は既定で 1 本立つ**（本実装では `features.apps=false` で止めている）。
+   kill はプロセスグループごと行う（`CODEX_TRAITS.killProcessGroup = true` → PR-C の
+   `killProcessGroupSignal` が pgid に SIGTERM→SIGKILL）。後始末の確認は `pgrep -x codex`（0 件が正）。
 4. **`~/.codex/config.toml` は作らない**（すべて `-c` インライン）。ただし
    `~/.codex/{history.jsonl,logs_2.sqlite,…}` はセッション状態として書かれる（回避不可）。
 5. **notification 注入は効かない**。master → codex エビの配送は必ず PTY 注入経路になる
@@ -136,9 +143,8 @@ EBI_BACKEND=codex npm start
 | `EBI_CODEX_ARGS` | （空） | 追加引数（`EBI_ARGS` は claude 用） |
 | `EBI_CODEX_MODEL` | （空） | codex の既定モデル |
 | `EBI_CODEX_MCP_STARTUP_TIMEOUT_SEC` | `60` | 制御MCP の起動待ち上限 |
-| `EBI_BACKEND_READY_WAIT_MS` | `90000` | spawn 時の ready 待ち（超過は警告のみ） |
-| `EBI_READY_PATTERN_SETTLE_MS` | `60000` | ready 判定パターンの待ち上限（degrade まで） |
-| `EBI_KILL_GROUP_GRACE_MS` | `1500` | プロセスグループ kill の SIGTERM→SIGKILL 猶予 |
+| `EBI_CODEX_READY_WARMUP_MS` | `20000` | ready 昇格の追加猶予（MCP ツール登録待ち） |
+| `EBI_GROUP_KILL_GRACE_MS` | `2000` | プロセスグループ kill の SIGTERM→SIGKILL 猶予（PR-C 共通） |
 
 ---
 
@@ -162,6 +168,6 @@ npm run build && npm run e2e:codex # live e2e（実 codex を 10 回 spawn。Cha
 
 1. `EBI_BACKEND=claude`（既定に戻す。spawn 引数で `backend` を指定しなければ codex は起動しない）
 2. 役割・spawn 引数から `backend: "codex"` を外す
-3. PR-D のみ revert（PR-A / PR-B は挙動不変なので残してよい）
+3. PR-D のみ revert（PR-A / PR-B は挙動不変、PR-C は gemini 用なので残してよい）
 
 **master は常に claude**（固定エビの backend は command から解決）。最悪でも統括系は落ちない。

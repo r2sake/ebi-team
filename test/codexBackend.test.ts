@@ -155,6 +155,14 @@ test("toCodexProjectsTrustArgs: 空なら付けない・重複は除去・イン
 
 // ===== 4. preflight の分岐 =====
 
+test("codex preflight: login チェックが宣言されている（codex login status・stderr 出力）", () => {
+  const login = BACKEND_TRAITS.codex.preflight.loginCheck;
+  assert.ok(login, "loginCheck が無い");
+  assert.deepEqual([...login.args], ["login", "status"]);
+  assert.equal(login.okPattern.test("Logged in using ChatGPT"), true);
+  assert.equal(login.okPattern.test("Not logged in"), false);
+});
+
 test("codex preflight: 認証ファイルが無ければ error（spawn を止める）", () => {
   const r = evaluatePreflight(BACKEND_TRAITS.codex.preflight, {
     home: "/home/boss",
@@ -227,11 +235,22 @@ test("codex は ready 昇格に追加猶予を持つ（MCP ツール登録待ち
   assert.equal(CLAUDE_BACKEND.readyWarmupMs, undefined);
 });
 
-test("codex の readyPattern は空白除去済みのバナーに一致する", () => {
+test("codex の readyPattern は起動バナー（ANSI 除去済み素文）に一致する", () => {
   const pattern = CODEX_BACKEND.readyPattern!;
-  const banner = ">_ OpenAI Codex (v0.146.0)".replace(/\s+/g, "");
-  assert.equal(pattern.test(banner), true);
+  // agent.ts の maybeMarkReadyPattern は ANSI を落とすだけで空白は保持する。
+  assert.equal(pattern.test("│ >_ OpenAI Codex (v0.146.0)                       │"), true);
   assert.equal(pattern.test("something else"), false);
+});
+
+test("codex の fatalPatterns は起動ゲート/ログイン要求を拾う", () => {
+  const hit = (text: string) =>
+    (CODEX_BACKEND.fatalPatterns ?? []).some((f) => f.pattern.test(text));
+  assert.equal(hit("Do you trust the contents of this directory?"), true);
+  assert.equal(hit("✨ Update available! 1. Update now"), true);
+  assert.equal(hit("Not logged in"), true);
+  assert.equal(hit("通常の出力"), false);
+  // ready 前に落ちたら 1 回だけ再 spawn する（PR-C の watchEarlyExit に相乗り）。
+  assert.equal(CODEX_BACKEND.retryOnEarlyExit, true);
 });
 
 // ===== 6. claude の外形ゼロ差分 =====

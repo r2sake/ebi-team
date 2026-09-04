@@ -19,6 +19,7 @@ import {
   EBI_CONTROL_MCP_NAME,
   IMPLEMENTED_BACKEND_IDS,
   applyEnvDenyList,
+  backendIdError,
   evaluatePreflight,
   expandHome,
   getBackend,
@@ -183,7 +184,11 @@ test("preflight(codex): auth.json があれば ok・無ければ error", () => {
   assert.match(ng.errors[0], /\/Users\/x\/\.codex\/auth\.json/);
 });
 
-test("preflight(gemini): oauth_creds.json と GOOGLE_CLOUD_PROJECT の両方が必要", () => {
+// PR-C（ボス裁定 2026-09-05 の変更後）: 必須は oauth_creds.json のみ。
+// GOOGLE_CLOUD_PROJECT は Workspace 垢では必須・個人垢では設定してはいけない、という
+// 相反する条件があるため ebi-team 側で決め打ちせず、「あれば継承・無ければ無し」で起動する
+// （Workspace 垢で未設定のときは gemini 自身の起動エラーを fatalPatterns が拾う）。
+test("preflight(gemini): 必須は oauth_creds.json のみ（GOOGLE_CLOUD_PROJECT は任意）", () => {
   const fileExists = (p: string) => p === "/Users/x/.gemini/oauth_creds.json";
   const ok = evaluatePreflight(geminiPreflight, {
     home: "/Users/x",
@@ -193,15 +198,22 @@ test("preflight(gemini): oauth_creds.json と GOOGLE_CLOUD_PROJECT の両方が�
   });
   assert.deepEqual(ok, { ok: true, errors: [], warnings: [] });
 
-  // GOOGLE_CLOUD_PROJECT が無いと起動不能（設計書 §2.5 の deny 方針とは逆向き）。
   const noProject = evaluatePreflight(geminiPreflight, {
     home: "/Users/x",
     fileExists,
     env: {},
     version: "0.58.0",
   });
-  assert.equal(noProject.ok, false);
-  assert.deepEqual(noProject.errors, ["必要な env がありません: GOOGLE_CLOUD_PROJECT"]);
+  assert.deepEqual(noProject, { ok: true, errors: [], warnings: [] });
+
+  // 認証ファイルが無ければ error（未ログイン）。
+  const noAuth = evaluatePreflight(geminiPreflight, {
+    home: "/Users/x",
+    fileExists: () => false,
+    env: {},
+    version: "0.58.0",
+  });
+  assert.equal(noAuth.ok, false);
 });
 
 test("preflight: バージョン差分は error ではなく warning（自動更新で簡単にズレるため）", () => {
@@ -279,20 +291,22 @@ test("envDenyList は ebi-team 自身が渡す env（launch.env / backend 既定
 
 // ===== 5. 未実装 / 未知 backend =====
 
-test("実装済みは claude / codex（PR-D）・gemini は型としてのみ既知", () => {
-  assert.deepEqual([...IMPLEMENTED_BACKEND_IDS], ["claude", "codex"]);
+// PR-C で gemini、PR-D で codex が実装済みになり、3 backend とも実装済みになった。
+test("実装済みは claude / codex / gemini の 3 つ", () => {
+  assert.deepEqual([...IMPLEMENTED_BACKEND_IDS], ["claude", "codex", "gemini"]);
   assert.deepEqual([...ALL_BACKEND_IDS], ["claude", "codex", "gemini"]);
   assert.equal(isImplementedBackendId("codex"), true);
-  assert.equal(isImplementedBackendId("gemini"), false);
-  assert.equal(isKnownBackendId("gemini"), true);
+  assert.equal(isImplementedBackendId("gemini"), true);
+  assert.equal(isKnownBackendId("codex"), true);
   assert.equal(isKnownBackendId("gpt"), false);
 });
 
-test("未実装 backend の明示指定は『未実装』と分かるエラーになる（claude に落とさない）", () => {
-  for (const id of ["gemini"]) {
-    assert.throws(() => resolveBackendId({ explicit: id }), /未実装/, `${id} が throw しない`);
-    assert.throws(() => getBackend(id as "gemini"), /未実装/);
-  }
+test("型としては既知だが未実装の backend は『未実装』と分かるエラー文言になる", () => {
+  // PR-D 時点で ALL_BACKEND_IDS はすべて実装済みなので、実際に throw させる id が無い。
+  // ここで固定するのは**文言の分岐**（既知だが未実装 / そもそも知らない id）で、
+  // 将来 BackendId を先に足して実装が後追いになったときに「黙って claude に落ちない」ことを守る。
+  assert.match(backendIdError("gemini").message, /未実装/);
+  assert.match(backendIdError("gpt").message, /backend が不正です/);
 });
 
 test("未知 backend の指定は『不正』エラーになる", () => {

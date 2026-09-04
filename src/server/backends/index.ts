@@ -6,6 +6,7 @@
 
 import { CLAUDE_BACKEND } from "./claude.ts";
 import { CODEX_BACKEND } from "./codex.ts";
+import { GEMINI_BACKEND } from "./gemini.ts";
 import { ALL_BACKEND_IDS } from "./types.ts";
 import type { BackendId, BackendLaunchInput, EbiBackend } from "./types.ts";
 
@@ -32,11 +33,25 @@ export {
 } from "./claude.ts";
 export {
   CODEX_BACKEND,
-  CODEX_LOGIN_CHECK,
   CODEX_VERIFIED_VERSION,
   codexSandboxFor,
   type CodexSandbox,
 } from "./codex.ts";
+export {
+  GEMINI_BACKEND,
+  GEMINI_DEFAULT_MODEL,
+  GEMINI_HEAVY_MODEL,
+  GEMINI_SETTINGS_ENV,
+  GEMINI_VERIFIED_VERSION,
+  buildGeminiSettings,
+  controlMcpSpecFromClaudeConfig,
+  geminiRuntimeDir,
+  resolveGeminiModel,
+  toGeminiApprovalMode,
+  writeGeminiRuntime,
+  type GeminiApprovalMode,
+  type GeminiEbiSettings,
+} from "./gemini.ts";
 export {
   BACKEND_TRAITS,
   CLAUDE_TRAITS,
@@ -53,10 +68,6 @@ export {
   type PreflightResult,
 } from "./preflight.ts";
 export {
-  runPreflight,
-  type LoginCheckSpec,
-} from "./preflightIo.ts";
-export {
   toClaudeMcpConfig,
   toCodexConfigArgs,
   toCodexProjectsTrustArgs,
@@ -65,8 +76,8 @@ export {
   type GeminiSystemSettings,
 } from "./mcpSpec.ts";
 
-/** 実装済みバックエンドの一覧（解決の探索順）。gemini は PR-C で追加する。 */
-export const BACKENDS: readonly EbiBackend[] = [CLAUDE_BACKEND, CODEX_BACKEND];
+/** 実装済みバックエンドの一覧（解決の探索順）。claude / codex(PR-D) / gemini(PR-C)。 */
+export const BACKENDS: readonly EbiBackend[] = [CLAUDE_BACKEND, CODEX_BACKEND, GEMINI_BACKEND];
 
 /** 最終フォールバックのバックエンド id。 */
 export const DEFAULT_BACKEND_ID: BackendId = "claude";
@@ -130,8 +141,8 @@ export function resolveBackendOrDefault(command: string): EbiBackend {
 /**
  * バックエンド id を解決する。優先度は
  *   spawn 引数 > 役割(EbiRole) > config.defaultBackend > env EBI_BACKEND > "claude"。
- * 未実装 id（"gemini"）・未知 id のいずれも throw する（黙って claude に落とさない）。
- * ※ PR-D 時点で実装済みなのは "claude" / "codex"。
+ * 未知 id は throw する（黙って claude に落とさない）。
+ * ※ PR-D 時点で claude / codex / gemini の 3 つとも実装済み。
  */
 export function resolveBackendId(sources?: {
   /** spawn 引数での明示指定。 */

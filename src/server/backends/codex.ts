@@ -170,17 +170,50 @@ export const CODEX_BACKEND: EbiBackend = {
   },
 
   /**
-   * ready 昇格の追加猶予。TUI のプロンプトが出てから制御MCP のツールが揃うまでに
-   * 数秒あり、その間に 1 通目を投げるとツール無しのターンになる（上記 features.apps の
-   * コメント参照）。env `EBI_CODEX_READY_WARMUP_MS` で調整可。
+   * ready 昇格の追加猶予（PR-D で追加）。
+   * codex TUI は起動 2〜3 秒でプロンプトを出すが、**MCP ツールがセッションに登録されるのは
+   * その後**で、その間に 1 通目を投げるとエビはツール無しのターンを回す
+   * （「reply_to_master を利用できません」と答えて終わる＝静かな故障。e2e で 10/10 再現）。
+   * 実測では ready + 12 秒なら安定して使えたため、既定は 20 秒（余裕込み）。
+   * env `EBI_CODEX_READY_WARMUP_MS` で調整可。
    */
-  readyWarmupMs: Number(process.env.EBI_CODEX_READY_WARMUP_MS) || 8000,
+  readyWarmupMs: Number(process.env.EBI_CODEX_READY_WARMUP_MS) || 20000,
 
   /**
-   * ready 昇格の追加条件（空白除去済みの起動出力に対する照合）。
-   * codex TUI のバナー（`>_ OpenAI Codex (v0.146.0)`）が出るまでは ready にしない。
-   * これで「起動直後に落ちた／ゲートで止まった」を沈黙 idle で ready と誤認しない。
-   * 検知できないまま出力が止まった場合は従来判定へ degrade する（agent.ts 側の settle）。
+   * 「入力受付になった」の目印（PR-C の readyPattern 機構に相乗り）。
+   * codex TUI は起動時に `>_ OpenAI Codex (v0.146.0)` のバナーを描くので、これが出るまでは
+   * ready にしない。沈黙（起動直後の異常終了・未知のゲート）を ready と誤認しないための錠前。
+   * 照合は **ANSI 除去のみ・空白は保持**した素文に対して行われる（agent.ts の maybeMarkReadyPattern）。
    */
-  readyPattern: /OpenAICodex\(v/i,
+  readyPattern: /OpenAI\s+Codex\s+\(v/,
+
+  /**
+   * 起動時に出たら待っても無駄な致命エラー / ゲート。
+   * いずれも buildArgs のフラグで出ないようにしてあるが、CLI のバージョン差でフラグの
+   * 効き方が変わったときに「黙って ready 待ちタイムアウト」ではなく原因が 1 行で分かるようにする。
+   */
+  fatalPatterns: [
+    {
+      pattern: /Do you trust the contents of this directory/i,
+      message:
+        "codex がフォルダ信頼ゲートを出しました（-c projects={...} が効いていない可能性）。" +
+        "docs/backends/codex.md §2.1 のインラインテーブル形式を確認してください",
+    },
+    {
+      pattern: /Update available!/i,
+      message:
+        "codex が更新ダイアログを出しました（-c check_for_update_on_startup=false が効いていない可能性）",
+    },
+    {
+      pattern: /(codex login|Not logged in|Please (re)?login)/i,
+      message:
+        "codex がログインを要求しています。`codex login` を実行してから再 spawn してください",
+    },
+  ],
+
+  /**
+   * ready 到達前に落ちたら 1 回だけ再 spawn する（PR-C の watchEarlyExit に相乗り）。
+   * PoC §6 で「起動 3.2 秒後に exit 0 で自然終了」が 1 度だけ観測されている。
+   */
+  retryOnEarlyExit: true,
 };

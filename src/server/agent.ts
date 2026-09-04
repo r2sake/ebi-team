@@ -56,26 +56,41 @@ const REPLY_SUPPRESS_MS = Number(process.env.EBI_REPLY_SUPPRESS_MS) || 5000;
 const GATE_WINDOW_MS = Number(process.env.EBI_GATE_WINDOW_MS) || 90000;
 
 /**
- * backend が readyPattern（プロンプト表示の検知）を要求する場合の待ち上限(ms)。
- * これを過ぎても検知できなければ従来判定（boot 猶予＋idle）へ degrade する
- * （TUI のバナー文言が将来変わっても永久に ready にならない事故を防ぐ保険）。
- * env `EBI_READY_PATTERN_SETTLE_MS` で調整可。
- */
-const READY_PATTERN_SETTLE_MS = Number(process.env.EBI_READY_PATTERN_SETTLE_MS) || 60000;
-
-/**
- * プロセスグループ kill（killProcessGroup=true の backend）で SIGTERM から SIGKILL へ
- * エスカレートするまでの猶予(ms)。子 MCP の終了処理を待ってから確実に落とす。
- */
-const KILL_GROUP_GRACE_MS = Number(process.env.EBI_KILL_GROUP_GRACE_MS) || 1500;
-
-/**
  * 起動ゲート自動応答が有効な agent で、「dev-channels ゲートへの応答が済むまで ready 昇格を
  * 待つ」上限(ms)。この時間を過ぎてもゲートを検知しなければ、従来どおりの ready 判定へ degrade する
  * （将来 claude 側がダイアログを出さなくなっても永久に ready にならない事故を防ぐ保険）。
  * 実測ではダイアログは spawn 後 2〜4 秒で出る。env `EBI_GATE_SETTLE_MS` で調整可。
  */
 const GATE_SETTLE_MS = Number(process.env.EBI_GATE_SETTLE_MS) || 20000;
+
+/**
+ * プロセスグループ kill（killProcessGroup=true の backend）で、SIGTERM から SIGKILL までの猶予(ms)。
+ * gemini は PTY リーダの下に「再 exec した子 node」と「その配下の stdio MCP」を持つため、
+ * PTY を閉じるだけでは孤児が残る（PoC で 7 セッション分 21 プロセスの残存を実測）。
+ * まずグループへ SIGTERM を送って正規の終了処理をさせ、居残りをこの猶予後に SIGKILL で刈る。
+ * env `EBI_GROUP_KILL_GRACE_MS` で調整可。
+ */
+const GROUP_KILL_GRACE_MS = Number(process.env.EBI_GROUP_KILL_GRACE_MS) || 2000;
+
+/**
+ * プロセスグループへシグナルを送る（pty の子は forkpty により setsid 済み＝pid がそのまま pgid）。
+ * 既に死んでいる（ESRCH）等は無視する。送れたら true。
+ * 純粋な副作用ヘルパとして切り出してあるのは、単体テストで「グループ kill が呼ばれたか」だけを
+ * 差し替えて確認できるようにするため。
+ */
+export function killProcessGroupSignal(
+  pid: number,
+  signal: NodeJS.Signals,
+  killer: (target: number, sig: NodeJS.Signals) => void = (t, sg) => process.kill(t, sg),
+): boolean {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  try {
+    killer(-pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * PTY 注入の結果。
@@ -276,7 +291,6 @@ export interface LaunchParams {
   /**
    * このエビを動かすバックエンド id（起動引数/env/起動ゲート/通信路の性質を決める）。
    * 未指定なら command から解決する（さらに一致しなければ既定 "claude"）。
-   * PR1 時点で実装済みの値は "claude" のみ。
    */
   backend?: BackendId;
   /**
@@ -286,6 +300,17 @@ export interface LaunchParams {
    * （backends/codex.ts・docs/poc/codex-poc-2026-09-04.md §5）。
    */
   initialInject?: string | null;
+  /**
+   * 制御MCP（ebi-control）の設定ファイルパス（claude 方言の JSON）。null/未指定なら制御MCP なし。
+   * claude では args（--mcp-config）に既に載っているが、gemini は env 経由で渡すため
+   * backend.buildEnv() にも同じ情報を渡す必要がある（PR-C）。
+   */
+  mcpConfigPath?: string | null;
+  /**
+   * 役割注入プロンプト。claude では args（--append-system-prompt）に載っているが、
+   * gemini は per-エビ GEMINI.md 経由で渡すため buildEnv にも渡す（PR-C）。
+   */
+  systemPrompt?: string | null;
 }
 
 /** Agent からのイベントを購読するためのコールバック束。 */
@@ -332,6 +357,20 @@ export class Agent {
   readonly model: string | null = null;
   /** このエビを動かしているバックエンド id（PR1 時点では常に "claude"）。 */
   readonly backend: BackendId;
+  /** kill 時にプロセスグループごと落とすか（backend のトレイト。gemini のみ true）。 */
+  private readonly killProcessGroup: boolean;
+  /**
+   * 「入力受付（プロンプト表示）」を示す出力パターン（backend のトレイト。null なら従来判定）。
+   * これを持つ backend は、パターンを一度も見ていない間は ready へ昇格しない。
+   */
+  private readonly readyPattern: RegExp | null;
+  /** readyPattern を検出済みか。 */
+  private readyPatternSeen = false;
+  /** readyPattern 走査用の素文リングバッファ。 */
+  private readyScanBuffer = "";
+  /** 起動フェーズの致命エラー文言（backend のトレイト）。検出済みのものは二度出さない。 */
+  private readonly fatalPatterns: readonly { readonly pattern: RegExp; readonly message: string }[];
+  private readonly reportedFatals = new Set<string>();
   /**
    * 起動に使った実パラメータ。自動再起動（固定エビ）でそのまま再 spawn するために保持する。
    */
@@ -387,22 +426,18 @@ export class Agent {
   /** ダイアログはチャンクを跨いで描画されるため、ready 前の出力を素文で溜めて走査する（上限付き）。 */
   private gateScanBuffer = "";
 
-  // ===== ready 判定の追加条件（backend の readyPattern）=====
-  /** backend が要求する ready 判定パターン（プロンプト表示の検知）。無い backend は null。 */
-  private readonly readyPattern: RegExp | null;
-  /** readyPattern 照合用の素文バッファ（空白除去済み・上限付き）。 */
-  private readyScanBuffer = "";
-  /** readyPattern を検知済みか。 */
-  private readyPatternSeen = false;
-  /** readyPattern の待ち上限満了時に ready 昇格を再評価するタイマ。 */
-  private readyPatternTimer: NodeJS.Timeout | null = null;
-
   // ===== 初回注入（役割プロンプト）=====
   /** ready 後の初回注入を既に送ったか（多重送信防止）。 */
   private initialInjectSent = false;
 
-  /** kill 時にプロセスグループごと落とすか（backend の性質。codex / gemini は true）。 */
-  private readonly killProcessGroup: boolean;
+  /**
+   * PTY への書き込み（本文 → ENTER_DELAY_MS → `\r`）を直列化するためのチェーン。
+   * sendLine は本文と Enter を時間的に分離するため、複数の注入が同時に走ると
+   * 「本文A → 本文B → EnterA → EnterB」のように混ざって 1 通目が壊れる。
+   * ready 時の初回注入（役割プロンプト）と、その直後に届くタスク本文が実際に競合する
+   * （PR-D で codex 運用時に顕在化）。claude 側でも複数送信者が同時に投げれば同じ穴がある。
+   */
+  private writeChain: Promise<void> = Promise.resolve();
 
   /**
    * ready 判定に使う boot 猶予(ms)。サーバ既定（MIN_BOOT_MS）に backend の
@@ -464,9 +499,10 @@ export class Agent {
       ? getBackend(launch.backend)
       : resolveBackendOrDefault(launch.command);
     this.backend = backend.id;
-    this.gateSpec = backend.startupGates;
-    this.readyPattern = backend.readyPattern ?? null;
     this.killProcessGroup = backend.killProcessGroup;
+    this.readyPattern = backend.readyPattern ?? null;
+    this.fatalPatterns = backend.fatalPatterns ?? [];
+    this.gateSpec = backend.startupGates;
     this.bootGraceMs = MIN_BOOT_MS + (backend.readyWarmupMs ?? 0);
     this.autoAnswerStartupGates = this.gateSpec
       ? this.gateSpec.isAutoAnswerEligible(
@@ -485,11 +521,19 @@ export class Agent {
     // 引数配列方式で起動（シェル非経由）。長文の --append-system-prompt も安全に渡る。
     // launch.env があれば親 env にマージする（engineer の EBI_ID 等。子の stdio MCP が継承する）。
     // さらに TUI をインライン描画させる既定 env を最下位優先で敷く（xterm.js のスクロール確保）。
+    // inlineTui の on/off は backend.buildEnv() へ渡して backend に判断させる
+    // （claude は off なら空を返す＝従来と同一。gemini の system settings パスのように
+    //   「TUI 描画ではなく起動の必須条件」である env まで落とさないため）。
     const spawnEnv = buildSpawnEnv(
       process.env,
       launch.env,
-      INLINE_TUI_ENABLED,
-      backend.buildEnv({ agentId: id }),
+      true,
+      backend.buildEnv({
+        agentId: id,
+        inlineTui: INLINE_TUI_ENABLED,
+        mcpConfigPath: launch.mcpConfigPath ?? null,
+        systemPrompt: launch.systemPrompt ?? null,
+      }),
       backend.envDenyList,
     );
     this.proc = pty.spawn(launch.command, launch.args, {
@@ -512,8 +556,8 @@ export class Agent {
       if (meaningful.length === 0) return;
       // 起動フェーズ（ready 前）の対話ダイアログへ自動応答（安全限定つき）。
       this.maybeAnswerStartupGates(meaningful);
-      // backend が readyPattern を持つ場合、プロンプト表示を検知するまで ready にしない。
-      this.scanReadyPattern(meaningful);
+      this.maybeMarkReadyPattern(meaningful);
+      this.maybeReportFatal(meaningful);
       this.detector.notifyOutput();
       this.appendScrollback(meaningful);
       this.handlers.onData(this.id, meaningful);
@@ -530,10 +574,6 @@ export class Agent {
       if (this.gateSettleTimer) {
         clearTimeout(this.gateSettleTimer);
         this.gateSettleTimer = null;
-      }
-      if (this.readyPatternTimer) {
-        clearTimeout(this.readyPatternTimer);
-        this.readyPatternTimer = null;
       }
       this.resolveReadyWaiters(false);
       this.handlers.onExit(this.id, exitCode);
@@ -553,15 +593,6 @@ export class Agent {
         this.gateSettleTimer = null;
         this.promoteReadyIfEligible();
       }, GATE_SETTLE_MS + 50);
-    }
-
-    // readyPattern を検知できないまま出力が止まったケースの degrade タイマ
-    // （将来 TUI のバナー文言が変わっても永久に ready にならない事故を防ぐ保険）。
-    if (this.readyPattern) {
-      this.readyPatternTimer = setTimeout(() => {
-        this.readyPatternTimer = null;
-        this.promoteReadyIfEligible();
-      }, READY_PATTERN_SETTLE_MS + 50);
     }
   }
 
@@ -630,7 +661,12 @@ export class Agent {
   private promoteReadyIfEligible(): void {
     if (this.disposed || this.hasBeenReady) return;
     const elapsed = Date.now() - this.spawnedAt;
+    // boot 猶予は「サーバ既定 ＋ backend の readyWarmupMs」（codex は MCP ツール登録待ち）。
     if (elapsed < this.bootGraceMs) return;
+    // backend が「プロンプト表示」の目印を持つなら、それを見るまで ready にしない。
+    // gemini は OAuth トークン再取得中（"Waiting for authentication..."）に沈黙するため、
+    // 「boot 猶予＋初回 idle」だけだとそこで ready 誤昇格して 1 通目が食われる（e2e で実測）。
+    if (this.readyPattern !== null && !this.readyPatternSeen) return;
     // 起動ゲート自動応答が有効な agent は、dev-channels ダイアログへ応答するまで ready にしない。
     // ダイアログはセッションを入力待ちで沈黙させ、その沈黙を idle 検出器が拾うため、従来の
     // 「boot 猶予＋idle」だけだとダイアログ表示中に ready へ誤昇格していた（＝入力欄がまだ
@@ -646,36 +682,13 @@ export class Agent {
     ) {
       return;
     }
-    // backend が readyPattern（プロンプト表示）を要求する場合、検知するまで ready にしない。
-    // 起動直後に落ちた／未知のゲートで止まった状態を「沈黙 idle」で ready と誤認しないため。
-    // 保険: READY_PATTERN_SETTLE_MS を過ぎたら従来判定へ degrade する。
-    if (
-      this.readyPattern !== null &&
-      !this.readyPatternSeen &&
-      elapsed < READY_PATTERN_SETTLE_MS
-    ) {
-      return;
-    }
     if (this.getStatus() !== "idle") return;
     this.hasBeenReady = true;
     this.handlers.onNotice(this.id, "ready（入力受付になりました）");
-    this.resolveReadyWaiters(true);
+    // 初回注入（役割プロンプト）を **ready 待ちを解放する前に**書き込みキューへ積む。
+    // 解放を先にすると、待っていた配送の本文と役割プロンプトが同時に書かれて混ざる。
     this.sendInitialInject();
-  }
-
-  /**
-   * readyPattern（backend が要求するプロンプト表示）を素文バッファで走査する。
-   * claude の起動ゲート検知と同じく、TUI が空白なしで描画する罠を避けるため
-   * **空白を全除去した文字列**に対して照合する（照合パターン側も空白なしで書く）。
-   */
-  private scanReadyPattern(chunk: string): void {
-    if (this.readyPattern === null || this.readyPatternSeen || this.disposed) return;
-    this.readyScanBuffer = (this.readyScanBuffer + compactPlain(chunk)).slice(-4096);
-    if (!this.readyPattern.test(this.readyScanBuffer)) return;
-    this.readyPatternSeen = true;
-    this.readyScanBuffer = "";
-    // 出力が既に止まっていると次の idle エッジが来ないため、ここでも昇格を再評価する。
-    this.promoteReadyIfEligible();
+    this.resolveReadyWaiters(true);
   }
 
   /**
@@ -688,7 +701,7 @@ export class Agent {
     if (!text || this.initialInjectSent || this.disposed) return;
     this.initialInjectSent = true;
     this.handlers.onNotice(this.id, "初回注入: 役割プロンプトを送信しました（ready 後）");
-    void this.sendLine(text);
+    void this.enqueueWrite(text);
   }
 
   /**
@@ -807,6 +820,44 @@ export class Agent {
    * ダイアログはチャンクを跨いで届くため、素文（ANSI 除去）を上限付きバッファに
    * 溜めてから判定する。応答したら、どのダイアログへ何を送ったかをサーバログに残す。
    */
+  /**
+   * backend の readyPattern（プロンプト表示の目印）を出力から探す。
+   * 見つかったら ready 昇格を再評価する（この時点で既に idle・boot 猶予経過なら即 ready）。
+   */
+  private maybeMarkReadyPattern(chunk: string): void {
+    if (this.readyPattern === null || this.readyPatternSeen || this.disposed) return;
+    const plain = chunk
+      .replace(/\x1b\][^\x07]*\x07/g, "")
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+      .replace(/\x1b[()][A-Z0-9]/g, "");
+    this.readyScanBuffer = (this.readyScanBuffer + plain).slice(-8192);
+    if (!this.readyPattern.test(this.readyScanBuffer)) return;
+    this.readyPatternSeen = true;
+    this.readyScanBuffer = "";
+    this.promoteReadyIfEligible();
+  }
+
+  /**
+   * backend が宣言した致命エラー文言を出力から探し、見つけたら notice とサーバログへ出す。
+   * ready 待ちが黙ってタイムアウトするより、原因の分かる 1 行を残す方が運用が早い。
+   */
+  private maybeReportFatal(chunk: string): void {
+    if (this.fatalPatterns.length === 0 || this.disposed) return;
+    if (this.reportedFatals.size === this.fatalPatterns.length) return;
+    const plain = chunk
+      .replace(/\x1b\][^\x07]*\x07/g, "")
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+      .replace(/\x1b[()][A-Z0-9]/g, "");
+    for (const { pattern, message } of this.fatalPatterns) {
+      const key = pattern.source;
+      if (this.reportedFatals.has(key)) continue;
+      if (!pattern.test(plain)) continue;
+      this.reportedFatals.add(key);
+      console.error(`[ebi-team] [${this.id}] 起動エラー: ${message}`);
+      this.handlers.onNotice(this.id, `起動エラー: ${message}`);
+    }
+  }
+
   private maybeAnswerStartupGates(chunk: string): void {
     const spec = this.gateSpec;
     if (this.disposed || !this.autoAnswerStartupGates || spec === null) return;
@@ -854,7 +905,7 @@ export class Agent {
         guard.onSuppress?.();
         return "suppressed";
       }
-      void this.sendLine(body);
+      void this.enqueueWrite(body);
       return "sent";
     }
     this.injectQueue.push({ body, guard });
@@ -902,6 +953,18 @@ export class Agent {
   }
 
   /** 本文を stdin へ書き、ENTER_DELAY_MS 待ってから Enter(`\r`) を別 write で送って送信を確定させる。 */
+  /**
+   * 直列化キューに 1 件の書き込みを積む（前の書き込みの Enter 送信が終わるまで待つ）。
+   * 例外は握りつぶす（1 件の失敗で以降の書き込みを止めない）。
+   */
+  private enqueueWrite(body: string): Promise<void> {
+    this.writeChain = this.writeChain.then(
+      () => this.sendLine(body),
+      () => this.sendLine(body),
+    );
+    return this.writeChain;
+  }
+
   private async sendLine(body: string): Promise<void> {
     if (this.disposed) return;
     this.proc.write(body);
@@ -940,35 +1003,25 @@ export class Agent {
       clearTimeout(this.gateSettleTimer);
       this.gateSettleTimer = null;
     }
-    if (this.readyPatternTimer) {
-      clearTimeout(this.readyPatternTimer);
-      this.readyPatternTimer = null;
-    }
     this.resolveReadyWaiters(false);
     // MVP は生存 agent のみスクロールバックを保持する方針。exit/kill で破棄する。
     this.scrollbackChunks.length = 0;
     this.scrollbackSize = 0;
-    const pid = this.pid;
+    // backend が要求する場合はプロセスグループごと落とす（gemini: 子 node の再 exec と
+    // その配下の stdio MCP が PTY リーダの kill だけでは孤児として残るため）。
+    if (this.killProcessGroup && this.pid != null) {
+      const pid: number = this.pid;
+      killProcessGroupSignal(pid, "SIGTERM");
+      const sweeper = setTimeout(() => {
+        killProcessGroupSignal(pid, "SIGKILL");
+      }, GROUP_KILL_GRACE_MS);
+      // サーバ終了を妨げない（居残りが無ければ何もせず消える保険タイマ）。
+      sweeper.unref?.();
+    }
     try {
       this.proc.kill();
     } catch {
       // 既に死んでいる場合は無視。
-    }
-    // 子プロセスを道連れにする必要がある backend（codex の codex_apps / ebi-control、
-    // gemini の再 exec した node）は、PTY リーダを落とすだけでは孤児が残りうる。
-    // node-pty の子は新セッションのリーダ（pgid == pid）なので、その pgid ごと止める。
-    // claude は従来どおり何もしない（killProcessGroup=false）。
-    if (this.killProcessGroup && pid != null) {
-      const killGroup = (signal: NodeJS.Signals): void => {
-        try {
-          process.kill(-pid, signal);
-        } catch {
-          // 既に全滅している / 権限が無い場合は無視。
-        }
-      };
-      killGroup("SIGTERM");
-      // 終了処理の猶予を置いてから確実に落とす（unref でプロセス終了を妨げない）。
-      setTimeout(() => killGroup("SIGKILL"), KILL_GROUP_GRACE_MS).unref();
     }
   }
 
@@ -1020,7 +1073,7 @@ export class Agent {
         entry.guard.onSuppress?.();
         continue;
       }
-      await this.sendLine(entry.body);
+      await this.enqueueWrite(entry.body);
       sent += 1;
       // 次の件と混ざらないよう、送信確定後に間隔を空ける。
       if (this.injectQueue.length > 0) await sleep(ENTER_DELAY_MS);

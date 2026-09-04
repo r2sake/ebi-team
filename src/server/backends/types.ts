@@ -80,6 +80,23 @@ export interface BackendEnvInput {
   agentId?: string | null;
   /** notification 注入モードが有効か。 */
   notifyMode?: boolean;
+  /**
+   * 制御MCP（ebi-control）の設定ファイルパス（claude 方言の JSON）。null なら制御MCP なし。
+   * gemini は「引数ではなく env（GEMINI_CLI_SYSTEM_SETTINGS_PATH）」で MCP を渡すため、
+   * buildArgs だけでなく buildEnv からもこの情報が要る（PR-C で追加）。
+   */
+  mcpConfigPath?: string | null;
+  /**
+   * 役割注入プロンプト。claude は `--append-system-prompt`（引数）で渡すが、gemini には
+   * 相当フラグが無く per-エビ GEMINI.md 経由で渡すため、buildEnv 側でも必要（PR-C で追加）。
+   */
+  systemPrompt?: string | null;
+  /**
+   * TUI をインライン描画させる既定 env を敷くか（env EBI_INLINE_TUI の解決結果）。
+   * false でも「起動に必須な env」（gemini の system settings パス等）は落としてはならない。
+   * 何を落として何を残すかは各 backend の buildEnv が判断する。未指定は true 扱い。
+   */
+  inlineTui?: boolean;
 }
 
 /** 起動フェーズに出る対話ダイアログ（ゲート）の種別。 */
@@ -150,6 +167,16 @@ export interface BackendPreflightSpec {
    * 設計書 §2.5 の deny 方針とは**逆向き**である点に注意。PoC 実測で確定）。
    */
   readonly requiredEnv: readonly string[];
+  /**
+   * 追加の実行チェック（PR-D で追加・任意項目）。
+   * ファイルの存在だけでは分からない「実際にログインできているか」を CLI に聞く
+   * （codex は `~/.codex/auth.json` があってもトークン失効で未ログインになりうる）。
+   * 出力（stdout+stderr）が okPattern に一致しなければ **error**（spawn を止める）。
+   */
+  readonly loginCheck?: {
+    readonly args: readonly string[];
+    readonly okPattern: RegExp;
+  } | null;
 }
 
 /**
@@ -180,6 +207,12 @@ export interface BackendTraits {
    * claude は false（現状踏襲）。実際の kill 実装の切替は PR-C で行う。
    */
   readonly killProcessGroup: boolean;
+  /**
+   * ready 到達前に予期せず exit した場合、1 回だけ再 spawn するか（PR-C で追加・任意項目）。
+   * gemini は起動に外部条件（OAuth トークンの再取得・GCP 側の応答）が絡み、稀に起動途中で
+   * 落ちうるため true。claude / codex は false（未指定＝false）。
+   */
+  readonly retryOnEarlyExit?: boolean;
   /** 起動前チェックの宣言。 */
   readonly preflight: BackendPreflightSpec;
   /**
@@ -214,6 +247,21 @@ export interface EbiBackend extends BackendTraits {
   hasControlBridge(args: readonly string[], env?: Record<string, string>): boolean;
   /** 起動ゲート（信頼ダイアログ等）の定義。出さないバックエンドは null。 */
   readonly startupGates: StartupGateSpec | null;
+  /**
+   * 「入力受付（プロンプト表示）」を示す出力パターン（PR-C で追加・任意項目）。
+   *
+   * 既定の ready 判定は「boot 猶予経過 ＋ 初めて idle」というヒューリスティックだが、
+   * これは**沈黙するダイアログ**（gemini の OAuth トークン再取得中の
+   * "Waiting for authentication..." 等）を ready と誤判定し、注入した本文が食われる。
+   * このパターンを持つ backend は、**素文にこのパターンが現れるまで ready へ昇格しない**。
+   * null / 未指定なら従来どおり（claude は現状踏襲）。
+   */
+  readonly readyPattern?: RegExp | null;
+  /**
+   * 起動フェーズに出たら「このまま待っても無駄」と分かる致命エラーの文言（PR-C で追加・任意項目）。
+   * 検出したら notice / サーバログへ人間に分かる文言で流す（黙って ready 待ちタイムアウトさせない）。
+   */
+  readonly fatalPatterns?: readonly { readonly pattern: RegExp; readonly message: string }[];
   /** 初回タスクをコマンドの位置引数として渡せるか（渡せると注入タイミング問題が消える）。 */
   readonly supportsInitialPrompt: boolean;
   /**
@@ -229,10 +277,4 @@ export interface EbiBackend extends BackendTraits {
    * チャットに答えて終わる＝静かな故障）。未指定なら 0（従来どおり）。
    */
   readonly readyWarmupMs?: number;
-  /**
-   * ready 昇格の追加条件。**空白を全除去した**起動出力に対して照合する正規表現。
-   * 指定した場合、これに一致するまで ready へ昇格しない（沈黙による ready 誤昇格を防ぐ）。
-   * 一定時間（agent.ts の settle）検知できなければ従来判定へ degrade する。
-   */
-  readonly readyPattern?: RegExp;
 }

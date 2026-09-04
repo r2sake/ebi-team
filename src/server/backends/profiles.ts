@@ -49,6 +49,11 @@ export const CODEX_TRAITS: BackendTraits = {
     verifiedVersion: "0.146.0",
     requiredFiles: ["~/.codex/auth.json"],
     requiredEnv: [],
+    // `codex login status` は結果を **stderr** に出す（0.146.0 実測）。
+    // backendPreflight.ts は stdout+stderr を連結して照合する。
+    // 正常時は `Logged in using ChatGPT`。`/Logged in/i` だと "Not logged in" にも
+    // 一致してしまうため（大小無視）、"using" まで含めて照合する。
+    loginCheck: { args: ["login", "status"], okPattern: /Logged in using/i },
   },
   initialPromptArgs: (prompt: string) => [prompt],
 };
@@ -57,9 +62,16 @@ export const CODEX_TRAITS: BackendTraits = {
  * gemini のプロファイル（PR0-G 実測・gemini-cli 0.58.0）。
  *
  * envDenyList は設計書 §2.5 の案から **訂正済み**:
- * ログイン中アカウントは Workspace（Code Assist Standard）で、`GOOGLE_CLOUD_PROJECT` を
- * 落とすと `ProjectIdRequiredError` で**起動すらできない**。よって deny せず、逆に
- * preflight で「ある」ことを必須にする。deny するのは API キー課金・別認証経路のみ。
+ * Workspace アカウント（Code Assist Standard）では `GOOGLE_CLOUD_PROJECT` を落とすと
+ * `ProjectIdRequiredError` で**起動すらできない**。よって deny しない。
+ * deny するのは API キー課金・別認証経路のみ。
+ *
+ * `requiredEnv` は**空**（ボス裁定 2026-09-05 の変更後）。ログイン中のアカウントが
+ * Workspace 垢（GCP プロジェクト必須）か個人垢（Google AI Pro 等・プロジェクト不要かつ
+ * 設定すると GCP 紐付き経路に載ってしまう）かを ebi-team 側で決め打ちしないため。
+ * 「あれば継承・無ければ無しで起動」し、Workspace 垢で未設定だった場合は起動時の
+ * `This account requires setting the GOOGLE_CLOUD_PROJECT` を fatalPatterns で拾って
+ * 明示エラーにする（backends/gemini.ts）。
  *
  * kill はプロセスグループ必須（gemini は子 node を再 exec するため、PTY リーダの kill だけでは
  * 子と配下の stdio MCP が孤児として残る。PoC で 21 プロセス残存を実測）。
@@ -75,12 +87,14 @@ export const GEMINI_TRAITS: BackendTraits = {
   reportsUsage: false,
   idleThresholdMs: null,
   killProcessGroup: true,
+  // 起動途中の予期せぬ exit（OAuth トークン再取得の失敗等）は 1 回だけ再試行する。
+  retryOnEarlyExit: true,
   preflight: {
     versionArgs: ["--version"],
     verifiedVersion: "0.58.0",
     requiredFiles: ["~/.gemini/oauth_creds.json"],
-    // 設計書 §2.5 とは逆向き: Workspace アカウントでは必須（無いと起動不能）。
-    requiredEnv: ["GOOGLE_CLOUD_PROJECT"],
+    // 空（上記コメント参照）。Workspace 垢／個人垢のどちらでも起動できるようにする。
+    requiredEnv: [],
   },
   initialPromptArgs: (prompt: string) => ["-i", prompt],
 };

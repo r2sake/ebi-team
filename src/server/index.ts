@@ -18,14 +18,14 @@ import { configureDeliveryLog, deliveryLogPath, logDelivery } from "./deliveryLo
 import type { Agent, SpawnConfig, AgentHandlers, LaunchParams } from "./agent.ts";
 import {
   BASE_ALLOWED_DEV_CHANNELS,
-  CODEX_LOGIN_CHECK,
   DEFAULT_BACKEND_ID,
   EBI_CONTROL_MCP_NAME,
+  applyEnvDenyList,
   buildLaunchArgs,
   getBackend,
   initialInjectFor,
+  resolveBackend,
   resolveBackendId,
-  runPreflight,
   type BackendId,
   type BackendLaunchInput,
   type ControlMcpSpec,
@@ -41,6 +41,7 @@ import {
 } from "./config.ts";
 import { EBI_ROLES, resolveRole, registerCustomRoles } from "./roles.ts";
 import { isRunningFromSrc, mcpConfigPathFor, type McpConfigRole } from "./mcpConfigPath.ts";
+import { needsPreflight, runPreflight } from "./backendPreflight.ts";
 import { FixedEbiManager, applyMasterMcpConfig } from "./fixedEbi.ts";
 import { configureFixedEbiLog, fixedEbiLogPath } from "./fixedEbiLog.ts";
 import { NoticeBuffer, DEFAULT_NOTICE_BUFFER_SIZE } from "./noticeBuffer.ts";
@@ -97,10 +98,6 @@ const READY_WAIT_MS = Number(process.env.EBI_READY_WAIT_MS ?? 30000);
 // spawn 直後は claude 起動→MCP 接続→control-server ブリッジの初回 subscribe まで数秒かかる。
 // この時間内に購読が確立しなければ、待たずに従来の PTY 経路（ready 待ち+inject）へフォールバックする。
 const SUBSCRIBE_WAIT_MS = Number(process.env.EBI_SUBSCRIBE_WAIT_MS ?? 20000);
-// 非 claude backend（codex）の spawn 時に ready 到達を待つ最大時間（ms）。
-// この待ちの目的は「ready 前に落ちた（PoC §6 の稀な即時 exit）」を検知して 1 回だけ
-// 再 spawn すること。時間切れ（生きているが遅い）は従来どおり配送側の ready 待ちに任せる。
-const BACKEND_READY_WAIT_MS = Number(process.env.EBI_BACKEND_READY_WAIT_MS ?? 90000);
 // registry のダンプ先。
 const DUMP_PATH = process.env.EBI_DUMP_PATH ?? join(process.cwd(), ".ebi-team", "registry.json");
 // 配送イベントの恒久ログ（JSONL）。tty の console だけでは事後追跡できなかった反省から、
@@ -144,18 +141,6 @@ const ROLE_MCP_CONFIG: Record<McpConfigRole, string> = {
 // （EBI_CONTROL_CHANNEL_SPEC）。付与条件も含めてバックエンド実装に閉じている。
 
 /**
- * backend 別の起動バイナリを解決する。
- * - claude（既定 backend）は**従来どおり** EBI_COMMAND（既定 "claude"）。テストで bash 等に
- *   差し替える逃げ道も維持する（＝挙動不変）。
- * - 非 claude（codex）は `EBI_CODEX_COMMAND` > backend の defaultCommand。
- *   EBI_COMMAND は claude 用の設定なので流用しない（bash スタブのまま codex を起動しない）。
- */
-function commandForBackend(id: BackendId): string {
-  if (id === DEFAULT_BACKEND_ID) return COMMAND;
-  return process.env[`EBI_${id.toUpperCase()}_COMMAND`] || getBackend(id).defaultCommand;
-}
-
-/**
  * backend 別の追加起動引数。EBI_ARGS は claude 向けの設定なので非 claude には渡さず、
  * `EBI_CODEX_ARGS` を使う（フラグ体系が違うため取り違えると即起動失敗になる）。
  */
@@ -195,92 +180,6 @@ function controlMcpSpecFor(mcpRole: McpConfigRole, agentId: string): ControlMcpS
       EBI_NOTIFY_SUBSCRIBE: "off",
     },
   };
-}
-
-/**
- * 非 claude backend の spawn 直前チェック（preflight）。
- * errors があれば spawn を止めて明示エラーにする（黙って起動して静かに壊れるのを防ぐ）。
- * claude は現状踏襲で走らせない（挙動不変）。
- */
-function preflightOrThrow(backendId: BackendId, command: string): void {
-  if (backendId === DEFAULT_BACKEND_ID) return;
-  const backend = getBackend(backendId);
-  const result = runPreflight({
-    command,
-    spec: backend.preflight,
-    env: process.env,
-    loginCheck: backendId === "codex" ? CODEX_LOGIN_CHECK : null,
-  });
-  for (const w of result.warnings) {
-    console.warn(`[ebi-team] preflight(${backendId}) 警告: ${w}`);
-  }
-  // dev（tsx）起動の制御MCP は起動が遅く、codex のターン開始までにツールが揃わないことがある
-  // （= reply_to_master が「利用できません」と言われる静かな故障。PR-D の e2e で実測）。
-  // 非 claude backend を dev サーバから起動する場合は明示的に警告する（docs/backends/codex.md）。
-  if (RUNNING_FROM_SRC) {
-    console.warn(
-      `[ebi-team] preflight(${backendId}) 警告: dev（src/tsx）起動のサーバです。` +
-        `制御MCP の起動が遅く reply_to_master が使えない場合があります` +
-        `（本番同様に npm run build → npm start での起動を推奨）`,
-    );
-  }
-  if (!result.ok) {
-    throw new Error(
-      `backend "${backendId}" の起動前チェックに失敗しました: ${result.errors.join(" / ")}`,
-    );
-  }
-}
-
-/** pid のプロセスが生きているか（シグナル 0 で存在確認する）。 */
-function isProcessAlive(pid: number | null): boolean {
-  if (pid == null) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * 非 claude backend の spawn 後始末（claude は現状踏襲で何もしない）。
- *
- * ready 到達を待ち、**ready 前に予期せず exit していたら 1 回だけ再 spawn**する。
- * codex は PoC で「起動 3.2 秒後に exit 0 で自然終了」が 1 度だけ観測されており
- * （docs/poc/codex-poc-2026-09-04.md §6）、静かに死んだエビが registry に残るのを防ぐ。
- * 2 回目も ready 前に落ちたら明示エラー（黙って「起動した」と返さない）。
- * 時間切れ（プロセスは生きているが ready にならない）は警告に留め、配送側の ready 待ちに委ねる。
- */
-async function settleBackendSpawn(
-  backendId: BackendId,
-  agentId: string,
-  respawn: () => Agent,
-): Promise<Agent> {
-  let agent = registry.get(agentId)!;
-  if (backendId === DEFAULT_BACKEND_ID) return agent;
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    if (await agent.waitUntilReady(BACKEND_READY_WAIT_MS)) return agent;
-    if (isProcessAlive(agent.pid)) {
-      console.warn(
-        `[ebi-team] [${agentId}] backend=${backendId}: ready 待ちが ${BACKEND_READY_WAIT_MS}ms で` +
-          `時間切れ（プロセスは生存）。配送側の ready 待ちに委ねます`,
-      );
-      return agent;
-    }
-    if (attempt === 2) {
-      registry.remove(agentId);
-      throw new Error(
-        `backend "${backendId}" のエビ ${agentId} が ready 到達前に終了しました（リトライ 1 回も失敗）`,
-      );
-    }
-    console.warn(
-      `[ebi-team] [${agentId}] backend=${backendId}: ready 到達前に終了。1 回だけ再 spawn します`,
-    );
-    broadcast({ type: "notice", id: agentId, text: "ready 到達前に終了したため再 spawn します" });
-    registry.remove(agentId);
-    agent = respawn();
-  }
-  return agent;
 }
 
 const spawnConfig: SpawnConfig = {
@@ -917,20 +816,27 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   const backendId = params.backend
     ? resolveBackendId({ explicit: params.backend })
     : BACKEND_ID;
+  const backend = getBackend(backendId);
+
   // モデル名の語彙は backend ごとに別物（claude の "opus"/"sonnet" は codex では通らず、
   // ChatGPT アカウントでは `The 'sonnet' model is not supported` で毎ターン 400 になる）。
   // よって役割の defaultModel（claude 語彙）は claude にだけ効かせ、非 claude では
   //   明示指定 > EBI_<ID>_MODEL > 未指定（CLI 既定モデル）
-  // の順で解決する。
+  // の順で解決する（PR-D）。
   const model =
     backendId === DEFAULT_BACKEND_ID
       ? (params.model ?? role?.defaultModel ?? null)
       : (params.model ?? process.env[`EBI_${backendId.toUpperCase()}_MODEL`] ?? null);
 
-  // 起動バイナリと追加引数は backend ごとに解決する（claude は従来どおり EBI_COMMAND）。
-  const command = commandForBackend(backendId);
-  // 非 claude backend は spawn 直前に起動前チェック（CLI 存在 / バージョン / 認証）を通す。
-  preflightOrThrow(backendId, command);
+  // 起動バイナリの解決。サーバ既定 command（EBI_COMMAND / 既定 "claude"）がその backend の
+  // ものでなければ backend の既定バイナリを使う（claude サーバから gemini/codex エビを起動する経路）。
+  // ただし **どの backend にも一致しない command（EBI_COMMAND=bash 等のスタブ起動）は
+  // そのまま尊重する**（テスト用の逃げ道を潰さないため。従来挙動と同一）。
+  const serverBackend = resolveBackend(spawnConfig.command);
+  const command =
+    serverBackend === null || serverBackend.id === backendId
+      ? spawnConfig.command
+      : backend.defaultCommand;
 
   // 役割付きなら ebi-control MCP（最小権限・reply_to_master 等）を追加する。
   // 「どのフラグをどう付けるか」はバックエンド実装（backends/claude.ts の buildArgs）に閉じており、
@@ -957,19 +863,38 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
 
   // バックエンド固有の起動引数を組み立てる（claude なら
   // --model / --permission-mode / --append-system-prompt / --mcp-config / dev-channels）。
-  // 制御MCP の渡し方は backend の方言で異なる（claude=JSON ファイルパス / codex=`-c` に焼く）。
-  // どちらを使うかは backend 実装が決めるので、ここでは両方を入力として渡す。
+  const mcpConfigPath = role ? ROLE_MCP_CONFIG[role.mcpRole] : null;
+  // 制御MCP の渡し方は backend の方言で異なる（claude=JSON ファイルパス / gemini=env /
+  // codex=`-c` に焼く）。どれを使うかは backend 実装が決めるので、ここでは全部渡す。
   const launchInputFor = (trustPaths: readonly string[]): BackendLaunchInput => ({
     model,
     permissionMode,
     systemPrompt: appendSystemPrompt,
-    mcpConfigPath: role ? ROLE_MCP_CONFIG[role.mcpRole] : null,
+    mcpConfigPath,
     controlMcp: role ? controlMcpSpecFor(role.mcpRole, agentId) : null,
     // フォルダ信頼ゲートを出させないために宣言するディレクトリ（codex のみ使用）。
     trustPaths,
     notifyMode: isNotifyMode(),
     extraArgs: extraArgsForBackend(backendId),
   });
+
+  // 起動前チェック（認証ファイル / 必須 env / CLI バージョン）。
+  // 確認すべきことを 1 つも持たない backend（claude）では実行されない＝外形ゼロ差分。
+  // errors があれば spawn を止めて明示エラーにする（起動即死 → crashloop より原因が分かる）。
+  if (needsPreflight(backend)) {
+    const pf = await runPreflight(backend, {
+      command,
+      env: applyEnvDenyList(process.env, backend.envDenyList),
+    });
+    for (const w of pf.warnings) {
+      console.warn(`[preflight:${backendId}] 警告: ${w}`);
+    }
+    if (!pf.ok) {
+      throw new Error(
+        `backend "${backendId}" の起動前チェックに失敗しました: ${pf.errors.join(" / ")}`,
+      );
+    }
+  }
 
   // worktree なし: cwd 直指定で起動。
   if (!params.useWorktree) {
@@ -981,15 +906,15 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
       model,
       env: launchEnv,
       backend: backendId,
+      mcpConfigPath,
+      systemPrompt: appendSystemPrompt,
       // 役割プロンプトを起動引数で渡せない backend（codex）は ready 後に PTY 注入する。
       initialInject: initialInjectFor(command, input),
     };
-    const spawnOnce = (): Agent =>
-      registry.spawn(cwd, handlers, { id: agentId, kind: params.kind, role: role?.id, launch });
-    let agent = spawnOnce();
+    const agent = registry.spawn(cwd, handlers, { id: agentId, kind: params.kind, role: role?.id, launch });
+    watchEarlyExit(agent, backend, params);
     broadcast({ type: "spawned", agent: agent.toRecord() });
     broadcastRegistry();
-    agent = await settleBackendSpawn(backendId, agent.id, spawnOnce);
     return agent.id;
   }
 
@@ -1010,23 +935,70 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     model,
     env: launchEnv,
     backend: backendId,
+    mcpConfigPath,
+    systemPrompt: appendSystemPrompt,
     initialInject: initialInjectFor(command, input),
   };
-  const spawnOnce = (): Agent =>
-    registry.spawn(wt.worktreePath, handlers, {
-      id: agentId,
-      kind: params.kind,
-      role: role?.id,
-      launch,
-      branch: wt.branch,
-      worktreeRepo: wt.repoTop,
-      worktreePath: wt.worktreePath,
-    });
-  let agent = spawnOnce();
+  const agent = registry.spawn(wt.worktreePath, handlers, {
+    id: agentId,
+    kind: params.kind,
+    role: role?.id,
+    launch,
+    branch: wt.branch,
+    worktreeRepo: wt.repoTop,
+    worktreePath: wt.worktreePath,
+  });
+  watchEarlyExit(agent, backend, params);
   broadcast({ type: "spawned", agent: agent.toRecord() });
   broadcastRegistry();
-  agent = await settleBackendSpawn(backendId, agent.id, spawnOnce);
   return agent.id;
+}
+
+/**
+ * ready 到達前の予期せぬ exit を 1 回だけ再試行する（backend.retryOnEarlyExit が true のとき）。
+ *
+ * 非ブロッキング（spawn の応答は待たせない）。判定は
+ *   「READY_WAIT_MS 以内に ready にならず、かつ registry から消えている（= exit 済み）」
+ * で行う。ready 待ちタイムアウトだけ（プロセスは生きている）では再試行しない
+ * ——生きているエビを二重起動しないため。
+ * 2 回目も ready 前に落ちたら notice で明示する（黙って消えるのが一番困る）。
+ */
+function watchEarlyExit(
+  agent: Agent,
+  backend: ReturnType<typeof getBackend>,
+  params: GeneralizedSpawnParams,
+): void {
+  if (!backend.retryOnEarlyExit) return;
+  const agentId = agent.id;
+  void (async () => {
+    const ready = await agent.waitUntilReady(READY_WAIT_MS);
+    if (ready) return;
+    // まだ registry に居る＝プロセスは生きている（単なる ready 待ちタイムアウト）。何もしない。
+    if (registry.get(agentId) === agent) return;
+    if (params.retryOfEarlyExit) {
+      broadcast({
+        type: "notice",
+        id: agentId,
+        text: `${agentId}（backend=${backend.id}）が ready 前に再び終了しました。再試行は打ち切ります（起動条件を確認してください）`,
+      });
+      console.error(`[spawn:${backend.id}] ${agentId} が ready 前に 2 回終了しました`);
+      return;
+    }
+    broadcast({
+      type: "notice",
+      id: agentId,
+      text: `${agentId}（backend=${backend.id}）が ready 前に終了しました。1 回だけ再起動します`,
+    });
+    try {
+      await spawnAgent({ ...params, id: agentId, retryOfEarlyExit: true });
+    } catch (err) {
+      broadcast({
+        type: "notice",
+        id: agentId,
+        text: `${agentId} の再起動に失敗しました: ${(err as Error).message}`,
+      });
+    }
+  })();
 }
 
 /** sendMessage の入力パラメータ。 */
