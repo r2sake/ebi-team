@@ -1,0 +1,146 @@
+{
+  "version": "0.146.0",
+  "enterDelayMs": 500,
+  "injections": [
+    {
+      "n": 1,
+      "submitted": true,
+      "answered": true,
+      "ms": 1907
+    },
+    {
+      "n": 2,
+      "submitted": true,
+      "answered": true,
+      "ms": 1919
+    },
+    {
+      "n": 3,
+      "submitted": true,
+      "answered": true,
+      "ms": 2115
+    },
+    {
+      "n": 4,
+      "submitted": true,
+      "answered": true,
+      "ms": 2111
+    },
+    {
+      "n": 5,
+      "submitted": true,
+      "answered": true,
+      "ms": 1809
+    },
+    {
+      "n": 6,
+      "submitted": true,
+      "answered": true,
+      "ms": 1808
+    },
+    {
+      "n": 7,
+      "submitted": true,
+      "answered": true,
+      "ms": 1910
+    },
+    {
+      "n": 8,
+      "submitted": true,
+      "answered": true,
+      "ms": 1908
+    },
+    {
+      "n": 9,
+      "submitted": true,
+      "answered": true,
+      "ms": 2415
+    },
+    {
+      "n": 10,
+      "submitted": true,
+      "answered": true,
+      "ms": 3320
+    }
+  ],
+  "boot": {
+    "quietAfterMs": 7334,
+    "altScreenEnter": false,
+    "mouseReport": true,
+    "bracketedPaste": true,
+    "bytes": 28061,
+    "chunks": 166,
+    "initialPromptEchoed": true,
+    "initialPromptNote": "READY-0 は composer エコーにも出るため、boot-plain.txt を目視で確認する",
+    "gateSuspect": false
+  },
+  "mcp": {
+    "nonce": "473334",
+    "submittedMs": 101,
+    "ms": 12035,
+    "answered": true,
+    "sawToolName": true
+  },
+  "injectSubmitted": 10,
+  "injectAnswered": 10,
+  "readTask": {
+    "ok": true,
+    "ms": 502
+  },
+  "idle60": {
+    "totalBytes": 0,
+    "totalChunks": 0,
+    "samples": [
+      {
+        "sec": 5,
+        "bytes": 0
+      },
+      {
+        "sec": 10,
+        "bytes": 0
+      },
+      {
+        "sec": 15,
+        "bytes": 0
+      },
+      {
+        "sec": 20,
+        "bytes": 0
+      },
+      {
+        "sec": 25,
+        "bytes": 0
+      },
+      {
+        "sec": 30,
+        "bytes": 0
+      },
+      {
+        "sec": 35,
+        "bytes": 0
+      },
+      {
+        "sec": 40,
+        "bytes": 0
+      },
+      {
+        "sec": 45,
+        "bytes": 0
+      },
+      {
+        "sec": 50,
+        "bytes": 0
+      },
+      {
+        "sec": 55,
+        "bytes": 0
+      },
+      {
+        "sec": 60,
+        "bytes": 0
+      }
+    ],
+    "quietMsAtEnd": 62026,
+    "idleAt900ms": true
+  }
+}
