@@ -60,16 +60,49 @@ function tomlInlineTable(env: Record<string, string>): string {
  *   値域は auto / prompt / writes / approve で、**auto ではダイアログが出る**。
  * - env はドット記法ではなくインラインテーブルで渡す。
  */
-export function toCodexConfigArgs(spec: ControlMcpSpec): string[] {
+export function toCodexConfigArgs(
+  spec: ControlMcpSpec,
+  opts?: {
+    /**
+     * MCP サーバの起動待ち上限（秒）。未指定なら付けない（codex 既定に従う）。
+     *
+     * PR-D 実測: 開発起動（`npx tsx src/mcp/control-server.ts`）は初期化に数秒かかり、
+     * codex 既定の待ちでは間に合わずツールが「利用できない」状態のまま先へ進む
+     * （= reply_to_master が永久に飛ばない静かな故障）。明示的に広げる。
+     */
+    startupTimeoutSec?: number;
+  },
+): string[] {
   const key = `mcp_servers.${spec.name}`;
   const argsToml = `[${spec.args.map(tomlString).join(",")}]`;
-  return [
+  const args = [
     "-c", `${key}.command=${tomlString(spec.command)}`,
     "-c", `${key}.args=${argsToml}`,
     "-c", `${key}.cwd=${tomlString(spec.cwd)}`,
     "-c", `${key}.default_tools_approval_mode="approve"`,
     "-c", `${key}.env=${tomlInlineTable(spec.env)}`,
   ];
+  if (opts?.startupTimeoutSec != null) {
+    args.push("-c", `${key}.startup_timeout_sec=${opts.startupTimeoutSec}`);
+  }
+  return args;
+}
+
+/**
+ * codex 方言: フォルダ信頼を宣言する `-c projects={...}` を返す（`-c` を含む平坦な配列）。
+ * paths が空なら空配列（＝フラグを付けない）。
+ *
+ * PoC（0.146.0）実測:
+ * - これが無いと「Do you trust the contents of this directory?」ゲートで無人 spawn が停止する。
+ * - **ドット記法（`-c projects."<path>".trust_level="trusted"`）は黙って無視される**。
+ *   インラインテーブル形式で渡すこと。
+ * - worktree は git サブディレクトリ扱いなので repo root と worktree の**両方**を入れる。
+ */
+export function toCodexProjectsTrustArgs(paths: readonly string[]): string[] {
+  const uniq = [...new Set(paths.filter((p) => p.length > 0))];
+  if (uniq.length === 0) return [];
+  const body = uniq.map((p) => `${tomlString(p)}={trust_level="trusted"}`).join(",");
+  return ["-c", `projects={${body}}`];
 }
 
 /** gemini 用 system settings（`GEMINI_CLI_SYSTEM_SETTINGS_PATH` で差し込む JSON）の形。 */

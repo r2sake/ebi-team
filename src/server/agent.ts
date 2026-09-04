@@ -294,6 +294,13 @@ export interface LaunchParams {
    */
   backend?: BackendId;
   /**
+   * ready 到達後に一度だけ PTY 注入する本文（未指定なら注入しない）。
+   * `--append-system-prompt` 相当を持たないバックエンド（codex）へ役割プロンプトを
+   * 載せるために使う。位置引数で渡すと MCP 起動と競合するため、必ず ready 後に注入する
+   * （backends/codex.ts・docs/poc/codex-poc-2026-09-04.md §5）。
+   */
+  initialInject?: string | null;
+  /**
    * 制御MCP（ebi-control）の設定ファイルパス（claude 方言の JSON）。null/未指定なら制御MCP なし。
    * claude では args（--mcp-config）に既に載っているが、gemini は env 経由で渡すため
    * backend.buildEnv() にも同じ情報を渡す必要がある（PR-C）。
@@ -419,6 +426,25 @@ export class Agent {
   /** ダイアログはチャンクを跨いで描画されるため、ready 前の出力を素文で溜めて走査する（上限付き）。 */
   private gateScanBuffer = "";
 
+  // ===== 初回注入（役割プロンプト）=====
+  /** ready 後の初回注入を既に送ったか（多重送信防止）。 */
+  private initialInjectSent = false;
+
+  /**
+   * PTY への書き込み（本文 → ENTER_DELAY_MS → `\r`）を直列化するためのチェーン。
+   * sendLine は本文と Enter を時間的に分離するため、複数の注入が同時に走ると
+   * 「本文A → 本文B → EnterA → EnterB」のように混ざって 1 通目が壊れる。
+   * ready 時の初回注入（役割プロンプト）と、その直後に届くタスク本文が実際に競合する
+   * （PR-D で codex 運用時に顕在化）。claude 側でも複数送信者が同時に投げれば同じ穴がある。
+   */
+  private writeChain: Promise<void> = Promise.resolve();
+
+  /**
+   * ready 判定に使う boot 猶予(ms)。サーバ既定（MIN_BOOT_MS）に backend の
+   * readyWarmupMs（MCP ツール登録待ち等）を加算したもの。
+   */
+  private readonly bootGraceMs: number;
+
   // ===== 逆方向通知（reverse-notify）の抑制状態 =====
   /** [A] 直近に reply_to_master（kind:"reply"）を発した時刻。B の抑制判定に使う。0 は未発。 */
   private lastReplyAt = 0;
@@ -477,6 +503,7 @@ export class Agent {
     this.readyPattern = backend.readyPattern ?? null;
     this.fatalPatterns = backend.fatalPatterns ?? [];
     this.gateSpec = backend.startupGates;
+    this.bootGraceMs = MIN_BOOT_MS + (backend.readyWarmupMs ?? 0);
     this.autoAnswerStartupGates = this.gateSpec
       ? this.gateSpec.isAutoAnswerEligible(
           launch.args,
@@ -557,7 +584,7 @@ export class Agent {
     this.bootTimer = setTimeout(() => {
       this.bootTimer = null;
       this.promoteReadyIfEligible();
-    }, MIN_BOOT_MS + 50);
+    }, this.bootGraceMs + 50);
 
     // 起動ゲート待ち（degrade）の再評価タイマ。ダイアログを検知できないまま出力も止まった
     // ケースで、GATE_SETTLE_MS 満了後に確実に ready 判定をやり直す。
@@ -634,7 +661,8 @@ export class Agent {
   private promoteReadyIfEligible(): void {
     if (this.disposed || this.hasBeenReady) return;
     const elapsed = Date.now() - this.spawnedAt;
-    if (elapsed < MIN_BOOT_MS) return;
+    // boot 猶予は「サーバ既定 ＋ backend の readyWarmupMs」（codex は MCP ツール登録待ち）。
+    if (elapsed < this.bootGraceMs) return;
     // backend が「プロンプト表示」の目印を持つなら、それを見るまで ready にしない。
     // gemini は OAuth トークン再取得中（"Waiting for authentication..."）に沈黙するため、
     // 「boot 猶予＋初回 idle」だけだとそこで ready 誤昇格して 1 通目が食われる（e2e で実測）。
@@ -657,7 +685,23 @@ export class Agent {
     if (this.getStatus() !== "idle") return;
     this.hasBeenReady = true;
     this.handlers.onNotice(this.id, "ready（入力受付になりました）");
+    // 初回注入（役割プロンプト）を **ready 待ちを解放する前に**書き込みキューへ積む。
+    // 解放を先にすると、待っていた配送の本文と役割プロンプトが同時に書かれて混ざる。
+    this.sendInitialInject();
     this.resolveReadyWaiters(true);
+  }
+
+  /**
+   * ready 到達後の初回注入（役割プロンプト）を一度だけ送る。
+   * `--append-system-prompt` 相当が無い backend（codex）で、役割・セキュリティ節を
+   * 「MCP 起動完了後の 1 通目」として載せるための経路。
+   */
+  private sendInitialInject(): void {
+    const text = this.launch.initialInject?.trim();
+    if (!text || this.initialInjectSent || this.disposed) return;
+    this.initialInjectSent = true;
+    this.handlers.onNotice(this.id, "初回注入: 役割プロンプトを送信しました（ready 後）");
+    void this.enqueueWrite(text);
   }
 
   /**
@@ -861,7 +905,7 @@ export class Agent {
         guard.onSuppress?.();
         return "suppressed";
       }
-      void this.sendLine(body);
+      void this.enqueueWrite(body);
       return "sent";
     }
     this.injectQueue.push({ body, guard });
@@ -909,6 +953,18 @@ export class Agent {
   }
 
   /** 本文を stdin へ書き、ENTER_DELAY_MS 待ってから Enter(`\r`) を別 write で送って送信を確定させる。 */
+  /**
+   * 直列化キューに 1 件の書き込みを積む（前の書き込みの Enter 送信が終わるまで待つ）。
+   * 例外は握りつぶす（1 件の失敗で以降の書き込みを止めない）。
+   */
+  private enqueueWrite(body: string): Promise<void> {
+    this.writeChain = this.writeChain.then(
+      () => this.sendLine(body),
+      () => this.sendLine(body),
+    );
+    return this.writeChain;
+  }
+
   private async sendLine(body: string): Promise<void> {
     if (this.disposed) return;
     this.proc.write(body);
@@ -1017,7 +1073,7 @@ export class Agent {
         entry.guard.onSuppress?.();
         continue;
       }
-      await this.sendLine(entry.body);
+      await this.enqueueWrite(entry.body);
       sent += 1;
       // 次の件と混ざらないよう、送信確定後に間隔を空ける。
       if (this.injectQueue.length > 0) await sleep(ENTER_DELAY_MS);

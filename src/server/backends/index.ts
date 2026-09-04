@@ -5,6 +5,7 @@
 // （以前は index.ts / config.ts / registry.ts の 3 箇所に同じ式が重複していた）。
 
 import { CLAUDE_BACKEND } from "./claude.ts";
+import { CODEX_BACKEND } from "./codex.ts";
 import { GEMINI_BACKEND } from "./gemini.ts";
 import { ALL_BACKEND_IDS } from "./types.ts";
 import type { BackendId, BackendLaunchInput, EbiBackend } from "./types.ts";
@@ -30,6 +31,12 @@ export {
   detectStartupGate,
   isDevChannelsAutoAnswerEligible,
 } from "./claude.ts";
+export {
+  CODEX_BACKEND,
+  CODEX_VERIFIED_VERSION,
+  codexSandboxFor,
+  type CodexSandbox,
+} from "./codex.ts";
 export {
   GEMINI_BACKEND,
   GEMINI_DEFAULT_MODEL,
@@ -63,13 +70,14 @@ export {
 export {
   toClaudeMcpConfig,
   toCodexConfigArgs,
+  toCodexProjectsTrustArgs,
   toGeminiSystemSettings,
   type ClaudeMcpConfig,
   type GeminiSystemSettings,
 } from "./mcpSpec.ts";
 
-/** 実装済みバックエンドの一覧（解決の探索順）。codex は PR-D で追加する。 */
-export const BACKENDS: readonly EbiBackend[] = [CLAUDE_BACKEND, GEMINI_BACKEND];
+/** 実装済みバックエンドの一覧（解決の探索順）。claude / codex(PR-D) / gemini(PR-C)。 */
+export const BACKENDS: readonly EbiBackend[] = [CLAUDE_BACKEND, CODEX_BACKEND, GEMINI_BACKEND];
 
 /** 最終フォールバックのバックエンド id。 */
 export const DEFAULT_BACKEND_ID: BackendId = "claude";
@@ -133,8 +141,8 @@ export function resolveBackendOrDefault(command: string): EbiBackend {
 /**
  * バックエンド id を解決する。優先度は
  *   spawn 引数 > 役割(EbiRole) > config.defaultBackend > env EBI_BACKEND > "claude"。
- * 未実装 id（"codex" / "gemini"）・未知 id のいずれも throw する（黙って claude に落とさない）。
- * ※ PR-B 時点で実装済みなのは "claude" のみ。
+ * 未知 id は throw する（黙って claude に落とさない）。
+ * ※ PR-D 時点で claude / codex / gemini の 3 つとも実装済み。
  */
 export function resolveBackendId(sources?: {
   /** spawn 引数での明示指定。 */
@@ -163,4 +171,14 @@ export function buildLaunchArgs(command: string, input: BackendLaunchInput): str
   const backend = resolveBackend(command);
   if (!backend) return [...input.extraArgs];
   return backend.buildArgs(input);
+}
+
+/**
+ * ready 到達後に一度だけ PTY 注入する本文（役割プロンプト）を返す。
+ * `--append-system-prompt` 相当を持たない backend（codex）だけが値を返し、claude は null。
+ * command に一致する backend が無ければ null（スタブ起動の逃げ道。buildLaunchArgs と同じ規約）。
+ */
+export function initialInjectFor(command: string, input: BackendLaunchInput): string | null {
+  const backend = resolveBackend(command);
+  return backend?.initialInjectText?.(input) ?? null;
 }

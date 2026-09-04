@@ -60,6 +60,18 @@ export interface BackendLaunchInput {
   notifyMode: boolean;
   /** 追加の任意引数（config の args / EBI_ARGS 由来）。常に末尾へ付く。 */
   extraArgs: string[];
+  /**
+   * 制御MCP（ebi-control）の中立表現。設定ファイル経由ではなく**起動引数に焼く**
+   * バックエンド（codex の `-c mcp_servers.*`）が使う。null / 未指定なら制御MCP 無しで起動する。
+   * claude は mcpConfigPath（JSON ファイル）側を使うため、この値を見ない。
+   */
+  controlMcp?: ControlMcpSpec | null;
+  /**
+   * 「信頼済み」として起動時に宣言するディレクトリ（repo root と worktree の両方を渡す）。
+   * codex のフォルダ信頼ゲートを**出させない**ために使う（PoC §3.1）。
+   * 未指定なら宣言しない。claude は workspace trust ダイアログを自動応答で越えるため見ない。
+   */
+  trustPaths?: readonly string[];
 }
 
 /** pty env を組み立てるための入力。 */
@@ -155,6 +167,16 @@ export interface BackendPreflightSpec {
    * 設計書 §2.5 の deny 方針とは**逆向き**である点に注意。PoC 実測で確定）。
    */
   readonly requiredEnv: readonly string[];
+  /**
+   * 追加の実行チェック（PR-D で追加・任意項目）。
+   * ファイルの存在だけでは分からない「実際にログインできているか」を CLI に聞く
+   * （codex は `~/.codex/auth.json` があってもトークン失効で未ログインになりうる）。
+   * 出力（stdout+stderr）が okPattern に一致しなければ **error**（spawn を止める）。
+   */
+  readonly loginCheck?: {
+    readonly args: readonly string[];
+    readonly okPattern: RegExp;
+  } | null;
 }
 
 /**
@@ -242,4 +264,17 @@ export interface EbiBackend extends BackendTraits {
   readonly fatalPatterns?: readonly { readonly pattern: RegExp; readonly message: string }[];
   /** 初回タスクをコマンドの位置引数として渡せるか（渡せると注入タイミング問題が消える）。 */
   readonly supportsInitialPrompt: boolean;
+  /**
+   * ready 到達後に一度だけ PTY 注入する本文（未実装なら注入しない）。
+   * `--append-system-prompt` 相当を持たないバックエンド（codex）が、役割プロンプトを
+   * 「MCP 起動完了後の 1 通目」として送るために使う（位置引数で渡すと MCP 起動と競合する）。
+   */
+  initialInjectText?(input: BackendLaunchInput): string | null;
+  /**
+   * ready 昇格を遅らせる追加の猶予(ms)。boot 猶予（MIN_BOOT_MS）に**加算**される。
+   * 「TUI は入力を受け付けるが、MCP ツールの登録がまだ終わっていない」時間帯に 1 通目を
+   * 投げてしまうと、エビはツール無しでターンを開始する（reply_to_master が使えないまま
+   * チャットに答えて終わる＝静かな故障）。未指定なら 0（従来どおり）。
+   */
+  readonly readyWarmupMs?: number;
 }

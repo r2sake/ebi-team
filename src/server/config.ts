@@ -15,6 +15,7 @@ import type { AgentKind } from "../shared/protocol.ts";
 import type { LaunchParams } from "./agent.ts";
 import {
   buildLaunchArgs,
+  resolveBackend,
   DEFAULT_BACKEND_ID,
   PERMISSION_MODES,
   type BackendId,
@@ -286,7 +287,19 @@ function normalizeOne(raw: RawFixedEbi, configDir: string, defaults: ConfigDefau
   return {
     id,
     kind,
-    launch: { command, args, cwd, model, backend: defaults.backend ?? DEFAULT_BACKEND_ID },
+    // 固定エビの backend は **command から解決**する（サーバ既定を波及させない）。
+    // 理由: 設計上 master は常に claude（統括系を落とさない）で、EBI_BACKEND=codex のような
+    // サーバ既定をそのまま master に付けると、claude/bash のプロセスに codex の性質
+    //（readyPattern 待ち・プロセスグループ kill）が乗って ready 判定が壊れる。
+    // command がどの backend にも一致しないスタブ起動（bash 等）は既定（claude）の性質を使う
+    // ＝ 従来どおり（PR-D 時点で挙動不変）。
+    launch: {
+      command,
+      args,
+      cwd,
+      model,
+      backend: resolveBackend(command)?.id ?? defaults.backend ?? DEFAULT_BACKEND_ID,
+    },
     notifySubscribe,
   };
 }

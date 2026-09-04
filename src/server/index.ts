@@ -9,6 +9,7 @@ import {
   Registry,
   hasControlBridge,
   isNotifyMode,
+  supportsChannelInject,
   type DeliverOutcome,
   type WorktreeMeta,
 } from "./registry.ts";
@@ -17,11 +18,17 @@ import { configureDeliveryLog, deliveryLogPath, logDelivery } from "./deliveryLo
 import type { Agent, SpawnConfig, AgentHandlers, LaunchParams } from "./agent.ts";
 import {
   BASE_ALLOWED_DEV_CHANNELS,
+  DEFAULT_BACKEND_ID,
+  EBI_CONTROL_MCP_NAME,
   applyEnvDenyList,
   buildLaunchArgs,
   getBackend,
+  initialInjectFor,
   resolveBackend,
   resolveBackendId,
+  type BackendId,
+  type BackendLaunchInput,
+  type ControlMcpSpec,
 } from "./backends/index.ts";
 import { addWorktree, removeWorktree } from "./git.ts";
 import { Supervisor } from "./supervisor.ts";
@@ -132,6 +139,48 @@ const ROLE_MCP_CONFIG: Record<McpConfigRole, string> = {
 };
 // --dangerously-load-development-channels に渡す channel 指定子は backends/claude.ts が持つ
 // （EBI_CONTROL_CHANNEL_SPEC）。付与条件も含めてバックエンド実装に閉じている。
+
+/**
+ * backend 別の追加起動引数。EBI_ARGS は claude 向けの設定なので非 claude には渡さず、
+ * `EBI_CODEX_ARGS` を使う（フラグ体系が違うため取り違えると即起動失敗になる）。
+ */
+function extraArgsForBackend(id: BackendId): string[] {
+  if (id === DEFAULT_BACKEND_ID) return [...spawnConfig.args];
+  const raw = process.env[`EBI_${id.toUpperCase()}_ARGS`];
+  return raw ? raw.split(" ").filter((a) => a.length > 0) : [];
+}
+
+/**
+ * 制御MCP（ebi-control）の中立表現。設定ファイルではなく**起動引数に焼く** backend
+ * （codex の `-c mcp_servers.*`）が使う。生成規約は scripts/gen-master-mcp.mjs と同じ
+ * （dev = tsx で src、本番 = node で dist）。
+ * EBI_ID をここで焼くのは、codex では pty env 継承だけに頼れないため（PoC の起動形も同じ）。
+ */
+function controlMcpSpecFor(mcpRole: McpConfigRole, agentId: string): ControlMcpSpec {
+  const root = process.cwd();
+  // dev（src 起点）でも `npx tsx` ではなく **同じ node バイナリ ＋ tsx ローダ**で起動する。
+  // npx は解決に数秒かかり、codex の MCP 起動待ちに間に合わずツールが使えないまま
+  // セッションが始まる（= reply_to_master が飛ばない静かな故障。PR-D の e2e で実測）。
+  const server = RUNNING_FROM_SRC
+    ? {
+        command: process.execPath,
+        args: ["--import", "tsx", join(root, "src/mcp/control-server.ts")],
+      }
+    : { command: "node", args: [join(root, "dist/server/mcp/control-server.js")] };
+  return {
+    name: EBI_CONTROL_MCP_NAME,
+    command: server.command,
+    args: server.args,
+    cwd: root,
+    env: {
+      EBI_CONTROL_URL: `http://${HOST}:${PORT}`,
+      EBI_MCP_ROLE: mcpRole,
+      EBI_ID: agentId,
+      // channel 注入非対応の backend は PTY 注入で受けるため、購読ループは回さない。
+      EBI_NOTIFY_SUBSCRIBE: "off",
+    },
+  };
+}
 
 const spawnConfig: SpawnConfig = {
   command: COMMAND,
@@ -759,7 +808,6 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     ? validatePermissionMode(params.permissionMode)
     : (role?.permissionMode ?? DEFAULT_PERMISSION_MODE);
   const appendSystemPrompt = params.appendSystemPrompt ?? role?.appendSystemPrompt ?? null;
-  const model = params.model ?? role?.defaultModel ?? null;
 
   // バックエンド解決: spawn 引数 > 役割既定（PR-E で EbiRole.backend を足す）> サーバ既定
   //（サーバ既定 BACKEND_ID は config.defaultBackend / env EBI_BACKEND 解決済み）。
@@ -770,8 +818,18 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     : BACKEND_ID;
   const backend = getBackend(backendId);
 
+  // モデル名の語彙は backend ごとに別物（claude の "opus"/"sonnet" は codex では通らず、
+  // ChatGPT アカウントでは `The 'sonnet' model is not supported` で毎ターン 400 になる）。
+  // よって役割の defaultModel（claude 語彙）は claude にだけ効かせ、非 claude では
+  //   明示指定 > EBI_<ID>_MODEL > 未指定（CLI 既定モデル）
+  // の順で解決する（PR-D）。
+  const model =
+    backendId === DEFAULT_BACKEND_ID
+      ? (params.model ?? role?.defaultModel ?? null)
+      : (params.model ?? process.env[`EBI_${backendId.toUpperCase()}_MODEL`] ?? null);
+
   // 起動バイナリの解決。サーバ既定 command（EBI_COMMAND / 既定 "claude"）がその backend の
-  // ものでなければ backend の既定バイナリを使う（claude サーバから gemini エビを起動する経路）。
+  // ものでなければ backend の既定バイナリを使う（claude サーバから gemini/codex エビを起動する経路）。
   // ただし **どの backend にも一致しない command（EBI_COMMAND=bash 等のスタブ起動）は
   // そのまま尊重する**（テスト用の逃げ道を潰さないため。従来挙動と同一）。
   const serverBackend = resolveBackend(spawnConfig.command);
@@ -806,13 +864,18 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   // バックエンド固有の起動引数を組み立てる（claude なら
   // --model / --permission-mode / --append-system-prompt / --mcp-config / dev-channels）。
   const mcpConfigPath = role ? ROLE_MCP_CONFIG[role.mcpRole] : null;
-  const launchArgs = buildLaunchArgs(command, {
+  // 制御MCP の渡し方は backend の方言で異なる（claude=JSON ファイルパス / gemini=env /
+  // codex=`-c` に焼く）。どれを使うかは backend 実装が決めるので、ここでは全部渡す。
+  const launchInputFor = (trustPaths: readonly string[]): BackendLaunchInput => ({
     model,
     permissionMode,
     systemPrompt: appendSystemPrompt,
     mcpConfigPath,
+    controlMcp: role ? controlMcpSpecFor(role.mcpRole, agentId) : null,
+    // フォルダ信頼ゲートを出させないために宣言するディレクトリ（codex のみ使用）。
+    trustPaths,
     notifyMode: isNotifyMode(),
-    extraArgs: [...spawnConfig.args],
+    extraArgs: extraArgsForBackend(backendId),
   });
 
   // 起動前チェック（認証ファイル / 必須 env / CLI バージョン）。
@@ -835,15 +898,18 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
 
   // worktree なし: cwd 直指定で起動。
   if (!params.useWorktree) {
+    const input = launchInputFor([cwd]);
     const launch: LaunchParams = {
       command,
-      args: launchArgs,
+      args: buildLaunchArgs(command, input),
       cwd,
       model,
       env: launchEnv,
       backend: backendId,
       mcpConfigPath,
       systemPrompt: appendSystemPrompt,
+      // 役割プロンプトを起動引数で渡せない backend（codex）は ready 後に PTY 注入する。
+      initialInject: initialInjectFor(command, input),
     };
     const agent = registry.spawn(cwd, handlers, { id: agentId, kind: params.kind, role: role?.id, launch });
     watchEarlyExit(agent, backend, params);
@@ -859,15 +925,19 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
 
   const wt = await addWorktree(repoPath, branch);
   if (wt.reused) broadcast({ type: "notice", id: agentId, text: wt.reused });
+  // worktree は git のサブディレクトリ扱いなので、repo root と worktree の**両方**を
+  // 信頼済みとして宣言する（codex のフォルダ信頼ゲート対策・PoC §3.1）。
+  const input = launchInputFor([wt.repoTop, wt.worktreePath]);
   const launch: LaunchParams = {
     command,
-    args: launchArgs,
+    args: buildLaunchArgs(command, input),
     cwd: wt.worktreePath,
     model,
     env: launchEnv,
     backend: backendId,
     mcpConfigPath,
     systemPrompt: appendSystemPrompt,
+    initialInject: initialInjectFor(command, input),
   };
   const agent = registry.spawn(wt.worktreePath, handlers, {
     id: agentId,
@@ -1057,7 +1127,15 @@ async function sendMessage(params: SendMessageParams): Promise<SendMessageResult
   // ただし notifySubscribe:false のエビ（外部チャンネル待機セッション minaebi 等・受信 PTY 固定）は
   // この経路に入らず PTY 注入へ直行する。自セッションに ebi-control channel を登録しないため
   // notification は harness に黙って捨てられる＝購読は永遠に確立せず、待つだけ無駄になるため。
-  if (registry.notifyEnabled() && hasControlBridge(agent) && agent.notifySubscribe !== false) {
+  // さらに、backend が channel 注入に対応しない場合（codex）もこの経路へ入らない。
+  // 制御MCP ブリッジは持つ（reply_to_master は使える）が、受信側の channel が無いため
+  // 購読は永遠に確立せず、待つだけ無駄になる。
+  if (
+    registry.notifyEnabled() &&
+    hasControlBridge(agent) &&
+    supportsChannelInject(agent) &&
+    agent.notifySubscribe !== false
+  ) {
     const subscribed =
       registry.hasActiveSubscriber(to) || (await registry.waitForSubscriber(to, SUBSCRIBE_WAIT_MS));
     if (subscribed) {

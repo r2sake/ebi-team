@@ -19,6 +19,7 @@ import {
   EBI_CONTROL_MCP_NAME,
   IMPLEMENTED_BACKEND_IDS,
   applyEnvDenyList,
+  backendIdError,
   evaluatePreflight,
   expandHome,
   getBackend,
@@ -290,21 +291,22 @@ test("envDenyList は ebi-team 自身が渡す env（launch.env / backend 既定
 
 // ===== 5. 未実装 / 未知 backend =====
 
-// PR-C で gemini が実装済みになった（codex は PR-D で実装される）。
-test("実装済みは claude / gemini・型としては codex も既知", () => {
-  assert.deepEqual([...IMPLEMENTED_BACKEND_IDS], ["claude", "gemini"]);
+// PR-C で gemini、PR-D で codex が実装済みになり、3 backend とも実装済みになった。
+test("実装済みは claude / codex / gemini の 3 つ", () => {
+  assert.deepEqual([...IMPLEMENTED_BACKEND_IDS], ["claude", "codex", "gemini"]);
   assert.deepEqual([...ALL_BACKEND_IDS], ["claude", "codex", "gemini"]);
+  assert.equal(isImplementedBackendId("codex"), true);
   assert.equal(isImplementedBackendId("gemini"), true);
-  assert.equal(isImplementedBackendId("codex"), false);
   assert.equal(isKnownBackendId("codex"), true);
   assert.equal(isKnownBackendId("gpt"), false);
 });
 
-test("未実装 backend の明示指定は『未実装』と分かるエラーになる（claude に落とさない）", () => {
-  for (const id of ["codex"]) {
-    assert.throws(() => resolveBackendId({ explicit: id }), /未実装/, `${id} が throw しない`);
-    assert.throws(() => getBackend(id as "codex"), /未実装/);
-  }
+test("型としては既知だが未実装の backend は『未実装』と分かるエラー文言になる", () => {
+  // PR-D 時点で ALL_BACKEND_IDS はすべて実装済みなので、実際に throw させる id が無い。
+  // ここで固定するのは**文言の分岐**（既知だが未実装 / そもそも知らない id）で、
+  // 将来 BackendId を先に足して実装が後追いになったときに「黙って claude に落ちない」ことを守る。
+  assert.match(backendIdError("gemini").message, /未実装/);
+  assert.match(backendIdError("gpt").message, /backend が不正です/);
 });
 
 test("未知 backend の指定は『不正』エラーになる", () => {
@@ -344,9 +346,10 @@ test("idleThresholdMs: 3 backend とも上書きなし＝サーバ既定 900ms�
   assert.equal(resolveIdleThresholdMs(2000, 900), 2000);
 });
 
-test("killProcessGroup: gemini のみ true（子 node の再 exec で孤児が残るため）", () => {
+test("killProcessGroup: 非 claude は true（子 MCP / 再 exec した node の孤児を残さない）", () => {
   assert.equal(BACKEND_TRAITS.claude.killProcessGroup, false);
-  assert.equal(BACKEND_TRAITS.codex.killProcessGroup, false);
+  // codex は組込み MCP codex_apps ＋ ebi-control の 2 本が子で立つ（PR-D）。
+  assert.equal(BACKEND_TRAITS.codex.killProcessGroup, true);
   assert.equal(BACKEND_TRAITS.gemini.killProcessGroup, true);
 });
 

@@ -33,7 +33,10 @@ const versionCache = new Map<string, string | null>();
 export function needsPreflight(backend: EbiBackend): boolean {
   const spec = backend.preflight;
   return (
-    spec.requiredFiles.length > 0 || spec.requiredEnv.length > 0 || spec.verifiedVersion !== null
+    spec.requiredFiles.length > 0 ||
+    spec.requiredEnv.length > 0 ||
+    spec.verifiedVersion !== null ||
+    spec.loginCheck != null
   );
 }
 
@@ -74,10 +77,40 @@ export async function runPreflight(
 ): Promise<PreflightResult> {
   const spec = backend.preflight;
   const version = await probeVersion(opts.command, spec.versionArgs);
-  return evaluatePreflight(spec, {
+  const result = evaluatePreflight(spec, {
     home: homedir(),
     fileExists: (path) => existsSync(path),
     env: opts.env,
     version,
   });
+
+  // 追加の実行チェック（codex の `codex login status`）。
+  // 認証ファイルがあっても失効していることがあるため、CLI 自身に聞くのが確実。
+  // キャッシュしないのは、失効はサーバ寿命の途中でも起きるため（1 回 300ms 程度）。
+  if (spec.loginCheck) {
+    const out = await probeCommand(opts.command, spec.loginCheck.args);
+    if (out === null || !spec.loginCheck.okPattern.test(out)) {
+      result.errors.push(
+        `ログインが確認できません（${opts.command} ${spec.loginCheck.args.join(" ")}` +
+          `${out === null ? " が失敗" : `: ${out}`}）`,
+      );
+      result.ok = false;
+    }
+  }
+  return result;
+}
+
+/**
+ * `<command> <args>` を実行し、**stdout と stderr を連結した** trim 済み出力を返す。失敗なら null。
+ * stderr も見るのは `codex login status` が結果を stderr に書くため（0.146.0 実測）。
+ */
+async function probeCommand(command: string, args: readonly string[]): Promise<string | null> {
+  try {
+    const { stdout, stderr } = await execFileAsync(command, [...args], {
+      timeout: VERSION_TIMEOUT_MS,
+    });
+    return `${stdout}${stderr}`.trim();
+  } catch {
+    return null;
+  }
 }

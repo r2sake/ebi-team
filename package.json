@@ -26,6 +26,7 @@
     "e2e:delivery-hardening": "node scripts/e2e-delivery-hardening.mjs",
     "e2e:spawn-delivery": "node scripts/e2e-spawn-delivery.mjs",
     "e2e:usage": "node scripts/e2e-usage.mjs",
+    "e2e:codex": "node scripts/e2e-codex-engineer.mjs",
     "e2e:context-guard": "node scripts/e2e-context-guard.mjs",
     "e2e:gemini": "node scripts/e2e-gemini-engineer.mjs",
     "e2e:viewer": "node --import tsx scripts/e2e-viewer.mjs",
