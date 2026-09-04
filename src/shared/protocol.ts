@@ -31,11 +31,13 @@ export type AgentKind = "master" | "supervisor" | "dynamic";
 export type AgentMode = "connected" | "isolated";
 
 /**
- * viewer（md/txt プレビュー）の表示フォーマット。
+ * viewer（md/txt/画像プレビュー）の表示フォーマット。
  * - md: 軽量 markdown レンダラで整形表示（見出し/箇条書き/コード/表 等）。
  * - txt: 生テキストを等幅で表示（.txt はレンダリングしない）。
+ * - image: 画像（.png/.jpg/.jpeg/.webp/.gif）。バイト列は content に載せず、
+ *   `GET /control/viewer-file?id=<viewer id>` から取得して <img> で表示する。
  */
-export type ViewerFormat = "md" | "txt";
+export type ViewerFormat = "md" | "txt" | "image";
 
 /**
  * viewer（読み取り専用の md/txt プレビュー）1 件分のスキーマ。
@@ -52,7 +54,11 @@ export interface ViewerRecord {
   title: string;
   /** レンダリング形式（拡張子から判定）。 */
   format: ViewerFormat;
-  /** ファイル内容（open 時点のスナップショット・UTF-8）。 */
+  /**
+   * ファイル内容（open 時点のスナップショット・UTF-8）。
+   * `format === "image"` のときは常に空文字（バイナリは WS ペイロードに載せず、
+   * `GET /control/viewer-file?id=` で別途配信する）。
+   */
   content: string;
   /**
    * 開いた時刻（epoch ms）。viewers.json への永続化・再起動後の並び順復元に使う。
@@ -72,7 +78,7 @@ export interface DirEntry {
   path: string;
   /** 種別。 */
   type: "dir" | "file";
-  /** ファイルのとき、viewer で開ける拡張子（.md/.markdown/.txt）か。ディレクトリでは undefined。 */
+  /** ファイルのとき、viewer で開ける拡張子（.md/.markdown/.txt/画像）か。ディレクトリでは undefined。 */
   eligible?: boolean;
 }
 

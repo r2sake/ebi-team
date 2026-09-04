@@ -155,6 +155,12 @@ export interface ControlDeps {
    * 検証失敗（許可ルート外/拡張子/サイズ/不存在）は throw（呼び出し側で 400 に振り分ける）。
    */
   openViewer: (path: string, title?: string) => Promise<ViewerRecord>;
+  /**
+   * 画像 viewer のバイト列を読む（`GET /control/viewer-file?id=` の実体）。
+   * 受けるのは **登録済み viewer の id だけ**（生パスは受けない＝新しいパストラバーサル入口を作らない）。
+   * 未登録 id・画像以外は null（404）。許可ルート外/サイズ超過などの検証失敗は throw（400）。
+   */
+  readViewerFile: (id: string) => Promise<{ bytes: Buffer; mime: string; path: string } | null>;
 }
 
 /** JSON レスポンスを返すヘルパー。 */
@@ -280,6 +286,40 @@ export function createControlApi(deps: ControlDeps) {
           // パス検証エラー（許可ルート外/拡張子/サイズ/不存在）は 400 で理由を返す。
           sendJson(res, 400, { error: (err as Error).message });
         }
+        return true;
+      }
+
+      // ---- GET /control/viewer-file?id=viewer-N ----
+      // 画像 viewer のバイナリ配信（読み取り専用）。クライアントの <img src> がここを叩く。
+      // 認証ゲート（index.ts）を通った後にしか到達しない。id 参照のみで生パスは受け取らない。
+      if (pathname === "/control/viewer-file" && method === "GET") {
+        const id = query.get("id");
+        if (!id) {
+          sendJson(res, 400, { error: "id（クエリ）は必須です" });
+          return true;
+        }
+        let file: { bytes: Buffer; mime: string; path: string } | null;
+        try {
+          file = await deps.readViewerFile(id);
+        } catch (err) {
+          // 許可ルート外・サイズ超過・実体消失など（open 後に差し替えられた場合を含む）。
+          sendJson(res, 400, { error: (err as Error).message });
+          return true;
+        }
+        if (!file) {
+          sendJson(res, 404, { error: `画像 viewer が見つかりません: ${id}` });
+          return true;
+        }
+        res.writeHead(200, {
+          "Content-Type": file.mime,
+          "Content-Length": String(file.bytes.length),
+          // ブラウザに MIME を推測させない（拡張子由来の Content-Type を強制）。
+          "X-Content-Type-Options": "nosniff",
+          "Content-Disposition": "inline",
+          // 同じ id で開き直したときに古い画像が残らないようにする。
+          "Cache-Control": "no-store",
+        });
+        res.end(file.bytes);
         return true;
       }
 

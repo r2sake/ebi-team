@@ -401,14 +401,18 @@ server.tool(
   },
 );
 
-// ---- open_viewer: md/txt ファイルを読み取り専用パネルとして UI に開く（master 専用）----
+// ---- open_viewer: md/txt/画像ファイルを読み取り専用パネルとして UI に開く（master 専用）----
 server.tool(
   "open_viewer",
-  "指定した md/txt ファイルを、UI の読み取り専用プレビュー（viewer）として開く。" +
-    "レビュー用のプランやレポートをユーザーに『見せる』ための明示操作。開くと自動でそのパネルに切り替わる。" +
-    "パスは許可ルート（既定 $HOME/workspace・EBI_VIEWER_ROOTS で設定）配下の .md/.markdown/.txt のみ。",
+  "指定した md/txt/画像ファイルを、UI の読み取り専用プレビュー（viewer）として開く。" +
+    "レビュー用のプランやレポート、エビが生成した画像をユーザーに『見せる』ための明示操作。" +
+    "開くと自動でそのパネルに切り替わる。" +
+    "パスは許可ルート（既定 $HOME/workspace・EBI_VIEWER_ROOTS で設定）配下の " +
+    ".md/.markdown/.txt/.png/.jpg/.jpeg/.webp/.gif のみ。",
   {
-    path: z.string().describe("開くファイルの絶対パス（許可ルート配下の .md/.markdown/.txt）"),
+    path: z
+      .string()
+      .describe("開くファイルの絶対パス（許可ルート配下の .md/.markdown/.txt/.png/.jpg/.jpeg/.webp/.gif）"),
     title: z.string().optional().describe("表示タイトル（未指定はファイル名）"),
   },
   async ({ path, title }) => {

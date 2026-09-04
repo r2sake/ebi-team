@@ -469,6 +469,22 @@ button:hover { filter: brightness(1.07); }
 }
 .viewer-empty { color: var(--muted); font-size: 12px; }
 
+/* 画像 viewer（バイト列は /control/viewer-file から取得）。 */
+.viewer-body.image { display: flex; align-items: flex-start; justify-content: center; }
+.viewer-img {
+  max-width: 100%;
+  height: auto;
+  /* 透過 PNG が背景に溶けないよう市松模様を敷く。 */
+  background-color: #ffffff;
+  background-image:
+    linear-gradient(45deg, #e8e8e8 25%, transparent 25%, transparent 75%, #e8e8e8 75%),
+    linear-gradient(45deg, #e8e8e8 25%, transparent 25%, transparent 75%, #e8e8e8 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 8px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
 /* .txt は等幅の生テキスト。 */
 .viewer-txt {
   margin: 0;

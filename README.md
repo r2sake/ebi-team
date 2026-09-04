@@ -217,16 +217,17 @@ Slack / Discord などの外部チャンネルに常駐する「待機・秘書�
 
 ルーティングは既存基盤の流用です（新規プロトコルなし）: 外部 → 中継エビ → `reply_to_master` → master（`[from:...]` タグ付き） / master → `send_message`（PTY 注入）→ 中継エビ → 自身の channel reply で外部へ返信。
 
-### md/txt ビューア (viewer)
+### md/txt/画像ビューア (viewer)
 
-統括役（master）がレビュー用のプランやレポート（md/txt）を UI に「見せる」ための **読み取り専用ビューア**です。master 専用の MCP ツール `open_viewer({ path, title? })` で開くと、REGISTRY サイドバーに `📄 <タイトル>` 行が現れ、メイン領域にプレビューが表示されます（開いた瞬間は自動でそのビューアに切り替わります）。行またはパネルヘッダの `✕` で閉じます。
+統括役（master）がレビュー用のプランやレポート（md/txt）、エビが生成した画像を UI に「見せる」ための **読み取り専用ビューア**です。master 専用の MCP ツール `open_viewer({ path, title? })` で開くと、REGISTRY サイドバーに `📄 <タイトル>`（画像は `🖼 <タイトル>`）行が現れ、メイン領域にプレビューが表示されます（開いた瞬間は自動でそのビューアに切り替わります）。行またはパネルヘッダの `✕` で閉じます。
 
 - **レンダリング**: 外部ライブラリを使わない依存ゼロの軽量レンダラで、見出し・箇条書き/番号リスト・コードブロック・インライン code・bold/italic・引用・水平線・表・リンクを描画します（`.txt` は等幅の生テキスト）。
 - **安全性**: 生成は `createElement` / `textContent` のみで行い、`innerHTML` に生コンテンツを入れません。md 中に含まれる HTML タグ（`<script>` 等）は文字列として表示され、実行されません。
-- **アクセス範囲**: 開けるのは許可ルート配下の `.md` / `.markdown` / `.txt` のみ（読み取り専用・サイズ上限あり・シンボリックリンクの脱出は `realpath` で防止）。許可ルートは環境変数 `EBI_VIEWER_ROOTS`（`:` 区切り・未設定時の既定は `$HOME/workspace`）で設定します。上限は `EBI_VIEWER_MAX_BYTES`（既定 1MB）。
+- **画像**: `.png` / `.jpg` / `.jpeg` / `.webp` / `.gif` を `<img>` で表示します（透過 PNG は市松模様の背景で確認できます）。バイト列は WS の `viewers` ブロードキャストには載せず（`content` は空文字）、サーバの読み取り専用エンドポイント `GET /control/viewer-file?id=<viewer id>` から配信します。クライアントが渡すのは **viewer id だけ**（生パスは渡さない）で、配信のたびに許可ルート・`realpath`・サイズを再検証し、`Content-Type` は拡張子から決めて `X-Content-Type-Options: nosniff` / `Cache-Control: no-store` を付けます。`.svg` はスクリプトを埋め込めるため対象外です。
+- **アクセス範囲**: 開けるのは許可ルート配下の `.md` / `.markdown` / `.txt` / 上記の画像拡張子のみ（読み取り専用・サイズ上限あり・シンボリックリンクの脱出は `realpath` で防止）。許可ルートは環境変数 `EBI_VIEWER_ROOTS`（`:` 区切り・未設定時の既定は `$HOME/workspace`）で設定します。上限はテキストが `EBI_VIEWER_MAX_BYTES`（既定 1MB）、画像が `EBI_VIEWER_MAX_IMAGE_BYTES`（既定 8MB）と別枠です。
 - **永続化（再起動後の復元）**: 開いているビューアは `.ebi-team/viewers.json`（`EBI_VIEWERS_PATH` で変更可・gitignore 対象）へ open/close のたびに atomic 保存され、サーバ再起動時に同じタブが復元されます。保存するのは `{id, path, title, openedAt}` のみで、本文は復元時にファイルから読み直します（＝再起動後は最新の内容が表示されます）。復元時にファイルが消えている／許可ルート外になっているエントリは警告ログを出して読み飛ばし、`viewers.json` からも掃除します（起動は止めません）。
 
-> **運用原則**: 統括役（master）がユーザーへ md/txt の成果物・プラン・レポートを提示するときは、**原則 `open_viewer` で UI に表示する**。「どう表示しましょうか」と表示方法を質問する前に、まず `open_viewer` で開いて見せること。ターミナルへの全文貼り付けは、ユーザーが明示的に望んだ場合に限る。
+> **運用原則**: 統括役（master）がユーザーへ md/txt/画像の成果物・プラン・レポートを提示するときは、**原則 `open_viewer` で UI に表示する**。「どう表示しましょうか」と表示方法を質問する前に、まず `open_viewer` で開いて見せること。ターミナルへの全文貼り付けは、ユーザーが明示的に望んだ場合に限る。
 
 ### master コンテキスト枯渇ガード (context-guard)
 

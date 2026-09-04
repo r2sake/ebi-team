@@ -458,7 +458,8 @@ function renderRegistry(): void {
     const td = document.createElement("td");
     td.colSpan = 5;
     td.className = "viewer-row-label";
-    td.append(document.createTextNode(`📄 ${v.title}`));
+    // 画像 viewer は一覧でも一目で分かるようアイコンを変える（パネル側と揃える）。
+    td.append(document.createTextNode(`${v.format === "image" ? "🖼" : "📄"} ${v.title}`));
 
     // ✗（閉じる）セル。行選択へ伝播させない。
     const closeTd = document.createElement("td");
