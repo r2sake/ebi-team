@@ -14,10 +14,13 @@ import {
 } from "./registry.ts";
 import { Mailbox } from "./mailbox.ts";
 import { configureDeliveryLog, deliveryLogPath, logDelivery } from "./deliveryLog.ts";
-import type { SpawnConfig, AgentHandlers, LaunchParams } from "./agent.ts";
+import type { Agent, SpawnConfig, AgentHandlers, LaunchParams } from "./agent.ts";
 import {
   BASE_ALLOWED_DEV_CHANNELS,
+  applyEnvDenyList,
   buildLaunchArgs,
+  getBackend,
+  resolveBackend,
   resolveBackendId,
 } from "./backends/index.ts";
 import { addWorktree, removeWorktree } from "./git.ts";
@@ -31,6 +34,7 @@ import {
 } from "./config.ts";
 import { EBI_ROLES, resolveRole, registerCustomRoles } from "./roles.ts";
 import { isRunningFromSrc, mcpConfigPathFor, type McpConfigRole } from "./mcpConfigPath.ts";
+import { needsPreflight, runPreflight } from "./backendPreflight.ts";
 import { FixedEbiManager, applyMasterMcpConfig } from "./fixedEbi.ts";
 import { configureFixedEbiLog, fixedEbiLogPath } from "./fixedEbiLog.ts";
 import { NoticeBuffer, DEFAULT_NOTICE_BUFFER_SIZE } from "./noticeBuffer.ts";
@@ -739,7 +743,6 @@ async function handleSpawn(ws: WebSocket, msg: SpawnMessage): Promise<void> {
  */
 async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   const cwd = params.cwd && params.cwd.trim() ? params.cwd.trim() : DEFAULT_CWD;
-  const command = spawnConfig.command;
 
   // 役割（EBI_ROLES）を解決する。後方互換: asEngineer=true は role="engineer" と等価。
   // 未知の role 文字列は 400 相当のエラーにする（黙って素の dynamic にしない）。
@@ -765,6 +768,17 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   const backendId = params.backend
     ? resolveBackendId({ explicit: params.backend })
     : BACKEND_ID;
+  const backend = getBackend(backendId);
+
+  // 起動バイナリの解決。サーバ既定 command（EBI_COMMAND / 既定 "claude"）がその backend の
+  // ものでなければ backend の既定バイナリを使う（claude サーバから gemini エビを起動する経路）。
+  // ただし **どの backend にも一致しない command（EBI_COMMAND=bash 等のスタブ起動）は
+  // そのまま尊重する**（テスト用の逃げ道を潰さないため。従来挙動と同一）。
+  const serverBackend = resolveBackend(spawnConfig.command);
+  const command =
+    serverBackend === null || serverBackend.id === backendId
+      ? spawnConfig.command
+      : backend.defaultCommand;
 
   // 役割付きなら ebi-control MCP（最小権限・reply_to_master 等）を追加する。
   // 「どのフラグをどう付けるか」はバックエンド実装（backends/claude.ts の buildArgs）に閉じており、
@@ -791,14 +805,33 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
 
   // バックエンド固有の起動引数を組み立てる（claude なら
   // --model / --permission-mode / --append-system-prompt / --mcp-config / dev-channels）。
+  const mcpConfigPath = role ? ROLE_MCP_CONFIG[role.mcpRole] : null;
   const launchArgs = buildLaunchArgs(command, {
     model,
     permissionMode,
     systemPrompt: appendSystemPrompt,
-    mcpConfigPath: role ? ROLE_MCP_CONFIG[role.mcpRole] : null,
+    mcpConfigPath,
     notifyMode: isNotifyMode(),
     extraArgs: [...spawnConfig.args],
   });
+
+  // 起動前チェック（認証ファイル / 必須 env / CLI バージョン）。
+  // 確認すべきことを 1 つも持たない backend（claude）では実行されない＝外形ゼロ差分。
+  // errors があれば spawn を止めて明示エラーにする（起動即死 → crashloop より原因が分かる）。
+  if (needsPreflight(backend)) {
+    const pf = await runPreflight(backend, {
+      command,
+      env: applyEnvDenyList(process.env, backend.envDenyList),
+    });
+    for (const w of pf.warnings) {
+      console.warn(`[preflight:${backendId}] 警告: ${w}`);
+    }
+    if (!pf.ok) {
+      throw new Error(
+        `backend "${backendId}" の起動前チェックに失敗しました: ${pf.errors.join(" / ")}`,
+      );
+    }
+  }
 
   // worktree なし: cwd 直指定で起動。
   if (!params.useWorktree) {
@@ -809,8 +842,11 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
       model,
       env: launchEnv,
       backend: backendId,
+      mcpConfigPath,
+      systemPrompt: appendSystemPrompt,
     };
     const agent = registry.spawn(cwd, handlers, { id: agentId, kind: params.kind, role: role?.id, launch });
+    watchEarlyExit(agent, backend, params);
     broadcast({ type: "spawned", agent: agent.toRecord() });
     broadcastRegistry();
     return agent.id;
@@ -830,6 +866,8 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     model,
     env: launchEnv,
     backend: backendId,
+    mcpConfigPath,
+    systemPrompt: appendSystemPrompt,
   };
   const agent = registry.spawn(wt.worktreePath, handlers, {
     id: agentId,
@@ -840,9 +878,57 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     worktreeRepo: wt.repoTop,
     worktreePath: wt.worktreePath,
   });
+  watchEarlyExit(agent, backend, params);
   broadcast({ type: "spawned", agent: agent.toRecord() });
   broadcastRegistry();
   return agent.id;
+}
+
+/**
+ * ready 到達前の予期せぬ exit を 1 回だけ再試行する（backend.retryOnEarlyExit が true のとき）。
+ *
+ * 非ブロッキング（spawn の応答は待たせない）。判定は
+ *   「READY_WAIT_MS 以内に ready にならず、かつ registry から消えている（= exit 済み）」
+ * で行う。ready 待ちタイムアウトだけ（プロセスは生きている）では再試行しない
+ * ——生きているエビを二重起動しないため。
+ * 2 回目も ready 前に落ちたら notice で明示する（黙って消えるのが一番困る）。
+ */
+function watchEarlyExit(
+  agent: Agent,
+  backend: ReturnType<typeof getBackend>,
+  params: GeneralizedSpawnParams,
+): void {
+  if (!backend.retryOnEarlyExit) return;
+  const agentId = agent.id;
+  void (async () => {
+    const ready = await agent.waitUntilReady(READY_WAIT_MS);
+    if (ready) return;
+    // まだ registry に居る＝プロセスは生きている（単なる ready 待ちタイムアウト）。何もしない。
+    if (registry.get(agentId) === agent) return;
+    if (params.retryOfEarlyExit) {
+      broadcast({
+        type: "notice",
+        id: agentId,
+        text: `${agentId}（backend=${backend.id}）が ready 前に再び終了しました。再試行は打ち切ります（起動条件を確認してください）`,
+      });
+      console.error(`[spawn:${backend.id}] ${agentId} が ready 前に 2 回終了しました`);
+      return;
+    }
+    broadcast({
+      type: "notice",
+      id: agentId,
+      text: `${agentId}（backend=${backend.id}）が ready 前に終了しました。1 回だけ再起動します`,
+    });
+    try {
+      await spawnAgent({ ...params, id: agentId, retryOfEarlyExit: true });
+    } catch (err) {
+      broadcast({
+        type: "notice",
+        id: agentId,
+        text: `${agentId} の再起動に失敗しました: ${(err as Error).message}`,
+      });
+    }
+  })();
 }
 
 /** sendMessage の入力パラメータ。 */

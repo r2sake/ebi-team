@@ -51,6 +51,11 @@ export interface GeneralizedSpawnParams {
    * role 未指定かつ true のとき role="engineer" と等価に扱う（index.ts 側で読み替え）。
    */
   asEngineer?: boolean;
+  /**
+   * 内部用（制御API からは受け取らない）。ready 前の予期せぬ exit による再試行での spawn か。
+   * true の spawn はそれ以上再試行しない（無限リトライ防止）。
+   */
+  retryOfEarlyExit?: boolean;
 }
 
 /** 要約結果（control.ts は supervisor.ts の型に依存しないよう最小形で受ける）。 */

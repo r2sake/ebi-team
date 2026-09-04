@@ -64,6 +64,35 @@ const GATE_WINDOW_MS = Number(process.env.EBI_GATE_WINDOW_MS) || 90000;
 const GATE_SETTLE_MS = Number(process.env.EBI_GATE_SETTLE_MS) || 20000;
 
 /**
+ * プロセスグループ kill（killProcessGroup=true の backend）で、SIGTERM から SIGKILL までの猶予(ms)。
+ * gemini は PTY リーダの下に「再 exec した子 node」と「その配下の stdio MCP」を持つため、
+ * PTY を閉じるだけでは孤児が残る（PoC で 7 セッション分 21 プロセスの残存を実測）。
+ * まずグループへ SIGTERM を送って正規の終了処理をさせ、居残りをこの猶予後に SIGKILL で刈る。
+ * env `EBI_GROUP_KILL_GRACE_MS` で調整可。
+ */
+const GROUP_KILL_GRACE_MS = Number(process.env.EBI_GROUP_KILL_GRACE_MS) || 2000;
+
+/**
+ * プロセスグループへシグナルを送る（pty の子は forkpty により setsid 済み＝pid がそのまま pgid）。
+ * 既に死んでいる（ESRCH）等は無視する。送れたら true。
+ * 純粋な副作用ヘルパとして切り出してあるのは、単体テストで「グループ kill が呼ばれたか」だけを
+ * 差し替えて確認できるようにするため。
+ */
+export function killProcessGroupSignal(
+  pid: number,
+  signal: NodeJS.Signals,
+  killer: (target: number, sig: NodeJS.Signals) => void = (t, sg) => process.kill(t, sg),
+): boolean {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  try {
+    killer(-pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * PTY 注入の結果。
  * - "sent": 今この場で stdin へ書いた（相手の入力欄に入った）
  * - "queued": 相手が busy のため injectQueue に滞留した（idle 復帰時に flush される。
@@ -262,9 +291,19 @@ export interface LaunchParams {
   /**
    * このエビを動かすバックエンド id（起動引数/env/起動ゲート/通信路の性質を決める）。
    * 未指定なら command から解決する（さらに一致しなければ既定 "claude"）。
-   * PR1 時点で実装済みの値は "claude" のみ。
    */
   backend?: BackendId;
+  /**
+   * 制御MCP（ebi-control）の設定ファイルパス（claude 方言の JSON）。null/未指定なら制御MCP なし。
+   * claude では args（--mcp-config）に既に載っているが、gemini は env 経由で渡すため
+   * backend.buildEnv() にも同じ情報を渡す必要がある（PR-C）。
+   */
+  mcpConfigPath?: string | null;
+  /**
+   * 役割注入プロンプト。claude では args（--append-system-prompt）に載っているが、
+   * gemini は per-エビ GEMINI.md 経由で渡すため buildEnv にも渡す（PR-C）。
+   */
+  systemPrompt?: string | null;
 }
 
 /** Agent からのイベントを購読するためのコールバック束。 */
@@ -311,6 +350,20 @@ export class Agent {
   readonly model: string | null = null;
   /** このエビを動かしているバックエンド id（PR1 時点では常に "claude"）。 */
   readonly backend: BackendId;
+  /** kill 時にプロセスグループごと落とすか（backend のトレイト。gemini のみ true）。 */
+  private readonly killProcessGroup: boolean;
+  /**
+   * 「入力受付（プロンプト表示）」を示す出力パターン（backend のトレイト。null なら従来判定）。
+   * これを持つ backend は、パターンを一度も見ていない間は ready へ昇格しない。
+   */
+  private readonly readyPattern: RegExp | null;
+  /** readyPattern を検出済みか。 */
+  private readyPatternSeen = false;
+  /** readyPattern 走査用の素文リングバッファ。 */
+  private readyScanBuffer = "";
+  /** 起動フェーズの致命エラー文言（backend のトレイト）。検出済みのものは二度出さない。 */
+  private readonly fatalPatterns: readonly { readonly pattern: RegExp; readonly message: string }[];
+  private readonly reportedFatals = new Set<string>();
   /**
    * 起動に使った実パラメータ。自動再起動（固定エビ）でそのまま再 spawn するために保持する。
    */
@@ -420,6 +473,9 @@ export class Agent {
       ? getBackend(launch.backend)
       : resolveBackendOrDefault(launch.command);
     this.backend = backend.id;
+    this.killProcessGroup = backend.killProcessGroup;
+    this.readyPattern = backend.readyPattern ?? null;
+    this.fatalPatterns = backend.fatalPatterns ?? [];
     this.gateSpec = backend.startupGates;
     this.autoAnswerStartupGates = this.gateSpec
       ? this.gateSpec.isAutoAnswerEligible(
@@ -438,11 +494,19 @@ export class Agent {
     // 引数配列方式で起動（シェル非経由）。長文の --append-system-prompt も安全に渡る。
     // launch.env があれば親 env にマージする（engineer の EBI_ID 等。子の stdio MCP が継承する）。
     // さらに TUI をインライン描画させる既定 env を最下位優先で敷く（xterm.js のスクロール確保）。
+    // inlineTui の on/off は backend.buildEnv() へ渡して backend に判断させる
+    // （claude は off なら空を返す＝従来と同一。gemini の system settings パスのように
+    //   「TUI 描画ではなく起動の必須条件」である env まで落とさないため）。
     const spawnEnv = buildSpawnEnv(
       process.env,
       launch.env,
-      INLINE_TUI_ENABLED,
-      backend.buildEnv({ agentId: id }),
+      true,
+      backend.buildEnv({
+        agentId: id,
+        inlineTui: INLINE_TUI_ENABLED,
+        mcpConfigPath: launch.mcpConfigPath ?? null,
+        systemPrompt: launch.systemPrompt ?? null,
+      }),
       backend.envDenyList,
     );
     this.proc = pty.spawn(launch.command, launch.args, {
@@ -465,6 +529,8 @@ export class Agent {
       if (meaningful.length === 0) return;
       // 起動フェーズ（ready 前）の対話ダイアログへ自動応答（安全限定つき）。
       this.maybeAnswerStartupGates(meaningful);
+      this.maybeMarkReadyPattern(meaningful);
+      this.maybeReportFatal(meaningful);
       this.detector.notifyOutput();
       this.appendScrollback(meaningful);
       this.handlers.onData(this.id, meaningful);
@@ -569,6 +635,10 @@ export class Agent {
     if (this.disposed || this.hasBeenReady) return;
     const elapsed = Date.now() - this.spawnedAt;
     if (elapsed < MIN_BOOT_MS) return;
+    // backend が「プロンプト表示」の目印を持つなら、それを見るまで ready にしない。
+    // gemini は OAuth トークン再取得中（"Waiting for authentication..."）に沈黙するため、
+    // 「boot 猶予＋初回 idle」だけだとそこで ready 誤昇格して 1 通目が食われる（e2e で実測）。
+    if (this.readyPattern !== null && !this.readyPatternSeen) return;
     // 起動ゲート自動応答が有効な agent は、dev-channels ダイアログへ応答するまで ready にしない。
     // ダイアログはセッションを入力待ちで沈黙させ、その沈黙を idle 検出器が拾うため、従来の
     // 「boot 猶予＋idle」だけだとダイアログ表示中に ready へ誤昇格していた（＝入力欄がまだ
@@ -706,6 +776,44 @@ export class Agent {
    * ダイアログはチャンクを跨いで届くため、素文（ANSI 除去）を上限付きバッファに
    * 溜めてから判定する。応答したら、どのダイアログへ何を送ったかをサーバログに残す。
    */
+  /**
+   * backend の readyPattern（プロンプト表示の目印）を出力から探す。
+   * 見つかったら ready 昇格を再評価する（この時点で既に idle・boot 猶予経過なら即 ready）。
+   */
+  private maybeMarkReadyPattern(chunk: string): void {
+    if (this.readyPattern === null || this.readyPatternSeen || this.disposed) return;
+    const plain = chunk
+      .replace(/\x1b\][^\x07]*\x07/g, "")
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+      .replace(/\x1b[()][A-Z0-9]/g, "");
+    this.readyScanBuffer = (this.readyScanBuffer + plain).slice(-8192);
+    if (!this.readyPattern.test(this.readyScanBuffer)) return;
+    this.readyPatternSeen = true;
+    this.readyScanBuffer = "";
+    this.promoteReadyIfEligible();
+  }
+
+  /**
+   * backend が宣言した致命エラー文言を出力から探し、見つけたら notice とサーバログへ出す。
+   * ready 待ちが黙ってタイムアウトするより、原因の分かる 1 行を残す方が運用が早い。
+   */
+  private maybeReportFatal(chunk: string): void {
+    if (this.fatalPatterns.length === 0 || this.disposed) return;
+    if (this.reportedFatals.size === this.fatalPatterns.length) return;
+    const plain = chunk
+      .replace(/\x1b\][^\x07]*\x07/g, "")
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+      .replace(/\x1b[()][A-Z0-9]/g, "");
+    for (const { pattern, message } of this.fatalPatterns) {
+      const key = pattern.source;
+      if (this.reportedFatals.has(key)) continue;
+      if (!pattern.test(plain)) continue;
+      this.reportedFatals.add(key);
+      console.error(`[ebi-team] [${this.id}] 起動エラー: ${message}`);
+      this.handlers.onNotice(this.id, `起動エラー: ${message}`);
+    }
+  }
+
   private maybeAnswerStartupGates(chunk: string): void {
     const spec = this.gateSpec;
     if (this.disposed || !this.autoAnswerStartupGates || spec === null) return;
@@ -843,6 +951,17 @@ export class Agent {
     // MVP は生存 agent のみスクロールバックを保持する方針。exit/kill で破棄する。
     this.scrollbackChunks.length = 0;
     this.scrollbackSize = 0;
+    // backend が要求する場合はプロセスグループごと落とす（gemini: 子 node の再 exec と
+    // その配下の stdio MCP が PTY リーダの kill だけでは孤児として残るため）。
+    if (this.killProcessGroup && this.pid != null) {
+      const pid: number = this.pid;
+      killProcessGroupSignal(pid, "SIGTERM");
+      const sweeper = setTimeout(() => {
+        killProcessGroupSignal(pid, "SIGKILL");
+      }, GROUP_KILL_GRACE_MS);
+      // サーバ終了を妨げない（居残りが無ければ何もせず消える保険タイマ）。
+      sweeper.unref?.();
+    }
     try {
       this.proc.kill();
     } catch {

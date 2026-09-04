@@ -5,6 +5,7 @@
 // （以前は index.ts / config.ts / registry.ts の 3 箇所に同じ式が重複していた）。
 
 import { CLAUDE_BACKEND } from "./claude.ts";
+import { GEMINI_BACKEND } from "./gemini.ts";
 import { ALL_BACKEND_IDS } from "./types.ts";
 import type { BackendId, BackendLaunchInput, EbiBackend } from "./types.ts";
 
@@ -30,6 +31,21 @@ export {
   isDevChannelsAutoAnswerEligible,
 } from "./claude.ts";
 export {
+  GEMINI_BACKEND,
+  GEMINI_DEFAULT_MODEL,
+  GEMINI_HEAVY_MODEL,
+  GEMINI_SETTINGS_ENV,
+  GEMINI_VERIFIED_VERSION,
+  buildGeminiSettings,
+  controlMcpSpecFromClaudeConfig,
+  geminiRuntimeDir,
+  resolveGeminiModel,
+  toGeminiApprovalMode,
+  writeGeminiRuntime,
+  type GeminiApprovalMode,
+  type GeminiEbiSettings,
+} from "./gemini.ts";
+export {
   BACKEND_TRAITS,
   CLAUDE_TRAITS,
   CODEX_TRAITS,
@@ -52,8 +68,8 @@ export {
   type GeminiSystemSettings,
 } from "./mcpSpec.ts";
 
-/** 実装済みバックエンドの一覧（解決の探索順）。codex / gemini は PR-C / PR-D で追加する。 */
-export const BACKENDS: readonly EbiBackend[] = [CLAUDE_BACKEND];
+/** 実装済みバックエンドの一覧（解決の探索順）。codex は PR-D で追加する。 */
+export const BACKENDS: readonly EbiBackend[] = [CLAUDE_BACKEND, GEMINI_BACKEND];
 
 /** 最終フォールバックのバックエンド id。 */
 export const DEFAULT_BACKEND_ID: BackendId = "claude";

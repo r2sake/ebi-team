@@ -170,7 +170,13 @@ export const CLAUDE_BACKEND: EbiBackend = {
     return args;
   },
 
-  buildEnv(_input?: BackendEnvInput): Record<string, string> {
+  /**
+   * インライン TUI 描画のための既定 env。claude はこれ以外に env を必要としないので、
+   * `inlineTui:false`（EBI_INLINE_TUI=off の非常口）なら空を返す
+   * （従来 agent.ts 側で丸ごと落としていた挙動と同一。判断を backend へ移しただけ）。
+   */
+  buildEnv(input?: BackendEnvInput): Record<string, string> {
+    if (input?.inlineTui === false) return {};
     return { ...INLINE_TUI_ENV };
   },
 
