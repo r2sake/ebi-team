@@ -2,12 +2,15 @@ import type { ViewerRecord } from "../shared/protocol.ts";
 import { parseMarkdown, type MdBlock, type MdInline } from "./markdown.ts";
 
 /**
- * viewer（読み取り専用の md/txt プレビュー）パネル。
+ * viewer（読み取り専用の md/txt/画像プレビュー）パネル。
  * REGISTRY の viewer 行を選んだときにメイン領域へ描画する DOM。
  * Dashboard と同じく setVisible()/update() インターフェースを持ち、master-detail の 1 枚として出す。
  *
  * XSS 安全: markdown は自前パーサ（markdown.ts）で AST 化し、テキストは **必ず textContent** で
  * 挿入する。innerHTML には生コンテンツを一切入れない（md 中の HTML タグは文字列として表示される）。
+ * 画像（format="image"）は content に載っていない。サーバの読み取り専用配信
+ * `GET /control/viewer-file?id=<viewer id>` を <img src> で参照する（src は id だけで組み立て、
+ * パスは一切載せない）。
  */
 export class Viewer {
   private current: ViewerRecord | null = null;
@@ -52,7 +55,7 @@ export class Viewer {
     titleWrap.className = "viewer-title-wrap";
     const title = document.createElement("span");
     title.className = "viewer-title";
-    title.textContent = `📄 ${rec.title}`;
+    title.textContent = `${rec.format === "image" ? "🖼" : "📄"} ${rec.title}`;
     const pathEl = document.createElement("span");
     pathEl.className = "viewer-path";
     pathEl.textContent = rec.path;
@@ -73,7 +76,23 @@ export class Viewer {
     // 本文。
     const body = document.createElement("div");
     body.className = "viewer-body";
-    if (rec.format === "txt") {
+    if (rec.format === "image") {
+      // 画像はバイト列をサーバから直接取る（openedAt を付けて開き直し時のキャッシュを避ける）。
+      body.classList.add("image");
+      const img = document.createElement("img");
+      img.className = "viewer-img";
+      img.alt = rec.title;
+      img.src = `/control/viewer-file?id=${encodeURIComponent(rec.id)}&t=${rec.openedAt ?? 0}`;
+      img.addEventListener("error", () => {
+        // 配信に失敗（削除済み・許可ルート外へ移動など）したら壊れアイコンではなく理由を出す。
+        img.remove();
+        const err = document.createElement("p");
+        err.className = "viewer-empty";
+        err.textContent = "画像を読み込めませんでした（ファイルが移動/削除された可能性があります）。";
+        body.appendChild(err);
+      });
+      body.appendChild(img);
+    } else if (rec.format === "txt") {
       // .txt は等幅の生テキスト（textContent で安全に）。
       const pre = document.createElement("pre");
       pre.className = "viewer-txt";

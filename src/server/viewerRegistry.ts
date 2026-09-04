@@ -1,4 +1,4 @@
-// viewer（読み取り専用の md/txt プレビュー）を保持するコレクション。
+// viewer（読み取り専用の md/txt/画像プレビュー）を保持するコレクション。
 //
 // 設計方針:
 // - AgentRecord（PTY プロセス前提）を汚さず、viewer は「プロセスを持たない UI エンティティ」
@@ -8,7 +8,12 @@
 // - パス安全（外部参照の制限・読み取り専用）:
 //   - EBI_VIEWER_ROOTS（`:` 区切り・未設定時は `$HOME/workspace`）配下に限定。
 //   - realpath でシンボリックリンク脱出を防止（実体が許可ルート配下にあること）。
-//   - 拡張子は .md / .markdown / .txt に限定、サイズ上限あり、書き込み口は作らない。
+//   - 拡張子は .md / .markdown / .txt / .png / .jpg / .jpeg / .webp / .gif に限定、
+//     サイズ上限あり（テキストと画像で別枠）、書き込み口は作らない。
+// - 画像（format="image"）:
+//   - content には載せない（WS の viewers broadcast は全接続へ流れるため、バイナリを base64 で
+//     詰めるとペイロードが膨らむ）。バイト列は readImage() → `GET /control/viewer-file?id=` で配信。
+//   - 配信時にも resolveViewerPath で再検証する（open 後にパスが差し替わっても許可範囲を外れない）。
 // - 永続化（サーバ再起動をまたいでタブを復元する）:
 //   - open/close のたびに `.ebi-team/viewers.json` へ `{id, path, title, openedAt}` を atomic 書き出し。
 //   - 起動時 restore() で読み直し、同じ id/openedAt のまま再登録する（content は読み直したスナップショット）。
@@ -25,10 +30,35 @@ const ALLOWED_EXT: Record<string, ViewerFormat> = {
   ".md": "md",
   ".markdown": "md",
   ".txt": "txt",
+  ".png": "image",
+  ".jpg": "image",
+  ".jpeg": "image",
+  ".webp": "image",
+  ".gif": "image",
 };
 
-/** ファイルサイズ上限の既定（バイト）。env EBI_VIEWER_MAX_BYTES で上書き可。 */
+/** 画像拡張子 → Content-Type。viewer-file 配信で使う（ALLOWED_EXT の image と同じ集合）。 */
+const IMAGE_MIME: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".webp": "image/webp",
+  ".gif": "image/gif",
+};
+
+/** 拡張子から画像の Content-Type を引く（画像以外は null）。 */
+export function imageMimeForPath(p: string): string | null {
+  return IMAGE_MIME[extname(p).toLowerCase()] ?? null;
+}
+
+/** テキスト（md/txt）のサイズ上限の既定（バイト）。env EBI_VIEWER_MAX_BYTES で上書き可。 */
 const DEFAULT_MAX_BYTES = 1024 * 1024; // 1MB
+
+/**
+ * 画像のサイズ上限の既定（バイト）。env EBI_VIEWER_MAX_IMAGE_BYTES で上書き可。
+ * テキストの 1MB では生成 PNG が普通に弾かれるため枠を分ける。
+ */
+const DEFAULT_MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8MB
 
 /** `~` / `$HOME` / `${HOME}` を展開する（未知変数はそのまま）。 */
 function expandHome(input: string): string {
@@ -58,8 +88,10 @@ type ViewerEntry = ViewerRecord;
 export interface ViewerRegistryOptions {
   /** 許可ルート（未指定は defaultViewerRoots()）。テストで temp dir を渡すのに使う。 */
   roots?: string[];
-  /** サイズ上限（バイト・未指定は env or 既定 1MB）。 */
+  /** テキスト（md/txt）のサイズ上限（バイト・未指定は env or 既定 1MB）。 */
   maxBytes?: number;
+  /** 画像のサイズ上限（バイト・未指定は env or 既定 8MB）。 */
+  maxImageBytes?: number;
   /**
    * 永続化先（`.ebi-team/viewers.json`）。未指定なら永続化しない（従来どおりメモリのみ）。
    * テストでは temp dir 配下を渡す。
@@ -130,6 +162,7 @@ export async function resolveViewerPath(
   rawPath: string,
   roots: string[],
   maxBytes: number,
+  maxImageBytes: number = maxBytes,
 ): Promise<{ absPath: string; realPath: string; format: ViewerFormat; size: number }> {
   if (typeof rawPath !== "string" || rawPath.trim() === "") {
     throw new ViewerPathError("path（文字列）は必須です");
@@ -168,8 +201,10 @@ export async function resolveViewerPath(
   if (!st.isFile()) {
     throw new ViewerPathError(`通常ファイルではありません: ${realPath}`);
   }
-  if (st.size > maxBytes) {
-    throw new ViewerPathError(`ファイルが大きすぎます: ${st.size} バイト（上限 ${maxBytes} バイト）`);
+  // サイズ上限はテキストと画像で別枠（画像は生成 PNG が 1MB を普通に超える）。
+  const limit = format === "image" ? maxImageBytes : maxBytes;
+  if (st.size > limit) {
+    throw new ViewerPathError(`ファイルが大きすぎます: ${st.size} バイト（上限 ${limit} バイト）`);
   }
 
   return { absPath, realPath, format, size: st.size };
@@ -184,6 +219,7 @@ export class ViewerRegistry {
   private seq = 0;
   private readonly roots: string[];
   private readonly maxBytes: number;
+  private readonly maxImageBytes: number;
   private readonly storePath: string | null;
   /** 永続化の直列化キュー（open/close が連続しても書き込み順を保つ）。 */
   private persistChain: Promise<void> = Promise.resolve();
@@ -192,6 +228,9 @@ export class ViewerRegistry {
     this.roots = opts.roots ?? defaultViewerRoots();
     this.maxBytes =
       opts.maxBytes ?? (Number(process.env.EBI_VIEWER_MAX_BYTES) || DEFAULT_MAX_BYTES);
+    this.maxImageBytes =
+      opts.maxImageBytes ??
+      (Number(process.env.EBI_VIEWER_MAX_IMAGE_BYTES) || DEFAULT_MAX_IMAGE_BYTES);
     this.storePath = opts.storePath ?? null;
   }
 
@@ -209,8 +248,10 @@ export class ViewerRegistry {
       params.path,
       this.roots,
       this.maxBytes,
+      this.maxImageBytes,
     );
-    const content = await readFile(realPath, "utf8");
+    // 画像は content に載せない（バイト列は /control/viewer-file で配信する）。
+    const content = format === "image" ? "" : await readFile(realPath, "utf8");
     const id = `viewer-${++this.seq}`;
     const title =
       params.title && params.title.trim() ? params.title.trim() : basename(absPath);
@@ -302,7 +343,34 @@ export class ViewerRegistry {
     return existed;
   }
 
-  /** 現在の viewer 一覧（broadcast 用・content 込み）。 */
+  /** id で viewer を引く（無ければ undefined）。 */
+  get(id: string): ViewerRecord | undefined {
+    return this.viewers.get(id);
+  }
+
+  /**
+   * 画像 viewer のバイト列を読む（`GET /control/viewer-file?id=` の実体）。
+   * - クライアントからは **id しか受けない**（生パスを受けない＝パストラバーサルの入口を作らない）。
+   * - 未登録 id・画像以外の viewer は null（呼び出し側で 404）。
+   * - open 済みでも配信のたびに resolveViewerPath で再検証する（許可ルート・realpath・サイズ）。
+   *   検証に失敗したら ViewerPathError を throw する（呼び出し側で 400）。
+   */
+  async readImage(id: string): Promise<{ bytes: Buffer; mime: string; path: string } | null> {
+    const rec = this.viewers.get(id);
+    if (!rec || rec.format !== "image") return null;
+    const { realPath } = await resolveViewerPath(
+      rec.path,
+      this.roots,
+      this.maxBytes,
+      this.maxImageBytes,
+    );
+    const mime = imageMimeForPath(realPath);
+    // resolveViewerPath が image と判定した以上ここは必ず引けるが、保険で弾く（sniff させない）。
+    if (!mime) throw new ViewerPathError(`画像として配信できない拡張子です: ${realPath}`);
+    return { bytes: await readFile(realPath), mime, path: rec.path };
+  }
+
+  /** 現在の viewer 一覧（broadcast 用・content 込み。画像の content は空文字）。 */
   list(): ViewerRecord[] {
     return [...this.viewers.values()];
   }
@@ -391,8 +459,9 @@ export class ViewerRegistry {
           e.path,
           this.roots,
           this.maxBytes,
+          this.maxImageBytes,
         );
-        const content = await readFile(realPath, "utf8");
+        const content = format === "image" ? "" : await readFile(realPath, "utf8");
         const id =
           typeof e.id === "string" && /^viewer-\d+$/.test(e.id) && !this.viewers.has(e.id)
             ? e.id

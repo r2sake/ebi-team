@@ -494,6 +494,8 @@ const controlApi = createControlApi({
     broadcastViewers();
     return rec;
   },
+  // 画像 viewer のバイナリ配信（クライアントの <img src="/control/viewer-file?id=..."> が叩く）。
+  readViewerFile: (id) => viewerRegistry.readImage(id),
 });
 
 /** HTML を期待するリクエスト（ブラウザ遷移）かを Accept ヘッダで大まかに判定する。 */

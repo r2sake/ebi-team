@@ -19,6 +19,11 @@ export default defineConfig({
         target: "ws://localhost:8787",
         ws: true,
       },
+      // 画像 viewer のバイナリ配信（<img src="/control/viewer-file?id=...">）など、
+      // 制御API も同一オリジンで叩けるように Node サーバへ転送する。
+      "/control": {
+        target: "http://localhost:8787",
+      },
     },
   },
   build: {
