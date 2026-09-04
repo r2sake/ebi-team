@@ -150,7 +150,11 @@ curl -s -X POST localhost:8811/control/open-viewer -H 'content-type: application
 
 ---
 
-## 5. 提案: open_viewer を画像対応にする最小改修（**実装は要件外なので未実施**）
+## 5. 提案: open_viewer を画像対応にする最小改修（**実装済み: 2026-09-05**）
+
+> この §5 の提案は別タスクで実装され、main に取り込み済み（`.png/.jpg/.jpeg/.webp/.gif` 対応・
+> `GET /control/viewer-file?id=`）。以下は当時の提案内容そのまま。実際の仕様は README の
+> 「md/txt/画像ビューア (viewer)」節を参照すること。
 
 要点は「`content` は UTF-8 文字列前提なので、**画像はここに載せない**」。バイト列は別口で取りに行かせる。
 
