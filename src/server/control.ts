@@ -56,6 +56,12 @@ export interface GeneralizedSpawnParams {
    * true の spawn はそれ以上再試行しない（無限リトライ防止）。
    */
   retryOfEarlyExit?: boolean;
+  /**
+   * 内部用（制御API からは受け取らない）。役割プロンプト ACK の「静かな故障」検知による
+   * 作り直しでの spawn か。true の spawn はそれ以上作り直さず、2 回目の故障は fatal として
+   * master へ通知する（無限リトライ防止・黙って消さない）。
+   */
+  retryOfAckFailure?: boolean;
 }
 
 /** 要約結果（control.ts は supervisor.ts の型に依存しないよう最小形で受ける）。 */

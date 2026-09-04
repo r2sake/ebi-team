@@ -180,6 +180,30 @@ export interface BackendPreflightSpec {
 }
 
 /**
+ * 役割プロンプト注入への ACK（最初の応答）を監視して「静かな故障」を検知する定義。
+ *
+ * 背景（docs/backends/codex.md §7.1）: codex エビは一定確率で、役割プロンプトへの ACK に
+ * 「この環境では reply_to_master ツールが利用できないため…」と書いて以後タスクを実行しない。
+ * MCP プロセスは立っており注入順序にも差が無い（＝モデル側のツール可視性のばらつき）。
+ * 一度そう述べたセッションは回復しないため、**ACK の文面で検知して 1 回だけ作り直す**。
+ *
+ * 監視は「役割プロンプト注入 → ACK 到着（busy→idle）」の区間に限る。
+ * ACK が来ないまま windowMs を過ぎたら監視を打ち切る（無限に文面を疑わない）。
+ */
+export interface AckFailureWatchSpec {
+  /** 静かな故障を示す文言（ANSI 除去済みの素文に対して照合する）。 */
+  readonly patterns: readonly { readonly pattern: RegExp; readonly message: string }[];
+  /** 監視の上限(ms)。役割プロンプト注入からこの時間が過ぎたら監視を終了する。 */
+  readonly windowMs: number;
+  /**
+   * 注入直後に「まだ ACK が始まっていない idle」で監視を終えないための最小観測時間(ms)。
+   * 注入本文のエコーだけで busy→idle が一往復しうるため、この時間を過ぎるまでは
+   * idle を「ACK 完了」とみなさない。
+   */
+  readonly minObserveMs: number;
+}
+
+/**
  * バックエンドの「性質」だけを切り出したもの（起動引数の組み立てを含まない）。
  * PR-C / PR-D が実装本体を書く前に、PoC で判明した固有事情をデータとして先に置けるようにする
  * （profiles.ts が BackendId ごとの唯一の SoT）。
@@ -213,6 +237,11 @@ export interface BackendTraits {
    * 落ちうるため true。claude / codex は false（未指定＝false）。
    */
   readonly retryOnEarlyExit?: boolean;
+  /**
+   * 役割プロンプト ACK の「静かな故障」検知＋1 回だけ再 spawn の定義（任意項目）。
+   * null / 未指定なら監視しない（claude / gemini は未指定＝挙動不変）。
+   */
+  readonly ackFailureWatch?: AckFailureWatchSpec | null;
   /** 起動前チェックの宣言。 */
   readonly preflight: BackendPreflightSpec;
   /**
