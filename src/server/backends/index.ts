@@ -11,6 +11,7 @@ import { ALL_BACKEND_IDS } from "./types.ts";
 import type { BackendId, BackendLaunchInput, EbiBackend } from "./types.ts";
 
 export type {
+  AckFailureWatchSpec,
   BackendId,
   BackendEnvInput,
   BackendLaunchInput,
@@ -55,10 +56,13 @@ export {
 export {
   BACKEND_TRAITS,
   CLAUDE_TRAITS,
+  CODEX_ACK_FAILURE_PATTERNS,
+  CODEX_ACK_FAILURE_WATCH,
   CODEX_TRAITS,
   GEMINI_TRAITS,
   DEFAULT_IDLE_THRESHOLD_MS,
   applyEnvDenyList,
+  matchAckFailure,
   resolveIdleThresholdMs,
 } from "./profiles.ts";
 export {

@@ -6,8 +6,10 @@ import {
   CLAUDE_BACKEND,
   applyEnvDenyList,
   getBackend,
+  matchAckFailure,
   resolveBackendOrDefault,
   resolveIdleThresholdMs,
+  type AckFailureWatchSpec,
   type BackendId,
   type StartupGateKind,
   type StartupGateSpec,
@@ -20,6 +22,9 @@ export {
   detectStartupGate,
   isDevChannelsAutoAnswerEligible,
 } from "./backends/index.ts";
+
+/** ACK 監視中に控える注入本文の上限件数（作り直しでの引き継ぎ用）。 */
+const ACK_WINDOW_BODY_LIMIT = 20;
 
 /**
  * 注入時、本文を書いてから Enter(`\r`) を別 write で送るまでの待ち時間(ms)。
@@ -325,6 +330,12 @@ export interface AgentHandlers {
    * index.ts 側で registry.reverseInject(id, "master", "...", "idle") を発火させる配線に使う。
    */
   onIdleNotify?: (id: string) => void;
+  /**
+   * 役割プロンプト ACK の「静かな故障」検知フック（任意）。
+   * backend.ackFailureWatch を持つエビ（codex）で、ACK 文面が故障パターンに一致したときに
+   * 1 度だけ呼ばれる。index.ts 側で「kill →同一 id・同一引数で 1 回だけ再 spawn」に配線する。
+   */
+  onAckFailure?: (id: string, reason: string) => void;
 }
 
 /**
@@ -397,6 +408,10 @@ export class Agent {
   private readonly spawnedAt: number = Date.now();
   /** これまでに一度でも ready に達したか。 */
   private hasBeenReady = false;
+  /** PTY プロセスの exit イベントを受け取ったか（awaitExit 用）。 */
+  private exited = false;
+  /** exit を待つ waiter の resolve 関数（awaitExit 用）。 */
+  private readonly exitWaiters: (() => void)[] = [];
   /** ready 化 or dispose を待つ waiter の resolve 関数（waitUntilReady 用）。 */
   private readonly readyWaiters: ((ready: boolean) => void)[] = [];
   /** boot 猶予満了時に ready 昇格を再評価するためのタイマ。 */
@@ -429,6 +444,29 @@ export class Agent {
   // ===== 初回注入（役割プロンプト）=====
   /** ready 後の初回注入を既に送ったか（多重送信防止）。 */
   private initialInjectSent = false;
+
+  // ===== ACK 監視（役割プロンプトへの応答が「静かな故障」でないかを見る）=====
+  /** backend の ACK 監視定義（持たない backend は null＝挙動不変）。 */
+  private readonly ackWatchSpec: AckFailureWatchSpec | null;
+  /** 監視中か（役割プロンプト注入で on・検知/成功 ACK/上限で off）。 */
+  private ackWatchActive = false;
+  /** 監視開始時刻（minObserveMs / windowMs の起点）。 */
+  private ackWatchStartedAt = 0;
+  /** ACK 走査用の素文リングバッファ。 */
+  private ackScanBuffer = "";
+  /** 監視の上限タイマ。 */
+  private ackWatchTimer: NodeJS.Timeout | null = null;
+  /** 検知を通知済みか（多重発火防止）。 */
+  private ackFailureReported = false;
+  /**
+   * ACK 監視中に届いた注入本文（タグ付け済み）。作り直しのときに新エビへ引き継ぐ。
+   *
+   * 監視中のエビは「役割プロンプトへの応答すら怪しい」状態なので、この間に届いた本文は
+   * **まだ実行されていない**とみなして持ち越す。注入キューだけを持ち越すのでは足りない:
+   * ready 直後は idle なので、master のタスクは**キューを経ずに PTY へ直接書かれる**
+   * （＝故障エビの画面に書かれて消える）。実際に e2e round 2 で 1 件消えた。
+   */
+  private readonly ackWindowBodies: string[] = [];
 
   /**
    * PTY への書き込み（本文 → ENTER_DELAY_MS → `\r`）を直列化するためのチェーン。
@@ -502,6 +540,7 @@ export class Agent {
     this.killProcessGroup = backend.killProcessGroup;
     this.readyPattern = backend.readyPattern ?? null;
     this.fatalPatterns = backend.fatalPatterns ?? [];
+    this.ackWatchSpec = backend.ackFailureWatch ?? null;
     this.gateSpec = backend.startupGates;
     this.bootGraceMs = MIN_BOOT_MS + (backend.readyWarmupMs ?? 0);
     this.autoAnswerStartupGates = this.gateSpec
@@ -558,6 +597,7 @@ export class Agent {
       this.maybeAnswerStartupGates(meaningful);
       this.maybeMarkReadyPattern(meaningful);
       this.maybeReportFatal(meaningful);
+      this.maybeDetectAckFailure(meaningful);
       this.detector.notifyOutput();
       this.appendScrollback(meaningful);
       this.handlers.onData(this.id, meaningful);
@@ -575,7 +615,10 @@ export class Agent {
         clearTimeout(this.gateSettleTimer);
         this.gateSettleTimer = null;
       }
+      this.clearAckWatchTimer();
       this.resolveReadyWaiters(false);
+      this.exited = true;
+      while (this.exitWaiters.length > 0) this.exitWaiters.shift()!();
       this.handlers.onExit(this.id, exitCode);
     });
 
@@ -603,6 +646,32 @@ export class Agent {
   /** TUI が入力受付（ready）になったか。一度 ready なら以降ずっと true。 */
   isReady(): boolean {
     return this.hasBeenReady;
+  }
+
+  /**
+   * PTY プロセスの exit イベントが処理されるまで待つ（上限つき・best effort）。
+   *
+   * 同じ id で作り直すとき（静かな故障の再 spawn）に必要:
+   * exit イベントのハンドラは id だけを見て registry から remove するため、
+   * 旧プロセスの exit を待たずに新しいエビを立てると、遅れて届いた旧 exit が
+   * **新しいエビを kill する**。
+   */
+  awaitExit(timeoutMs: number): Promise<boolean> {
+    if (this.exited) return Promise.resolve(true);
+    return new Promise<boolean>((resolve) => {
+      let done = false;
+      const finish = (ok: boolean) => {
+        if (done) return;
+        done = true;
+        resolve(ok);
+      };
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      timer.unref?.();
+      this.exitWaiters.push(() => {
+        clearTimeout(timer);
+        finish(true);
+      });
+    });
   }
 
   /**
@@ -701,7 +770,81 @@ export class Agent {
     if (!text || this.initialInjectSent || this.disposed) return;
     this.initialInjectSent = true;
     this.handlers.onNotice(this.id, "初回注入: 役割プロンプトを送信しました（ready 後）");
+    this.startAckWatch();
     void this.enqueueWrite(text);
+  }
+
+  /**
+   * 役割プロンプト ACK の監視を開始する（backend が ackFailureWatch を持つときだけ）。
+   * 上限（windowMs）で自動終了する。ACK が来ないまま黙るケースを永久に疑わないため。
+   */
+  private startAckWatch(): void {
+    const spec = this.ackWatchSpec;
+    if (spec === null || this.disposed || this.ackWatchActive || this.ackFailureReported) return;
+    this.ackWatchActive = true;
+    this.ackWatchStartedAt = Date.now();
+    this.ackScanBuffer = "";
+    this.ackWatchTimer = setTimeout(() => {
+      this.stopAckWatch("上限時間に達した");
+    }, spec.windowMs);
+    this.ackWatchTimer.unref?.();
+  }
+
+  /** ACK 監視の上限タイマだけを止める（exit / kill の後始末）。 */
+  private clearAckWatchTimer(): void {
+    this.ackWatchActive = false;
+    if (this.ackWatchTimer) {
+      clearTimeout(this.ackWatchTimer);
+      this.ackWatchTimer = null;
+    }
+  }
+
+  /** ACK 監視を終了する（成功 ACK / 上限 / 検知後 のいずれか）。 */
+  private stopAckWatch(reason: string, keepBodies = false): void {
+    if (!this.ackWatchActive) return;
+    this.ackWatchActive = false;
+    this.ackScanBuffer = "";
+    // 故障検知のときだけ引き継ぎ用に残す。健全に終わったなら控えは不要（二重注入の元）。
+    if (!keepBodies) this.ackWindowBodies.length = 0;
+    if (this.ackWatchTimer) {
+      clearTimeout(this.ackWatchTimer);
+      this.ackWatchTimer = null;
+    }
+    console.log(`[ebi-team] [${this.id}] ACK 監視を終了（${reason}）`);
+  }
+
+  /**
+   * ACK 文面から「静かな故障」（reply_to_master が使えないと述べて終わる応答）を検知する。
+   * 検知したら監視を終了し、onAckFailure フックを 1 度だけ呼ぶ（再 spawn の判断は index.ts）。
+   */
+  private maybeDetectAckFailure(chunk: string): void {
+    const spec = this.ackWatchSpec;
+    if (spec === null || !this.ackWatchActive || this.disposed) return;
+    const plain = chunk
+      .replace(/\x1b\][^\x07]*\x07/g, "")
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+      .replace(/\x1b[()][A-Z0-9]/g, "");
+    this.ackScanBuffer = (this.ackScanBuffer + plain).slice(-8192);
+    const hit = matchAckFailure(this.ackScanBuffer, spec.patterns);
+    if (hit === null) return;
+    this.ackFailureReported = true;
+    this.stopAckWatch("静かな故障を検知", true);
+    const msg = `静かな故障を検知: ${hit.message}`;
+    console.error(`[ebi-team] [${this.id}] ${msg}`);
+    this.handlers.onNotice(this.id, msg);
+    this.handlers.onAckFailure?.(this.id, hit.message);
+  }
+
+  /**
+   * ACK が「故障パターンに一致しないまま完了した」ときに監視を終える。
+   * 判定は busy→idle のエッジ。ただし注入本文のエコーだけで一往復しうるため、
+   * minObserveMs を過ぎるまでは完了とみなさない。
+   */
+  private maybeFinishAckWatch(): void {
+    const spec = this.ackWatchSpec;
+    if (spec === null || !this.ackWatchActive) return;
+    if (Date.now() - this.ackWatchStartedAt < spec.minObserveMs) return;
+    this.stopAckWatch("成功 ACK（故障パターン非該当）");
   }
 
   /**
@@ -899,6 +1042,7 @@ export class Agent {
    */
   inject(from: string, message: string, guard?: EchoGuard, msgId?: number | null): InjectState {
     const body = deliveryText(from, message, msgId);
+    this.recordAckWindowBody(body);
     if (this.getStatus() === "idle") {
       // guard 付き（notify フォールバック由来）は、書く直前に「もう届いていないか」を確認する。
       if (guard && this.isEchoed(guard)) {
@@ -914,6 +1058,40 @@ export class Agent {
       `busy のため注入をキューに保留（待ち ${this.injectQueue.length} 件）`,
     );
     return "queued";
+  }
+
+  /**
+   * 既にタグ付け済みの本文をそのまま注入する（再タグ付けしない）。
+   * 「静かな故障」検知でエビを作り直すとき、旧エビの注入キューに滞留していた本文
+   * （master が送ったタスク）を新しいエビへ引き継ぐために使う。ここで捨てると
+   * 「エビは作り直されたがタスクは消えた」という、直そうとしている故障そのものになる。
+   */
+  injectRaw(body: string): InjectState {
+    this.recordAckWindowBody(body);
+    if (this.getStatus() === "idle") {
+      void this.enqueueWrite(body);
+      return "sent";
+    }
+    this.injectQueue.push({ body });
+    return "queued";
+  }
+
+  /**
+   * ACK 監視中なら注入本文を控える（作り直しで新エビへ引き継ぐため）。
+   * 上限を超えたら古い方から捨てる（監視窓は数十秒なので実際には数件で収まる）。
+   */
+  private recordAckWindowBody(body: string): void {
+    if (!this.ackWatchActive) return;
+    this.ackWindowBodies.push(body);
+    while (this.ackWindowBodies.length > ACK_WINDOW_BODY_LIMIT) this.ackWindowBodies.shift();
+  }
+
+  /**
+   * ACK 監視中に届いた注入本文を取り出して空にする（作り直し時に 1 度だけ呼ぶ）。
+   * 呼ばれなければ、監視の終了（成功 ACK / 上限）時に破棄される。
+   */
+  takeAckWindowBodies(): string[] {
+    return this.ackWindowBodies.splice(0);
   }
 
   /** 現在 busy で滞留している注入の件数（可視化・破棄ログ用）。 */
@@ -1003,6 +1181,7 @@ export class Agent {
       clearTimeout(this.gateSettleTimer);
       this.gateSettleTimer = null;
     }
+    this.clearAckWatchTimer();
     this.resolveReadyWaiters(false);
     // MVP は生存 agent のみスクロールバックを保持する方針。exit/kill で破棄する。
     this.scrollbackChunks.length = 0;
@@ -1031,6 +1210,8 @@ export class Agent {
 
   private onIdle(): void {
     this.handlers.onStatus(this.id, "idle");
+    // 役割プロンプト ACK の監視は「ACK 到着（busy→idle）」で終える。
+    this.maybeFinishAckWatch();
     // ready 判定: boot 猶予を過ぎていて idle に達したら ready とみなす。
     this.promoteReadyIfEligible();
     void this.flushQueue();

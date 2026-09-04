@@ -15,6 +15,7 @@ import {
 } from "./registry.ts";
 import { Mailbox } from "./mailbox.ts";
 import { configureDeliveryLog, deliveryLogPath, logDelivery } from "./deliveryLog.ts";
+import { buildAckFatalMessage, decideAckFailureAction } from "./ackRespawn.ts";
 import type { Agent, SpawnConfig, AgentHandlers, LaunchParams } from "./agent.ts";
 import {
   BASE_ALLOWED_DEV_CHANNELS,
@@ -393,6 +394,9 @@ const handlers: AgentHandlers = {
     // （remove で Agent が消える前に控える）。
     const managed = fixedEbi.manages(id);
     registry.remove(id);
+    // 静かな故障の作り直し用に控えた spawn 引数も破棄する（作り直し経路は remove の前に
+    // 自分で取り出して delete 済みなので、ここで消えるのは通常終了ぶんだけ）。
+    ackRespawnParams.delete(id);
     broadcast({ type: "exited", id, exitCode });
     broadcastRegistry();
     if (meta) void cleanupWorktree(id, meta);
@@ -401,6 +405,18 @@ const handlers: AgentHandlers = {
   },
   onNotice(id, text) {
     broadcast({ type: "notice", id, text });
+  },
+  onAckFailure(id, reason) {
+    // 役割プロンプト ACK の「静かな故障」検知（codex）。kill →同一 id・同一引数で 1 回だけ
+    // 作り直す。投げっぱなし（spawn の応答を待たせない）にするが、例外は握り潰さない。
+    void handleAckFailure(id, reason).catch((err) => {
+      console.error(`[ebi-team] [${id}] 静かな故障の再 spawn 処理で例外:`, err);
+      broadcast({
+        type: "notice",
+        id,
+        text: `${id} の作り直しに失敗しました: ${(err as Error).message}`,
+      });
+    });
   },
   onIdleNotify(id) {
     // [B] idle 自動通知（保険）。busy→idle のエッジで、master/supervisor 以外かつ
@@ -936,6 +952,7 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     };
     const agent = registry.spawn(cwd, handlers, { id: agentId, kind: params.kind, role: role?.id, launch });
     watchEarlyExit(agent, backend, params);
+    watchAckFailure(agent, backend, params);
     broadcast({ type: "spawned", agent: agent.toRecord() });
     broadcastRegistry();
     return agent.id;
@@ -972,9 +989,134 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     worktreePath: wt.worktreePath,
   });
   watchEarlyExit(agent, backend, params);
+  watchAckFailure(agent, backend, params);
   broadcast({ type: "spawned", agent: agent.toRecord() });
   broadcastRegistry();
   return agent.id;
+}
+
+/**
+ * 役割プロンプト ACK の「静かな故障」検知で作り直すために、spawn 引数を控えておく。
+ *
+ * 背景（docs/backends/codex.md §7.1）: codex エビは一定確率で、役割プロンプトへの ACK に
+ * 「reply_to_master ツールが利用できない」と書き、以後タスクを実行しない。プロセスは生きて
+ * idle に戻るため、master からは「起動して落ち着いているが報告が来ない」ようにしか見えず、
+ * タスクが 1 件静かに消える。検知（agent.ts の maybeDetectAckFailure）と、その後の
+ * 「kill →同一 id・同一引数で 1 回だけ再 spawn」をここで繋ぐ。
+ *
+ * ackFailureWatch を持たない backend（claude / gemini）では何も登録しない＝挙動不変。
+ */
+const ackRespawnParams = new Map<string, GeneralizedSpawnParams>();
+
+/** 作り直し時に旧プロセスの exit を待つ上限(ms)。プロセスグループ kill の猶予より長く取る。 */
+const ACK_RESPAWN_EXIT_WAIT_MS = Number(process.env.EBI_ACK_RESPAWN_EXIT_WAIT_MS) || 8000;
+
+function watchAckFailure(
+  agent: Agent,
+  backend: ReturnType<typeof getBackend>,
+  params: GeneralizedSpawnParams,
+): void {
+  if (!backend.ackFailureWatch) return;
+  ackRespawnParams.set(agent.id, params);
+}
+
+/**
+ * 「静かな故障」を検知したエビを 1 回だけ作り直す。
+ *
+ * - 1 回目: kill（プロセスグループ）→ 同一 id・同一引数で再 spawn。旧エビの注入キューに
+ *   滞留していた本文（master が送ったタスク）は新エビへ引き継ぐ（捨てると「作り直したが
+ *   タスクは消えた」という、直そうとしている故障そのものになる）。
+ * - 2 回目: 作り直さず **fatal として master へ通知**する（reverseInject＝既存の通知経路）。
+ *   黙って idle のまま放置するのが一番困るため、報告は必ず出す。
+ */
+async function handleAckFailure(id: string, reason: string): Promise<void> {
+  const params = ackRespawnParams.get(id);
+  const agent = registry.get(id);
+  const action = decideAckFailureAction({
+    hasParams: params !== undefined,
+    agentAlive: agent !== undefined,
+    isRetry: params?.retryOfAckFailure === true,
+  });
+  ackRespawnParams.delete(id);
+  if (action === "ignore" || params === undefined || agent === undefined) return;
+  const backendId = agent.backend;
+
+  if (action === "fatal") {
+    const text = buildAckFatalMessage(id, backendId, reason);
+    logDelivery({
+      event: "ack-failure-fatal",
+      level: "warn",
+      msg: `${id} が再 spawn 後も静かな故障（${reason}）。master へ fatal 通知`,
+      id,
+      backend: backendId,
+      reason,
+      attempt: 2,
+    });
+    broadcast({ type: "notice", id, text });
+    const r = await registry.reverseInject(id, "master", text, "reply");
+    if (r.delivered.length === 0) {
+      console.error(`[ebi-team] [${id}] fatal 通知を master へ配信できませんでした`);
+    }
+    return;
+  }
+
+  logDelivery({
+    event: "ack-failure-respawn",
+    level: "warn",
+    msg: `${id} の役割プロンプト ACK で静かな故障（${reason}）。kill して 1 回だけ再 spawn する`,
+    id,
+    backend: backendId,
+    reason,
+    attempt: 1,
+  });
+  broadcast({
+    type: "notice",
+    id,
+    text: `${id}（backend=${backendId}）が「${reason}」。kill して 1 回だけ作り直します`,
+  });
+
+  // 作り直しで引き継ぐ本文（master のタスク）を先に取り出してから kill する。
+  // ready 直後のエビは idle なので、タスクは**注入キューを経ずに PTY へ直接書かれる**。
+  // よってキューの中身だけでは足りず、ACK 監視中に届いた本文（takeAckWindowBodies）を使う
+  // （キューに滞留したぶんもそこに含まれる。drain は二重注入と破棄ログの抑止）。
+  // registry.remove() は worktree を消さない（cleanupWorktree は呼び出し側の責務）ので、
+  // 同じ worktree／ブランチのまま作り直せる。
+  const pending = agent.takeAckWindowBodies();
+  agent.drainInjectQueue();
+  registry.remove(id);
+  broadcast({ type: "exited", id, exitCode: null });
+  broadcastRegistry();
+  // 旧プロセスの exit が処理されるまで待ってから作り直す。exit ハンドラは id だけを見て
+  // registry から remove するため、待たずに新エビを立てると遅れて届いた旧 exit が
+  // 新エビを kill してしまう（同一 id で作り直すこの経路に固有の罠）。
+  if (!(await agent.awaitExit(ACK_RESPAWN_EXIT_WAIT_MS))) {
+    console.warn(`[ebi-team] [${id}] 旧プロセスの exit を待てませんでした（作り直しは続行）`);
+  }
+
+  await spawnAgent({ ...params, id, retryOfAckFailure: true });
+
+  if (pending.length === 0) return;
+  const next = registry.get(id);
+  if (!next) return;
+  const ready = await next.waitUntilReady(READY_WAIT_MS);
+  if (!ready) {
+    logDelivery({
+      event: "ack-failure-requeue-failed",
+      level: "warn",
+      msg: `${id} の再 spawn 後に ready 到達せず、滞留していた注入 ${pending.length} 件を引き継げませんでした`,
+      id,
+      count: pending.length,
+    });
+    return;
+  }
+  for (const body of pending) next.injectRaw(body);
+  logDelivery({
+    event: "ack-failure-requeued",
+    level: "info",
+    msg: `${id} の再 spawn 後に滞留注入 ${pending.length} 件を引き継ぎました`,
+    id,
+    count: pending.length,
+  });
 }
 
 /**

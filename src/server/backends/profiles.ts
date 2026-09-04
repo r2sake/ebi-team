@@ -6,7 +6,7 @@
 // codex / gemini は PR-C / PR-D で実装本体が入るまで、このプロファイルだけが存在する
 // （＝「器」。未実装 backend の spawn 指定は index.ts が明示エラーで弾く）。
 
-import type { BackendId, BackendTraits } from "./types.ts";
+import type { AckFailureWatchSpec, BackendId, BackendTraits } from "./types.ts";
 
 /** idle 判定のサーバ既定（ms）。backend が idleThresholdMs=null ならこれを使う。 */
 export const DEFAULT_IDLE_THRESHOLD_MS = 900;
@@ -30,6 +30,75 @@ export const CLAUDE_TRAITS: BackendTraits = {
 };
 
 /**
+ * codex の「静かな故障」を示す ACK 文面（docs/backends/codex.md §7.1 / §7.2 の失敗の型）。
+ *
+ * 実測された文面（言い回しは毎回ぶれる。**同じ意味の別表現**が出ることを前提に広めに取る）:
+ *   「ただし、この環境では reply_to_master ツールが利用できないため、現時点では master へ送信できません。」
+ *   「reply_to_master ツールがこの環境で利用できないため、呼び出せません」
+ *   「この環境には reply_to_master ツールが提供されていないため、master へのツール経由の報告は実行できません。」
+ *     ← 2026-09-05 の実装後 e2e で観測。初版（`利用でき` 系だけ）では**取りこぼした**
+ *
+ * 成功ラウンドの ACK（「承知しました。テスト用の疎通係として対応します。」）には
+ * これらの語が 1 件も出ないことを実測で確認済み。
+ * 役割プロンプト本文（＝注入時に TUI がエコーする文字列）にもこれらの語は含まれない
+ * （含めてしまうとエコーで誤検知するため、役割プロンプトを書くときの制約でもある。
+ *  test/codexAckRespawn.test.ts が組込み役割・e2e のタスク本文で錠前を掛けている）。
+ */
+export const CODEX_ACK_FAILURE_PATTERNS: readonly {
+  readonly pattern: RegExp;
+  readonly message: string;
+}[] = [
+  {
+    pattern: /(利用|使用)でき(ない|ません|ず)/,
+    message: "エビが『ツールを利用できない』と応答しました（静かな故障）",
+  },
+  {
+    pattern: /(呼び出せません|呼び出せない|使えません)/,
+    message: "エビが『ツールを呼び出せない』と応答しました（静かな故障）",
+  },
+  {
+    // 「ツールが提供されていない／登録されていない」型。
+    pattern: /(提供|登録|用意)されて(いない|いません|おらず)/,
+    message: "エビが『ツールが提供されていない』と応答しました（静かな故障）",
+  },
+  {
+    // 「報告は実行できません／送信できません」型（ツールに触れずに結論だけ書く言い回し）。
+    pattern: /(実行|送信|報告)でき(ない|ません|ず)/,
+    message: "エビが『報告を実行できない』と応答しました（静かな故障）",
+  },
+  {
+    pattern: /(tool|tools)[^\n]{0,40}(not available|unavailable|not provided|not registered)/i,
+    message: "エビが英語で『ツールが利用できない』と応答しました（静かな故障）",
+  },
+];
+
+/**
+ * codex の ACK 監視設定。
+ * - windowMs: 役割プロンプト注入からの監視上限。実測の ACK 所要は 30 秒前後なので既定 90 秒。
+ * - minObserveMs: 注入本文エコーだけの busy→idle で「成功 ACK」と誤判定しないための下限。
+ * env `EBI_CODEX_ACK_WATCH_MS` / `EBI_CODEX_ACK_MIN_OBSERVE_MS` で調整可。
+ */
+export const CODEX_ACK_FAILURE_WATCH: AckFailureWatchSpec = {
+  patterns: CODEX_ACK_FAILURE_PATTERNS,
+  windowMs: Number(process.env.EBI_CODEX_ACK_WATCH_MS) || 90000,
+  minObserveMs: Number(process.env.EBI_CODEX_ACK_MIN_OBSERVE_MS) || 3000,
+};
+
+/**
+ * ACK 文面から静かな故障を検知する純関数（検知ロジックの SoT）。
+ * 最初に一致したパターンの説明文を返す。一致しなければ null。
+ */
+export function matchAckFailure(
+  plainText: string,
+  patterns: readonly { readonly pattern: RegExp; readonly message: string }[],
+): { pattern: RegExp; message: string } | null {
+  for (const entry of patterns) {
+    if (entry.pattern.test(plainText)) return entry;
+  }
+  return null;
+}
+
+/**
  * codex のプロファイル（PR0-C 実測・codex-cli 0.146.0）。
  * - 待機中の PTY 出力は 60 秒で 0 バイト → idleThresholdMs は上書き不要。
  * - 初回タスクは位置引数で「渡せる」（CLI 能力）。ただし ebi-team の運用としては使わない
@@ -44,6 +113,8 @@ export const CODEX_TRAITS: BackendTraits = {
   reportsUsage: false,
   idleThresholdMs: null,
   killProcessGroup: true,
+  // 役割プロンプト ACK の「静かな故障」を検知したら 1 回だけ作り直す（docs §7.1 の次の一手 1）。
+  ackFailureWatch: CODEX_ACK_FAILURE_WATCH,
   preflight: {
     versionArgs: ["--version"],
     verifiedVersion: "0.146.0",
