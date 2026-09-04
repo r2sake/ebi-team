@@ -15,8 +15,11 @@ import type { AgentKind } from "../shared/protocol.ts";
 import type { LaunchParams } from "./agent.ts";
 import {
   buildLaunchArgs,
+  isImplementedBackendId,
   resolveBackend,
+  backendIdError,
   DEFAULT_BACKEND_ID,
+  IMPLEMENTED_BACKEND_IDS,
   PERMISSION_MODES,
   type BackendId,
   type PermissionMode,
@@ -70,6 +73,10 @@ interface RawConfig {
    * 組込み（server:ebi-control）に足す形。ワイルドカード・部分一致は不可。
    */
   devChannelsAllowlist?: unknown;
+  /** サーバ既定のバックエンド id（env EBI_BACKEND より優先）。検証は loadBackendSettings。 */
+  defaultBackend?: unknown;
+  /** バックエンド別の既定（command / defaultModel）。検証は loadBackendSettings。 */
+  backends?: unknown;
 }
 
 /**
@@ -123,6 +130,90 @@ export async function loadDevChannelsAllowlist(configPath: string): Promise<stri
     }
   }
   return raw as string[];
+}
+
+// ===== バックエンド既定（PR-E: top-level "defaultBackend" / "backends"） =====
+
+/** バックエンド 1 件分の既定（ebi-team.config.json の backends[<id>]）。 */
+export interface BackendConfigEntry {
+  /** 起動バイナリ（未指定なら backend の defaultCommand）。 */
+  command?: string;
+  /** そのバックエンドの既定モデル（未指定なら env EBI_<ID>_MODEL → CLI 既定）。 */
+  defaultModel?: string;
+}
+
+/** config 由来のバックエンド既定（サーバ既定 backend と backend 別の設定）。 */
+export interface BackendSettings {
+  /** config.defaultBackend（未指定なら null → env EBI_BACKEND → claude）。 */
+  defaultBackend: BackendId | null;
+  /** backend 別の既定。未定義の backend は空オブジェクト相当（参照側は ?. で読む）。 */
+  backends: Partial<Record<BackendId, BackendConfigEntry>>;
+}
+
+/** バックエンド既定が何も無いときの値（config 無し・キー無し）。 */
+export const EMPTY_BACKEND_SETTINGS: BackendSettings = { defaultBackend: null, backends: {} };
+
+/**
+ * top-level "defaultBackend" / "backends" を検証・正規化する純関数（I/O 無し＝単体テスト対象）。
+ * - 未指定は「既定なし」。未実装/未知の backend id は throw（黙って claude に落とさない）。
+ * - backends のキーは実装済み backend id のみ許容。値は { command?, defaultModel? }。
+ */
+export function normalizeBackendSettings(raw: {
+  defaultBackend?: unknown;
+  backends?: unknown;
+}): BackendSettings {
+  let defaultBackend: BackendId | null = null;
+  if (raw.defaultBackend !== undefined && raw.defaultBackend !== null) {
+    if (typeof raw.defaultBackend !== "string") {
+      throw new Error("defaultBackend は文字列である必要があります");
+    }
+    if (!isImplementedBackendId(raw.defaultBackend)) throw backendIdError(raw.defaultBackend);
+    defaultBackend = raw.defaultBackend;
+  }
+
+  const backends: Partial<Record<BackendId, BackendConfigEntry>> = {};
+  if (raw.backends !== undefined && raw.backends !== null) {
+    if (typeof raw.backends !== "object" || Array.isArray(raw.backends)) {
+      throw new Error("backends はオブジェクト（{ backendId: 定義 }）である必要があります");
+    }
+    for (const [id, def] of Object.entries(raw.backends as Record<string, unknown>)) {
+      if (!isImplementedBackendId(id)) {
+        throw new Error(
+          `backends のキーが不正です: ${id}（許容: ${IMPLEMENTED_BACKEND_IDS.join(", ")}）`,
+        );
+      }
+      if (def === null || typeof def !== "object" || Array.isArray(def)) {
+        throw new Error(`backends."${id}" の定義はオブジェクトである必要があります`);
+      }
+      const d = def as Record<string, unknown>;
+      const entry: BackendConfigEntry = {};
+      for (const field of ["command", "defaultModel"] as const) {
+        const v = d[field];
+        if (v === undefined) continue;
+        if (typeof v !== "string") {
+          throw new Error(`backends."${id}" の ${field} は文字列である必要があります`);
+        }
+        entry[field] = v;
+      }
+      backends[id] = entry;
+    }
+  }
+  return { defaultBackend, backends };
+}
+
+/**
+ * ebi-team.config.json の top-level "defaultBackend" / "backends" を読み、正規化して返す。
+ * - ファイルが無ければ EMPTY_BACKEND_SETTINGS（既定なし＝従来どおり env → claude）。
+ * - 検証失敗は throw（呼び出し側で警告ログにして起動継続する想定）。
+ */
+export async function loadBackendSettings(configPath: string): Promise<BackendSettings> {
+  const parsed = await readRawConfig(configPath);
+  if (parsed === null) return EMPTY_BACKEND_SETTINGS;
+  try {
+    return normalizeBackendSettings(parsed);
+  } catch (err) {
+    throw new Error(`${configPath} の ${(err as Error).message}`);
+  }
 }
 
 /** 正規化済みの固定エビ定義。サーバが spawn にそのまま使える形。 */

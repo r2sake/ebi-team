@@ -193,8 +193,28 @@ curl -s localhost:8787/control/spawn -H 'content-type: application/json' \
 #   send_message(to=..., spawnIfMissing=true, role="engineer", backend="gemini")
 ```
 
-サーバ既定を gemini にしたい場合は `EBI_BACKEND=gemini`（非推奨。master は claude 固定のため、
-役割単位の指定＝PR-E を待つのが本筋）。
+サーバ既定を gemini にしたい場合は `EBI_BACKEND=gemini` / `defaultBackend: "gemini"`（非推奨。
+master は claude 固定なので統括系は落ちないが、動的エビが全部 gemini になる）。
+
+**推奨は役割単位の指定（PR-E で実装済み）**。`ebi-team.config.json`:
+
+```jsonc
+{
+  "backends": { "gemini": { "command": "gemini", "defaultModel": "gemini-flash-latest" } },
+  "roles": {
+    "researcher": {
+      "label": "調査",
+      "backend": "gemini",
+      "permissionMode": "plan",
+      "appendSystemPrompt": "下調べ・読解専任の使い捨てセッション。…"
+    }
+  }
+}
+```
+
+これで `spawn_ebi(role="researcher")` が gemini 起動になる（解決順は spawn 引数 > 役割 >
+`defaultBackend` > env > claude）。UI では 🔵 gemini バッジが付き、cost / context は
+「—（未対応）」表示になる（`reportsUsage: false`）。
 
 ### 起動前チェック（preflight）
 

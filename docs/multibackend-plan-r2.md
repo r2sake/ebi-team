@@ -444,10 +444,37 @@ PR1 で `registry.hasControlBridge()` は backend 委譲済み。**codex / gemin
 | **PR-B** | **抽象化の拡張（挙動不変）**: `BackendId` に gemini 追加・`envDenyList` / `reportsUsage` / `idleThresholdMs` / `initialPromptArgs` 追加・`ControlMcpSpec` 中立表現と 3 方言射影・`gen-master-mcp.mjs` を中立表現から生成 | 既存 unit + 新規純関数テスト green。**claude 起動の外形ゼロ差分**（`backendArgs.test.ts` を拡張して担保） | 0.5〜1日 | PR-A |
 | **PR-C** | **Gemini バックエンド実装（opt-in）**: `GeminiBackend` / spawn 経路に `backend` 配線 / system settings 生成 / env deny / 起動前チェック（`gemini --version` と OAuth 資格の存在） | 新規 live e2e `scripts/e2e-gemini-engineer.mjs`：spawn → タスク委譲 → `reply_to_master` 着弾が**連続10回 100%**。claude 側 e2e 回帰なし | 1〜1.5日 | PR-B / PR0-G |
 | **PR-D** | **Codex バックエンド実装（opt-in）**: `CodexBackend`（inline / home / profile の 3 モード）・`codex doctor` 事前チェック | `scripts/e2e-codex-engineer.mjs` 連続10回 100%／claude 回帰なし | 1〜1.5日 | PR-B / PR0-C |
-| **PR-E** | **役割既定 + UI + docs**: `EbiRole.backend` / `config.backends` / バッジ / spawn セレクト / usage 欠測表示 / README に写像表 | 役割 spawn で既定 backend が効く。UI に backend が出る。cost 欠測が「—」と明示される | 0.5〜1日 | PR-C or PR-D |
+| **PR-E** ✅**着地（2026-09-05）** | **役割既定 + UI + docs**: `EbiRole.backend` / `config.defaultBackend` / `config.backends` / バッジ / spawn セレクト / usage 欠測表示 / README に写像表 | 役割 spawn で既定 backend が効く。UI に backend が出る。cost 欠測が「—」と明示される | 0.5〜1日 | PR-C or PR-D |
 | **PR-F**（任意） | supervisor の非 claude 化・usage 補完（`codex exec --json` / `gemini -o json`）・Discord/Slack ブリッジ（旧プラン §9 PR5〜7 を据え置き） | — | 別途 | PR-E |
 
 **合計（PR0〜PR-E）: 約 3.5〜5 日**。
+
+#### 進行状態（2026-09-05 時点）
+
+| PR | 状態 | 備考 |
+|---|---|---|
+| PR0-G / PR0-C | ✅ 完了 | PoC 実測結果は §2 / §3 と `docs/backends/*.md` に反映済み |
+| PR-A / PR-B | ✅ 完了 | 抽象化の取り込みと拡張（挙動不変） |
+| PR-C（Gemini） | ✅ 完了 | live e2e 10/10 |
+| PR-D（Codex） | ⚠️ 実装完了・**e2e は実験枠** | 再起動後検証で 3/3 まで改善（`docs/verify/post-restart-2026-09-05.md`）。実装役の既定にはしない |
+| **PR-E（本節）** | ✅ **完了** | 役割既定 backend / config `defaultBackend`・`backends` / master の claude 固定 fail-safe / UI バッジ・欠測表示・spawn セレクト。unit 229（fail 0）／typecheck 通過／UI スクショ `tmp/pr-e-ui/` |
+| PR-F | 未着手 | supervisor の非 claude 化・usage 補完・Discord/Slack ブリッジ |
+
+PR-E の実装メモ:
+
+- **役割の既定 backend**: `EbiRole.backend`（`src/server/roles.ts`）。組込み `engineer` は **`claude` のまま**
+  （Codex は e2e が確定していないため実装役の既定にはしない＝ボス裁定）。
+- **config**: top-level `defaultBackend` と `backends.<id>.{command,defaultModel}`（`src/server/config.ts` の
+  `normalizeBackendSettings` が検証。未実装 id は明示エラー）。
+- **model の扱い**: 役割の `defaultModel` は **その役割の backend で起動したときだけ**適用する
+  （claude 語彙のモデル名を codex/gemini に渡すと毎ターン 400 になるため）。
+- **master 固定**: `applyMasterBackendFailsafe`（`src/server/fixedEbi.ts`）が `kind:"master"` の
+  `launch.backend` を強制的に `claude` にする。
+- **UI**: `src/shared/backendBadge.ts` が表示メタの SoT（`reportsUsage` は `BACKEND_TRAITS` と
+  unit テストで同期を担保）。REGISTRY 行・PANE ヘッダにバッジ、ダッシュボードに backend 列と
+  「—（未対応）」表示、ヘッダに backend セレクト。
+- **MCP 説明文の訂正**: `src/mcp/control-server.ts` の `backend` 引数の説明が「claude のみ実装済み」の
+  ままだったのを実装（3 backend とも実装済み・model 語彙差・usage 未対応）に合わせた。
 
 ### 5.2 ボス作業（人手が要るもの）
 
@@ -456,7 +483,7 @@ PR1 で `registry.hasControlBridge()` は backend 委譲済み。**codex / gemin
 | B-1 | PoC の GO 判断（`gemini` / `codex` を実際に起動する許可） | PR0 の直前 |
 | B-2 | ~~`codex login`~~ **完了済み**（2026-09-04・`Logged in using ChatGPT`） | — |
 | B-3 | Gemini の課金経路確認（`/about` の userTier 目視・GCP コンソールの課金レコード確認） | PR0-G 中／翌日 |
-| B-4 | **サーバ再起動**（各 PR の反映ごと。`npm run build` → `node scripts/gen-master-mcp.mjs` → 再起動） | PR-A/C/D/E の反映時 |
+| B-4 | **サーバ再起動**（各 PR の反映ごと。`npm run build` → `node scripts/gen-master-mcp.mjs` → 再起動） | PR-A/C/D/E の反映時（**PR-E 分は未反映**: main へマージ済み・稼働 clone の build と再起動待ち） |
 | B-5 | 再起動後の master 受信経路（channel）の確認と、`ps -wwwE` での master ブリッジ二重購読チェック | 再起動のたび |
 
 ### 5.3 裁定項目（Q-1〜Q-8・各推奨つき）
