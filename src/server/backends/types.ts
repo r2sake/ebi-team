@@ -27,8 +27,17 @@ export const PERMISSION_MODES = [
 ] as const;
 export type PermissionMode = (typeof PERMISSION_MODES)[number];
 
-/** バックエンド識別子。実装済みかどうかは別（IMPLEMENTED_BACKEND_IDS を参照）。 */
-export type BackendId = "claude" | "codex";
+/**
+ * バックエンド識別子。
+ * **実装済みかどうかは別**（実装済みの集合は index.ts の IMPLEMENTED_BACKEND_IDS）。
+ * "codex" / "gemini" は PR-B 時点では「器（型・プロファイル・MCP 方言射影・preflight 定義）」
+ * だけがあり、EbiBackend 実装本体は PR-C / PR-D で入る。
+ * 未実装 id を spawn 引数等で指定した場合は黙って claude に落とさず明示エラーにする。
+ */
+export type BackendId = "claude" | "codex" | "gemini";
+
+/** 全バックエンド識別子（未実装を含む）。UI の選択肢や zod enum の SoT。 */
+export const ALL_BACKEND_IDS = ["claude", "codex", "gemini"] as const;
 
 /** 起動引数を組み立てるための入力（バックエンド非依存の抽象パラメータ）。 */
 export interface BackendLaunchInput {
@@ -89,8 +98,89 @@ export interface StartupGateSpec {
   noticeFor(kind: StartupGateKind): string;
 }
 
+/**
+ * 制御MCP（ebi-control）の起動情報のバックエンド中立表現（SoT）。
+ * ここから claude(--mcp-config JSON) / codex(-c TOML) / gemini(system settings JSON) の
+ * 3 方言へ射影する（backends/mcpSpec.ts の純関数群）。
+ */
+export interface ControlMcpSpec {
+  /** MCP サーバ名（mcpServers のキー / codex の mcp_servers.<name>）。 */
+  readonly name: string;
+  readonly command: string;
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly env: Record<string, string>;
+}
+
+/**
+ * 起動前チェック（preflight）の宣言的定義。
+ *
+ * 「何を確認するか」だけをデータで持ち、実際の I/O（コマンド実行・ファイル存在確認）は
+ * 呼び出し側が行う。判定そのものは preflight.ts の純関数 evaluatePreflight() が担う
+ * （＝単体テストでプロセスを起動せずに全分岐を固定できる）。
+ */
+export interface BackendPreflightSpec {
+  /** バージョン確認に使う引数（例: ["--version"]）。空なら実行しない。 */
+  readonly versionArgs: readonly string[];
+  /**
+   * 検証済みバージョン（PoC で実測した値）。null なら未固定。
+   * 一致しない場合は **エラーにせず警告**にする（CLI の自動更新で簡単に動くため。R6 対策）。
+   */
+  readonly verifiedVersion: string | null;
+  /**
+   * 存在が必須のファイル（認証情報など）。先頭 "~/" はホームへ展開する。
+   * 例: codex="~/.codex/auth.json" / gemini="~/.gemini/oauth_creds.json"
+   */
+  readonly requiredFiles: readonly string[];
+  /**
+   * 値が「ある」ことが必須の env キー。
+   * 例: gemini の GOOGLE_CLOUD_PROJECT（Workspace アカウントでは無いと起動不能。
+   * 設計書 §2.5 の deny 方針とは**逆向き**である点に注意。PoC 実測で確定）。
+   */
+  readonly requiredEnv: readonly string[];
+}
+
+/**
+ * バックエンドの「性質」だけを切り出したもの（起動引数の組み立てを含まない）。
+ * PR-C / PR-D が実装本体を書く前に、PoC で判明した固有事情をデータとして先に置けるようにする
+ * （profiles.ts が BackendId ごとの唯一の SoT）。
+ */
+export interface BackendTraits {
+  /**
+   * pty env から**削除する**キー（課金経路・別認証への誤接続を防ぐ）。
+   * 親 env の継承分にだけ効かせる（ebi-team 自身が渡す launch.env は対象外）。
+   * claude は空。
+   */
+  readonly envDenyList: readonly string[];
+  /**
+   * statusLine 相当で usage（cost / context）を報告できるか。
+   * false のバックエンドは UI に「—（未対応）」と明示表示する（空欄にしない）。
+   */
+  readonly reportsUsage: boolean;
+  /**
+   * idle 判定しきい値の上書き（ms）。null ならサーバ既定（EBI_IDLE_MS・既定 900）を使う。
+   * PoC 実測では codex / gemini とも待機中の出力が 0 バイトで、上書きは不要（= null）。
+   */
+  readonly idleThresholdMs: number | null;
+  /**
+   * kill 時にプロセスグループごと落とす必要があるか。
+   * gemini は子 node を再 exec するため PTY リーダの kill だけでは孤児が残る（PoC 実測）。
+   * claude は false（現状踏襲）。実際の kill 実装の切替は PR-C で行う。
+   */
+  readonly killProcessGroup: boolean;
+  /** 起動前チェックの宣言。 */
+  readonly preflight: BackendPreflightSpec;
+  /**
+   * 初回タスクを起動引数として渡す形。
+   * claude: []（対話起動では渡さない・従来どおり注入）
+   * codex:  [prompt]（位置引数）
+   * gemini: ["-i", prompt]
+   */
+  initialPromptArgs(prompt: string): string[];
+}
+
 /** 1 つのエージェント CLI バックエンドの振る舞い定義。 */
-export interface EbiBackend {
+export interface EbiBackend extends BackendTraits {
   readonly id: BackendId;
   /** 既定バイナリ名（config / env で上書き可）。 */
   readonly defaultCommand: string;

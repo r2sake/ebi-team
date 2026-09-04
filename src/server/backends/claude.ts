@@ -5,6 +5,7 @@
 // 文言と自動応答・制御MCP ブリッジ判定）を 1 箇所に集約したもの。
 // 挙動は集約前と完全に同一（外形ゼロ差分）であること。
 
+import { CLAUDE_TRAITS } from "./profiles.ts";
 import type {
   BackendEnvInput,
   BackendLaunchInput,
@@ -19,7 +20,10 @@ import type {
  * （素の "ebi-control" だと claude が起動時エラーで即終了する。実機で確認済み）。
  * キー名は gen-master-mcp.mjs の生成キー "ebi-control" と一致していること。
  */
-export const EBI_CONTROL_CHANNEL_SPEC = "server:ebi-control";
+export const EBI_CONTROL_MCP_NAME = "ebi-control";
+
+/** 同上（`server:<mcpServersキー名>`）。キー名は ControlMcpSpec.name と同一 SoT。 */
+export const EBI_CONTROL_CHANNEL_SPEC = `server:${EBI_CONTROL_MCP_NAME}`;
 
 /**
  * 起動ゲート自動応答を許可する dev channel 値の「組込み（既定）許可リスト」。
@@ -129,6 +133,10 @@ const CLAUDE_STARTUP_GATES: StartupGateSpec = {
 
 /** Claude Code バックエンド。 */
 export const CLAUDE_BACKEND: EbiBackend = {
+  // 性質（envDenyList / reportsUsage / idleThresholdMs / killProcessGroup / preflight /
+  // initialPromptArgs）は profiles.ts が SoT。claude は全て「現状踏襲」の値。
+  ...CLAUDE_TRAITS,
+
   id: "claude",
   defaultCommand: "claude",
 

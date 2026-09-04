@@ -20,10 +20,32 @@
 //   EBI_CONTROL_URL=http://127.0.0.1:9999 node scripts/gen-master-mcp.mjs
 
 import { writeFileSync, mkdirSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, resolve, join } from "node:path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * 制御MCP の中立表現（ControlMcpSpec）→ claude 方言（--mcp-config JSON）の射影は
+ * src/server/backends/mcpSpec.ts が唯一の SoT。ここでは同じ純関数を読み込んで使う
+ * （claude 用 JSON と codex/gemini 方言の二重管理を作らないため）。
+ *
+ * .ts の読み込み: Node 22.18+/23+ は型注釈を素で剥がせる。剥がせない古い Node では
+ * devDependency の tsx を ESM ローダとして登録してから読み直す。
+ */
+const mcpSpecUrl = pathToFileURL(join(__dirname, "../src/server/backends/mcpSpec.ts")).href;
+let toClaudeMcpConfig;
+try {
+  ({ toClaudeMcpConfig } = await import(mcpSpecUrl));
+} catch (err) {
+  try {
+    const { register } = await import("tsx/esm/api");
+    register();
+    ({ toClaudeMcpConfig } = await import(mcpSpecUrl));
+  } catch {
+    throw err;
+  }
+}
 const root = resolve(__dirname, "..");
 const dev = process.argv.includes("--dev");
 const controlUrl = process.env.EBI_CONTROL_URL ?? "http://127.0.0.1:8787";
@@ -37,17 +59,16 @@ mkdirSync(outDir, { recursive: true });
 
 /** role 別の mcp config を組み立てて書き出し、パスを返す。 */
 function genConfig(role, fileName) {
-  const config = {
-    mcpServers: {
-      "ebi-control": {
-        command: server.command,
-        args: server.args,
-        cwd: root,
-        // EBI_ID は焼かない（engineer は pty env から継承）。role と接続先のみ固定する。
-        env: { EBI_CONTROL_URL: controlUrl, EBI_MCP_ROLE: role },
-      },
-    },
+  // 中立表現（ControlMcpSpec）。ここから claude 方言へ射影する。
+  // EBI_ID は焼かない（engineer は pty env から継承）。role と接続先のみ固定する。
+  const spec = {
+    name: "ebi-control",
+    command: server.command,
+    args: server.args,
+    cwd: root,
+    env: { EBI_CONTROL_URL: controlUrl, EBI_MCP_ROLE: role },
   };
+  const config = toClaudeMcpConfig(spec);
   const outPath = join(outDir, fileName);
   writeFileSync(outPath, JSON.stringify(config, null, 2) + "\n");
   return outPath;

@@ -30,6 +30,12 @@ export interface GeneralizedSpawnParams {
   appendSystemPrompt?: string | null;
   /** permission-mode（未検証文字列。spawnAgent 側で検証）。 */
   permissionMode?: string;
+  /**
+   * バックエンド（エージェント CLI）id。未検証文字列で受け、spawnAgent 側で検証する。
+   * 未指定なら「役割の既定 → config.defaultBackend → env EBI_BACKEND → claude」。
+   * 未実装 backend（PR-B 時点では codex / gemini）は明示エラーで弾く。
+   */
+  backend?: string;
   /** エビ種別（既定 dynamic）。 */
   kind?: AgentKind;
   /**
@@ -65,6 +71,8 @@ export interface SendMessageInput {
   branch?: string;
   /** spawnIfMissing で起動する際の役割（EBI_ROLES id。未指定は engineer）。 */
   role?: string;
+  /** spawnIfMissing で起動する際のバックエンド（未指定は役割の既定→サーバ既定）。 */
+  backend?: string;
   /** 【後方互換】spawnIfMissing で起動する際 engineer 役割にするか。role が優先。 */
   asEngineer?: boolean;
 }
@@ -195,6 +203,7 @@ function agentSummary(registry: Registry) {
     cwd: a.cwd,
     pinned: a.pinned,
     pid: a.pid,
+    backend: a.backend,
   }));
 }
 
@@ -239,6 +248,7 @@ export function createControlApi(deps: ControlDeps) {
           branch: asString(body.branch),
           appendSystemPrompt: asString(body.appendSystemPrompt) ?? null,
           permissionMode: asString(body.permissionMode),
+          backend: asString(body.backend),
           kind: (kindRaw as AgentKind | undefined) ?? "dynamic",
           role: asString(body.role),
           asEngineer: asBool(body.asEngineer),
@@ -355,6 +365,7 @@ export function createControlApi(deps: ControlDeps) {
           repoPath: asString(body.repoPath),
           branch: asString(body.branch),
           role: asString(body.role),
+          backend: asString(body.backend),
           asEngineer: asBool(body.asEngineer),
         });
         if (result.ok) {

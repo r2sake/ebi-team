@@ -26,6 +26,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { EBI_ROLES, registerCustomRoles, type EbiRoleId } from "../server/roles.ts";
+import { ALL_BACKEND_IDS } from "../server/backends/index.ts";
 import { loadRawCustomRoles } from "../server/config.ts";
 import { deliveryText } from "../shared/deliveryTag.ts";
 
@@ -102,6 +103,15 @@ const ROLE = process.env.EBI_MCP_ROLE === "engineer" ? "engineer" : "master";
 
 /** spawn_ebi / send_message で指定できる役割 id（EBI_ROLES のキー）。 */
 const ROLE_IDS = Object.keys(EBI_ROLES) as [EbiRoleId, ...EbiRoleId[]];
+
+/**
+ * spawn_ebi / spawn_engineer / send_message で指定できる backend id。
+ * 型としては codex / gemini も受けるが、**実装は claude のみ**（PR-B 時点）。
+ * 未実装 id を渡した場合はサーバ側（spawnAgent）が明示エラーで弾く。
+ */
+const BACKEND_IDS = [...ALL_BACKEND_IDS] as [string, ...string[]];
+const BACKEND_DESC =
+  "バックエンド（省略時は役割の既定 → サーバ既定 → claude）。claude のみ実装済みで、codex / gemini は未実装（指定するとエラー）";
 
 /** 制御API を呼ぶ共通ヘルパー。失敗時は { ok:false, error } を返す（throw しない）。 */
 async function callControl(
@@ -232,15 +242,17 @@ async function spawnRoleAndInject(args: {
   role: EbiRoleId;
   task: string;
   model?: string;
+  backend?: string;
   cwd?: string;
   useWorktree?: boolean;
   repoPath?: string;
   branch?: string;
 }) {
-  const { role, task, model, cwd, useWorktree, repoPath, branch } = args;
+  const { role, task, model, backend, cwd, useWorktree, repoPath, branch } = args;
   const spawnRes = await callControl("POST", "/control/spawn", {
     role,
     model,
+    backend,
     cwd,
     useWorktree,
     repoPath,
@@ -277,6 +289,7 @@ server.tool(
     role: z.enum(ROLE_IDS).describe("役割（engineer: 実装。roles.ts の EBI_ROLES にカスタム役割を追加すればそれも選べる）"),
     task: z.string().describe("委譲するタスク内容（起動後に注入される）"),
     model: z.string().optional().describe("モデル上書き（未指定は役割の既定モデル）"),
+    backend: z.enum(BACKEND_IDS).optional().describe(BACKEND_DESC),
     cwd: z.string().optional().describe("作業ディレクトリ（未指定はサーバ既定）"),
     useWorktree: z.boolean().optional().describe("true なら git worktree を切って隔離 cwd で起動"),
     repoPath: z.string().optional().describe("worktree の元 repo パス"),
@@ -292,6 +305,7 @@ server.tool(
   {
     task: z.string().describe("engineer に委譲するタスク内容（起動後に注入される）"),
     model: z.string().optional().describe("モデル（既定 opus）"),
+    backend: z.enum(BACKEND_IDS).optional().describe(BACKEND_DESC),
     cwd: z.string().optional().describe("作業ディレクトリ（未指定はサーバ既定）"),
     useWorktree: z.boolean().optional().describe("true なら git worktree を切って隔離 cwd で起動"),
     repoPath: z.string().optional().describe("worktree の元 repo パス"),
@@ -318,12 +332,13 @@ server.tool(
       .optional()
       .describe("spawnIfMissing で起動する役割（EBI_ROLES に登録された役割。既定 engineer）"),
     model: z.string().optional().describe("spawn 時のモデル上書き（未指定は役割の既定）"),
+    backend: z.enum(BACKEND_IDS).optional().describe(`spawn 時の${BACKEND_DESC}`),
     cwd: z.string().optional().describe("spawn 時の作業ディレクトリ（未指定はサーバ既定）"),
     useWorktree: z.boolean().optional().describe("spawn 時に git worktree を切って隔離 cwd で起動"),
     repoPath: z.string().optional().describe("worktree の元 repo パス"),
     branch: z.string().optional().describe("worktree ブランチ名（未指定は ebi/<id> 採番）"),
   },
-  async ({ to, message, spawnIfMissing, role, model, cwd, useWorktree, repoPath, branch }) => {
+  async ({ to, message, spawnIfMissing, role, model, backend, cwd, useWorktree, repoPath, branch }) => {
     const r = await callControl("POST", "/control/send", {
       to,
       message,
@@ -332,6 +347,7 @@ server.tool(
       // 未起動の宛先を spawn する場合の役割（既定 engineer）。
       role: role ?? "engineer",
       model,
+      backend,
       cwd,
       useWorktree,
       repoPath,

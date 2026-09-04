@@ -4,8 +4,10 @@ import type { AgentRecord, AgentStatus, AgentMode, AgentKind } from "../shared/p
 import { deliveryText } from "../shared/deliveryTag.ts";
 import {
   CLAUDE_BACKEND,
+  applyEnvDenyList,
   getBackend,
   resolveBackendOrDefault,
+  resolveIdleThresholdMs,
   type BackendId,
   type StartupGateKind,
   type StartupGateSpec,
@@ -182,7 +184,7 @@ const INLINE_TUI_ENABLED = !["off", "0", "false"].includes(
 
 /**
  * pty に渡す env を組み立てる純関数。優先度は低い順に
- * 「バックエンド既定 env < 親 env < launch.env」。
+ * 「バックエンド既定 env < 親 env（envDenyList 適用後） < launch.env」。
  * 親 env に同名キーがあればユーザーの明示指定として尊重する。
  *
  * backendEnv 未指定時は Claude バックエンドの既定を使う。EBI_COMMAND=bash 等の
@@ -193,10 +195,14 @@ export function buildSpawnEnv(
   launchEnv?: Record<string, string>,
   inlineTui: boolean = INLINE_TUI_ENABLED,
   backendEnv: Record<string, string> = CLAUDE_BACKEND.buildEnv(),
+  envDenyList: readonly string[] = CLAUDE_BACKEND.envDenyList,
 ): Record<string, string> {
   const merged: Record<string, string> = inlineTui ? { ...backendEnv } : {};
+  // 親 env の継承分からだけ deny list のキーを落とす（claude は空＝従来と完全に同一）。
+  // ebi-team 自身が渡す backendEnv / launchEnv は対象外（意図して渡している値のため）。
+  const inherited = applyEnvDenyList(parentEnv, envDenyList);
   // 値が undefined のキーで既定を握り潰さない（spread だと undefined でも上書きされてしまう）。
-  for (const [key, value] of Object.entries(parentEnv)) {
+  for (const [key, value] of Object.entries(inherited)) {
     if (value !== undefined) merged[key] = value;
   }
   for (const [key, value] of Object.entries(launchEnv ?? {})) {
@@ -422,8 +428,9 @@ export class Agent {
         )
       : false;
 
+    // idle しきい値は backend が上書きできる（null ならサーバ既定＝従来どおり）。
     this.detector = new IdleDetector(
-      config.idleThresholdMs,
+      resolveIdleThresholdMs(backend.idleThresholdMs, config.idleThresholdMs),
       () => this.onIdle(),
       () => this.onBusy(),
     );
@@ -436,6 +443,7 @@ export class Agent {
       launch.env,
       INLINE_TUI_ENABLED,
       backend.buildEnv({ agentId: id }),
+      backend.envDenyList,
     );
     this.proc = pty.spawn(launch.command, launch.args, {
       name: "xterm-color",

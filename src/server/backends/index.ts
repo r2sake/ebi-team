@@ -5,27 +5,54 @@
 // （以前は index.ts / config.ts / registry.ts の 3 箇所に同じ式が重複していた）。
 
 import { CLAUDE_BACKEND } from "./claude.ts";
+import { ALL_BACKEND_IDS } from "./types.ts";
 import type { BackendId, BackendLaunchInput, EbiBackend } from "./types.ts";
 
 export type {
   BackendId,
   BackendEnvInput,
   BackendLaunchInput,
+  BackendPreflightSpec,
+  BackendTraits,
+  ControlMcpSpec,
   EbiBackend,
   PermissionMode,
   StartupGateKind,
   StartupGateSpec,
 } from "./types.ts";
-export { PERMISSION_MODES } from "./types.ts";
+export { ALL_BACKEND_IDS, PERMISSION_MODES } from "./types.ts";
 export {
   CLAUDE_BACKEND,
   BASE_ALLOWED_DEV_CHANNELS,
   EBI_CONTROL_CHANNEL_SPEC,
+  EBI_CONTROL_MCP_NAME,
   detectStartupGate,
   isDevChannelsAutoAnswerEligible,
 } from "./claude.ts";
+export {
+  BACKEND_TRAITS,
+  CLAUDE_TRAITS,
+  CODEX_TRAITS,
+  GEMINI_TRAITS,
+  DEFAULT_IDLE_THRESHOLD_MS,
+  applyEnvDenyList,
+  resolveIdleThresholdMs,
+} from "./profiles.ts";
+export {
+  evaluatePreflight,
+  expandHome,
+  type PreflightProbe,
+  type PreflightResult,
+} from "./preflight.ts";
+export {
+  toClaudeMcpConfig,
+  toCodexConfigArgs,
+  toGeminiSystemSettings,
+  type ClaudeMcpConfig,
+  type GeminiSystemSettings,
+} from "./mcpSpec.ts";
 
-/** 実装済みバックエンドの一覧（解決の探索順）。codex 等は後続 PR で追加する。 */
+/** 実装済みバックエンドの一覧（解決の探索順）。codex / gemini は PR-C / PR-D で追加する。 */
 export const BACKENDS: readonly EbiBackend[] = [CLAUDE_BACKEND];
 
 /** 最終フォールバックのバックエンド id。 */
@@ -39,14 +66,31 @@ export function isImplementedBackendId(value: string | undefined | null): value 
   return value != null && (IMPLEMENTED_BACKEND_IDS as readonly string[]).includes(value);
 }
 
+/** 文字列が（未実装を含む）既知のバックエンド id かを判定する型ガード。 */
+export function isKnownBackendId(value: string | undefined | null): value is BackendId {
+  return value != null && (ALL_BACKEND_IDS as readonly string[]).includes(value);
+}
+
+/**
+ * 未実装／不正な backend id に対する共通エラー文言。
+ * 「型としては存在するがまだ実装されていない（codex / gemini）」と「そもそも知らない id」を
+ * 区別して伝える（黙って claude に落とさない）。
+ */
+export function backendIdError(value: string): Error {
+  if (isKnownBackendId(value)) {
+    return new Error(
+      `backend "${value}" は未実装です（実装済み: ${IMPLEMENTED_BACKEND_IDS.join(", ")}）`,
+    );
+  }
+  return new Error(
+    `backend が不正です: ${value}（許容: ${IMPLEMENTED_BACKEND_IDS.join(", ")}）`,
+  );
+}
+
 /** id からバックエンドを引く。未実装 id は throw（黙って claude に落とさない）。 */
 export function getBackend(id: BackendId): EbiBackend {
   const found = BACKENDS.find((b) => b.id === id);
-  if (!found) {
-    throw new Error(
-      `backend が不正です: ${id}（許容: ${IMPLEMENTED_BACKEND_IDS.join(", ")}）`,
-    );
-  }
+  if (!found) throw backendIdError(id);
   return found;
 }
 
@@ -73,8 +117,8 @@ export function resolveBackendOrDefault(command: string): EbiBackend {
 /**
  * バックエンド id を解決する。優先度は
  *   spawn 引数 > 役割(EbiRole) > config.defaultBackend > env EBI_BACKEND > "claude"。
- * 未実装 id を指定された場合は throw する。
- * ※ PR1 時点で実装済みなのは "claude" のみ。
+ * 未実装 id（"codex" / "gemini"）・未知 id のいずれも throw する（黙って claude に落とさない）。
+ * ※ PR-B 時点で実装済みなのは "claude" のみ。
  */
 export function resolveBackendId(sources?: {
   /** spawn 引数での明示指定。 */
@@ -89,11 +133,7 @@ export function resolveBackendId(sources?: {
   const candidates = [sources?.explicit, sources?.role, sources?.configDefault, sources?.env];
   for (const raw of candidates) {
     if (raw == null || raw === "") continue;
-    if (!isImplementedBackendId(raw)) {
-      throw new Error(
-        `backend が不正です: ${raw}（許容: ${IMPLEMENTED_BACKEND_IDS.join(", ")}）`,
-      );
-    }
+    if (!isImplementedBackendId(raw)) throw backendIdError(raw);
     return raw;
   }
   return DEFAULT_BACKEND_ID;
