@@ -1,0 +1,7 @@
+組み込みの `image_gen__imagegen` を使って生成し、1024×1024 PNGとして保存しました。
+
+保存先: [docs/poc/imagegen-plus-sample.png](/Users/yoimaro/workspace/GitHub/ebi-team/.worktrees/ebi-ebiteam-poc-imagegen-plus/docs/poc/imagegen-plus-sample.png)
+
+```text
+-rw-r--r--  1 yoimaro  staff  831865 Sep  5 11:30 docs/poc/imagegen-plus-sample.png
+```

@@ -7,3 +7,6 @@ ebi-team.config.json
 .claude/
 .env
 !.env.sample
+
+# imagegen エビの生成物置き場（採否前の作業置き場・コミットしない）
+tmp/images/

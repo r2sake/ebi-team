@@ -32,6 +32,8 @@
     "e2e:supervisor-gemini": "node scripts/e2e-supervisor-gemini.mjs",
     "e2e:viewer": "node --import tsx scripts/e2e-viewer.mjs",
     "e2e:viewer-persist": "node scripts/e2e-viewer-persist.mjs",
+    "e2e:imagegen": "node --import tsx scripts/e2e-imagegen.mjs",
+    "imagegen:check": "node --import tsx scripts/imagegen-check.mjs",
     "postinstall": "node scripts/fix-pty-helper.mjs"
   },
   "dependencies": {
