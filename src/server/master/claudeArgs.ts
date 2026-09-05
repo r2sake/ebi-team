@@ -46,6 +46,13 @@ export interface ClaudeHeadlessArgsInput {
    * 逐次表示が要る PR-M3 で true に切り替える。
    */
   includePartialMessages?: boolean;
+  /**
+   * `--permission-prompt-tool` に渡す MCP ツールの完全名（PR-M5）。
+   * null なら付けない＝承認は claude 側の既定（-p では Manual）に委ねられる。
+   * **`--mcp-config` を渡していないときに指定してはいけない**（起動時に
+   * 「not found. Available MCP tools: none」で即死する。PR-M5 実測）。
+   */
+  permissionPromptTool?: string | null;
   extraArgs: readonly string[];
 }
 
@@ -61,6 +68,8 @@ export interface ClaudeHeadlessArgsInput {
  * - `--bare` は**絶対に付けない**（付いていたら preflight が起動を拒否する）。
  * - `--permission-prompts none` は付けない（AskUserQuestion がツール一覧から消え、
  *   「ボスに聞く」という master の中核機能が死ぬ・設計書 §1.1）。
+ * - `--permission-prompt-tool` は `--mcp-config` があるときだけ付ける（PR-M5）。
+ *   単体で付けると claude が起動時にツール解決に失敗して即死する。
  * - extraArgs は常に末尾（既存 EbiBackend.buildArgs と同じ規約）。
  */
 export function buildClaudeHeadlessArgs(input: ClaudeHeadlessArgsInput): string[] {
@@ -77,6 +86,9 @@ export function buildClaudeHeadlessArgs(input: ClaudeHeadlessArgsInput): string[
   if (input.mcpConfigPath) {
     // --strict-mcp-config を付けても ebi-control は connected になる（PoC §2.1）。
     args.push("--mcp-config", input.mcpConfigPath, "--strict-mcp-config");
+  }
+  if (input.permissionPromptTool) {
+    args.push("--permission-prompt-tool", input.permissionPromptTool);
   }
   if (input.permissionMode) args.push("--permission-mode", input.permissionMode);
   if (input.systemPrompt) args.push("--append-system-prompt", input.systemPrompt);

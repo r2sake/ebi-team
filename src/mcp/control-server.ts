@@ -152,12 +152,14 @@ async function callControl(
   method: "GET" | "POST",
   path: string,
   body?: unknown,
+  signal?: AbortSignal,
 ): Promise<{ ok: true; data: unknown } | { ok: false; error: string }> {
   try {
     const res = await fetch(`${CONTROL_URL}${path}`, {
       method,
       headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
       body: body !== undefined ? JSON.stringify(body) : undefined,
+      ...(signal ? { signal } : {}),
     });
     const text = await res.text();
     let data: unknown = undefined;
@@ -267,6 +269,48 @@ if (ROLE === "engineer") {
 // ===== master ロール専用: 配下のエビを統括する制御系 =====
 // engineer（動的エビ）には出さない（spawn/kill/send/inject/set_mode/ask_supervisor の最小権限化）。
 if (ROLE === "master") {
+
+// ---- permission_prompt: 承認 / 質問をボスの UI へ回す（master 専用・PR-M5）----
+//
+// これは **claude 本体が `--permission-prompt-tool` として呼ぶ**ツールで、モデルが
+// 自発的に呼ぶものではない（呼ばれても実害は無いが、意味は無い）。
+//
+// 実測（PR-M5・設計書 §0.6）:
+//  - 引数は `{tool_name, input, tool_use_id}`。承認の往復は claude の NDJSON には出ない
+//  - **AskUserQuestion も同じツールを通る**。答えを返すには
+//    `{"behavior":"allow","updatedInput":{...input, answers:{"<質問文>":"<回答>"}}}` を返す
+//    （answers 無しで allow すると `The user did not answer the questions.` になる）
+//  - 返す JSON は content[0].text にそのまま入れる（isError にはしない）
+//
+// サーバは**ボスが答えるまで応答を返さない**ので、この await は数分〜無限に待つ。
+// 途中で claude がツール呼び出しを諦めると extra.signal が発火し、fetch の中断が
+// サーバ側の保留破棄（＝deny）に繋がる。
+server.tool(
+  "permission_prompt",
+  "（Claude Code 内部用）ツール実行の承認・ユーザーへの質問をボスのチャット UI へ回し、" +
+    "回答が返るまで待つ。--permission-prompt-tool から呼ばれる想定で、通常はモデルから呼ばない。",
+  {
+    tool_name: z.string().describe("承認対象のツール名"),
+    input: z.any().optional().describe("承認対象のツール入力"),
+    tool_use_id: z.string().optional().describe("対応する tool_use の id"),
+  },
+  async ({ tool_name, input, tool_use_id }, extra) => {
+    const r = await callControl(
+      "POST",
+      "/control/chat-permission",
+      { tool_name, input, tool_use_id },
+      extra?.signal,
+    );
+    if (!r.ok) {
+      // 承認 UI へ到達できないときは**拒否**に倒す（黙って実行させない）。
+      return textResult(
+        JSON.stringify({ behavior: "deny", message: `承認 UI へ到達できません: ${r.error}` }),
+      );
+    }
+    return textResult(JSON.stringify(r.data));
+  },
+);
+
 /**
  * 役割付きの動的エビを起動して task を注入する共通処理。
  * spawn_ebi（汎用）と spawn_engineer（後方互換ラッパ）の双方から使う。

@@ -12,6 +12,12 @@
 // - PR-M1 の範囲はサーバ内部まで。UI 配線（WS プロトコル・MasterSession）は PR-M2。
 
 import type { ControlMcpSpec, PermissionMode } from "../backends/types.ts";
+import type {
+  MasterAnswer,
+  MasterPermissionDecision,
+  MasterPermissionRequest,
+  PermissionOutcome,
+} from "./permission.ts";
 
 /** master の頭脳として使える CLI の識別子。 */
 export type MasterBrainId = "claude" | "codex" | "gemini" | "agy";
@@ -95,6 +101,12 @@ export type MasterEvent =
       options: { label: string; description?: string }[];
       multi: boolean;
     }
+  /**
+   * 保留（permission / question）1 件が解けた（PR-M5）。
+   * UI はこれを見てボタンを畳む。**再接続や再起動のあとでも**トランスクリプトから
+   * 決着済みかどうかが復元できるように、notice ではなく専用の kind にしている。
+   */
+  | { kind: "permissionSettled"; id: string; outcome: PermissionOutcome; answer: string | null }
   | {
       kind: "turnEnd";
       ok: boolean;
@@ -147,7 +159,18 @@ export interface MasterBrain {
   /** 出力ストリーム（正規化済み）。 */
   events(): AsyncIterable<MasterEvent>;
   /** 承認/質問への応答（permission / question の id に対して返す）。 */
-  answer(id: string, decision: { allow?: boolean; choice?: string[]; note?: string }): Promise<void>;
+  answer(id: string, decision: MasterAnswer): Promise<void>;
+  /**
+   * `--permission-prompt-tool`（制御MCP の permission_prompt）から届いた承認要求を受ける。
+   * **ボスが答えるまで resolve しない**（未応答は待ち続ける・自動拒否しない）。
+   * 承認 UI を持たない backend では未実装（optional）。
+   */
+  requestPermission?(
+    req: MasterPermissionRequest,
+    signal?: AbortSignal,
+  ): Promise<MasterPermissionDecision>;
+  /** 未応答の承認/質問の件数（UI のスティッキーバー用）。 */
+  readonly pendingPermissions?: number;
   /** 実行中ターンの中断（会話は殺さない）。 */
   interrupt(): Promise<void>;
   /** 再開に必要な id（プロセス死亡後の resume 用に呼び出し側が永続化する）。 */

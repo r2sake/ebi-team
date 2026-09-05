@@ -27,6 +27,7 @@
     "e2e:master-channel": "node scripts/e2e-master-channel.mjs",
     "e2e:master-chat": "node scripts/e2e-master-chat.mjs",
     "e2e:master-chat-image": "node scripts/e2e-master-chat-image.mjs",
+    "e2e:master-chat-approval": "node scripts/e2e-master-chat-approval.mjs",
     "e2e:delivery-hardening": "node scripts/e2e-delivery-hardening.mjs",
     "e2e:spawn-delivery": "node scripts/e2e-spawn-delivery.mjs",
     "e2e:usage": "node scripts/e2e-usage.mjs",
@@ -42,7 +43,7 @@
     "e2e:master-brain": "node --import tsx scripts/e2e-master-brain.mjs",
     "compare:contextpct": "node --import tsx scripts/compare-contextpct-statusline.mjs",
     "e2e:all-terminal": "unset EBI_ID; export EBI_IDLE_NOTIFY=on; npm run e2e:control && npm run e2e:send && npm run e2e:reverse-notify && npm run e2e:notify-fallback && npm run e2e:delivery-hardening && npm run e2e:usage && npm run e2e:viewer && npm run e2e:viewer-persist && npm run e2e:supervisor && npm run e2e:fixed && npm run e2e:minaebi && npm run e2e:context-guard && npm run e2e:spawn-delivery",
-    "e2e:all-chat": "unset EBI_ID; export EBI_IDLE_NOTIFY=on; npm run e2e:context-guard && npm run e2e:master-chat && npm run e2e:master-chat-image",
+    "e2e:all-chat": "unset EBI_ID; export EBI_IDLE_NOTIFY=on; npm run e2e:context-guard && npm run e2e:master-chat && npm run e2e:master-chat-image && npm run e2e:master-chat-approval",
     "postinstall": "node scripts/fix-pty-helper.mjs"
   },
   "dependencies": {

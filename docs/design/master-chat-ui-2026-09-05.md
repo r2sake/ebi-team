@@ -3,8 +3,8 @@
 - 作成: 2026-09-05 engineer エビ（master 委譲・**設計のみ / 実装なし**）
 - **r2: 2026-09-05 更新**（PR-M0 PoC の実測とボス裁定を反映。PR-M1 実装と同じ PR で改訂）。
   変更点の一覧は §0.1。実測の一次資料は `docs/poc/master-headless-poc-2026-09-05.md`
-- **r6: 2026-09-05 更新**（PR-M7 実装＝移行と docs を §0.7 として追加し §6.2 / §6.3 / §6.4 / §9 を更新）。
-  ブランチは `ebi/ebiteam-master-chat-m7`
+- **r6: 2026-09-05 更新**（PR-M5 実装＝承認 / 質問 UI を §0.6 として、PR-M7 実装＝移行と docs を §0.7 として追加し
+  §5.2 / §6.2 / §6.3 / §6.4 / §9 を更新）。ブランチは `ebi/ebiteam-master-chat-m5` / `ebi/ebiteam-master-chat-m7`
 - **r5: 2026-09-05 更新**（PR-M4 実装＝入力系を §0.4、PR-M6 実装＝usage / context / cost を §0.5 として追加し §5.2 / §9 を更新）。
   ブランチは `ebi/ebiteam-master-chat-m4` / `ebi/ebiteam-master-chat-m6`
 - **r4: 2026-09-05 更新**（PR-M3 実装＝チャット UI に合わせて §0.3 を追加し §9 を更新）。ブランチは `ebi/ebiteam-master-chat-m3`
@@ -180,6 +180,37 @@ chat master 単独で見ているときの出所を README に注記する。`co
 
 ---
 
+## 0.6 r6 での変更（PR-M5 実装の確定事項）
+
+**PR-M5 で実装したもの**: `src/server/master/permission.ts`（`PermissionBroker` と claude 方言への写像・純関数）
+＋ `claudeBrain.ts` の `requestPermission()` / `answer()` 実装 ＋ `claudeArgs.ts` の `--permission-prompt-tool`
+＋ `brain.ts` の `permissionSettled` イベントと `MasterBrain.requestPermission?()`
+＋ `session.ts` の `handlePermissionRequest()` / pending 会計 / `unsettledRequestIds()`
+＋ `control.ts` の `POST /control/chat-permission` ＋ `index.ts` の配線
+＋ `src/mcp/control-server.ts` の `permission_prompt`（master ロール専用）
+＋ `chatModel.ts` / `chat.ts` / `style.css` の応答 UI ＋ `main.ts` の `chatAnswer` 配線
+＋ `protocol.ts` の `permissionSettled`（**ワイヤ追加はこの 1 kind だけ**）。
+unit +27 本（`test/masterPermission.test.ts` 17 / `masterChatSession.test.ts` に 4 / `masterChatUi.test.ts` に 6）、
+受け入れ e2e は `scripts/e2e-master-chat-approval.mjs`（`npm run e2e:master-chat-approval`）、
+偽 claude スタブ `scripts/fake-claude-stream.mjs` に承認 / 質問の往復を追加。
+
+**PR-M5 の実測（claude 2.1.258・PoC は `docs/poc/master-headless-poc-2026-09-05.md` を補う位置づけ）**
+
+| # | 実測 / 確定した点 | 反映先 |
+|---|---|---|
+| N | **承認の往復は claude の NDJSON に一切現れない**。`--permission-prompt-tool mcp__<server>__<tool>` を付けると、承認が要るツールのたびに**その MCP ツールが呼ばれる**（引数は `{tool_name, input, tool_use_id}`）。stdout に出るのは `tool_use` と、決着後の `tool_result` だけ。したがって**保留の供給源はサーバ側のブローカだけ**で、`claudeEvents.ts` の正規化からは permission は出ない。返す JSON は `{"behavior":"allow","updatedInput":{...}}` / `{"behavior":"deny","message":"..."}` を content[0].text にそのまま入れる（`isError` にはしない）。**このフラグは `claude --help` に出ない（隠しフラグ）が 2.1.258 で機能する**。`--mcp-config` 無しで付けると `MCP tool ... not found. Available MCP tools: none` で**起動即死**するので、`--mcp-config` があるときだけ付ける | §3.2 / `claudeArgs.ts` / `permission.ts` |
+| O | **`AskUserQuestion` も同じ承認ツールを通る**（＝質問専用の口は無い）。ここで `answers` を付けずに `allow` すると、ツール結果は `The user did not answer the questions.` になり「許可しただけ・未回答」として会話が進む。**回答を届けるには `updatedInput` に `answers: {"<質問文>": "<回答>"}` を足す**。そうすると tool_result が `Your questions have been answered: "<質問文>"="<回答>". You can now continue with these answers in mind.` になる（実測）。複数選択は `, ` 連結の 1 文字列にする | `permission.ts` / §5.2 |
+| P | **タイムアウトは持たない**（ボス裁定: 未応答は待ち続ける・自動拒否しない）。保留が消えるのは 3 系統だけ: ①ボスが答えた ②HTTP 接続が切れた（＝claude がツール呼び出しを諦めた。MCP 側の `extra.signal` → `fetch` の abort → サーバ側 `res.on("close")` → ブローカが deny で畳む）③頭脳プロセスが終わった / 新しい会話 / サーバ再起動。②③はいずれも **deny を返してツールを実行させない** | §8-R8 |
+| Q | **決着は `permissionSettled` イベントとしてトランスクリプトに載せる**（`chatState.pending` は件数しか持たないので、再接続や再起動のあとに「ボタンを出し直してよいか」が復元できない）。サーバ再起動時は復元した会話ログを走査して未決着の id を `outcome:"discarded"` で畳む。**id は会話を跨いで再利用されうる**（頭脳プロセスが入れ替わると tool_use_id の採番が振り出しに戻る）ので、判定は「一度でも settled が出たか」ではなく**その id の最後のイベントがどちらか**で行う（`unsettledRequestIds`） | §5.4 / `session.ts` |
+| R | **pending の増減は `permissionSettled` 側に一本化する**。`chatAnswer` の受領時に減らすと、破棄・中断でも同じ経路を通るため二重に減る。また `exit` → `discardAll` の順で来たときに `stopped` を `busy` へ上書きしないよう、状態を戻すのは **waiting のときだけ**にする | `session.ts` |
+| S | **AskUserQuestion の tool_use は `toolCall` バブルとしても出る**（正規化はそのまま）。承認バブルは別立てで並ぶので、UI では「ツールが呼ばれた」「回答を求められている」が 2 段に見える。これは Bash 等の承認と同じ並びで、意図どおり | §5.2 |
+
+**PR-M6 / PR-M7 への持ち越し**: 承認の「以後このツールは常に許可」（suggestions / permission rules の永続化）は入れていない
+（毎回聞く。ボス裁定の permissionMode auto を弱めないため）。ツール結果の「全部見る」・`chatHistory` の
+ページング・添付の掃除は引き続き未着手。
+
+---
+
 ## 0.7 r6 での変更（PR-M7 実装の確定事項）
 
 **PR-M7 で実装したもの**: 移行手順 docs `docs/ops/master-chat-ui.md`（新設）/ backend docs
@@ -194,14 +225,15 @@ chat master 単独で見ているときの出所を README に注記する。`co
 |---|---|---|
 | AC | **移行は 3 段・ロールバックは 1 手**という形を docs に固定した。第 2 段（別ポート評価）では `.ebi-team/` を共有すると会話 JSONL と添付保管庫が稼働側と混ざるため、`EBI_MASTER_CHAT_LOG_PATH` / `EBI_CHAT_ATTACH_DIR` / `EBI_DUMP_PATH` を一時パスへ逃がす手順を明記した（設計 §6.2 には無かった運用上の穴） | §6.2 / `docs/ops/master-chat-ui.md` §2 |
 | AD | **「再起動で切れるもの／残るもの」を表にした**。会話 JSONL と添付は残り、**claude 側のセッション・コスト累計・ヘッダの ctx は切れる**（`start()` は `--resume` 無しで launch する＝サーバ再起動は常に新しい会話。`--resume` はプロセスだけが死んだときの復帰専用）。ここは実装を読んで確定させた点で、設計書には書かれていなかった | `docs/ops/master-chat-ui.md` §4 |
-| AE | **npm scripts を 2 束にした**。`e2e:all-terminal`（ui 未指定の一式・実 claude は末尾の `e2e:spawn-delivery` のみ）と `e2e:all-chat`（context-guard スタブ → master-chat → master-chat-image）。既定の `npm test` は unit だけで枠を消費しない。未登録だった `scripts/e2e-fixed-ebi.mjs` / `e2e-master-brain.mjs` / `compare-contextpct-statusline.mjs`（PR-M6 持ち越し）も登録した | §6.4 / §9 PR-M7 |
+| AE | **npm scripts を 2 束にした**。`e2e:all-terminal`（ui 未指定の一式・実 claude は末尾の `e2e:spawn-delivery` のみ）と `e2e:all-chat`（context-guard スタブ → master-chat → master-chat-image → master-chat-approval。approval は PR-M5 マージ時に束ねへ追加）。既定の `npm test` は unit だけで枠を消費しない。未登録だった `scripts/e2e-fixed-ebi.mjs` / `e2e-master-brain.mjs` / `compare-contextpct-statusline.mjs`（PR-M6 持ち越し）も登録した | §6.4 / §9 PR-M7 |
 | AF | **規約の原文と URL は 3 箇所に置いた**（`codexBrain.ts` 冒頭 = SoT / `docs/backends/codex.md` §9 / README の該当行）。claude 側のサブスク担保（`--bare` 拒否・env deny・`apiKeySource` 検査の三重）も原文引用付きで `docs/backends/claude.md` §2 に集約した | §1.1 / §1.2 |
 | AG | **ヘッダの枠（5h / 週）はアカウント単位の latest** で、PTY エビの statusLine 由来の値と混ざる旨を docs と README に注記した（PR-M6 持ち越し）。`ctx` は chat master 自身の `turnEnd.usage` だけなので混線しない | §5.2 / `docs/ops/master-chat-ui.md` §5 |
 | AH | **添付保管庫は自動削除しない**（会話 JSONL から参照され続けるため）。掃除は運用で行う前提とし、容量の目安（月あたり数百 MB）と `find -mtime +30 -delete` の例、会話 JSONL は削除ではなく退避を勧める旨を docs/ops に書いた（PR-M4 持ち越し） | `docs/ops/master-chat-ui.md` §7 |
 | AI | **e2e をエビのセッションから回すと 2 つの env が毒になる**（実測で判明）。エビの env には `EBI_IDLE_NOTIFY=off`（`npm start` の設定を継承）と `EBI_ID=<自分の id>` が入っており、e2e が立てる一時サーバまで引き継がれて `e2e:reverse-notify` の idle 自動通知チェックと `e2e:usage` の `EBI_ID` 注入チェックが**コードとは無関係に落ちる**。束ねスクリプトの先頭で `unset EBI_ID; export EBI_IDLE_NOTIFY=on` してから並べることで固定した | §6.4 / `docs/ops/master-chat-ui.md` §6 |
 
-**PR-M5 との関係**: 承認/質問の応答送信は PR-M5 の担当（本 PR ではソースに触っていない）。docs 上は
-「現状は表示のみ・応答送信は PR-M5」と明記してある。PR-M5 マージ後にその 1 行を落とす。
+**PR-M5 との関係**: 承認/質問の応答送信は PR-M5（§0.6）で実装済み。docs（README /
+`docs/ops/master-chat-ui.md`）も「応答送信は PR-M5 で対応中」の注記を落とし、
+**承認は UI からの応答が必須**である旨に改めた。
 
 ---
 
@@ -510,7 +542,7 @@ export interface MasterBrainCapabilities {
 
 | MasterBrain | **claude**（`-p --input-format stream-json`） | **codex**（`app-server` JSON-RPC） | **gemini**（`--acp`） | **agy**（`-p --input-format stream-json`） |
 |---|---|---|---|---|
-| `start()` | **r2（実測でそのまま通った列）**: `claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --mcp-config <path> --strict-mcp-config --permission-mode auto --append-system-prompt <role> --model opus`（**`--bare` は付けない** / **`--model` を明示**＝既定は opus ではない / `--include-partial-messages` は PoC 未検証なので PR-M3 で有効化 / `--permission-prompt-tool` は PR-M5 で追加） | `codex app-server` を spawn → `thread/start`（model / cwd / sandbox） | `gemini --acp`（ACP initialize → session/new） | `agy -p --input-format stream-json --output-format stream-json` |
+| `start()` | **r2（実測でそのまま通った列）**: `claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --mcp-config <path> --strict-mcp-config --permission-mode auto --append-system-prompt <role> --model opus`（**`--bare` は付けない** / **`--model` を明示**＝既定は opus ではない / `--include-partial-messages` は PoC 未検証なので PR-M3 で有効化 / `--permission-prompt-tool` は PR-M5 で追加済み＝`--mcp-config` があるときだけ付ける・§0.6-N） | `codex app-server` を spawn → `thread/start`（model / cwd / sandbox） | `gemini --acp`（ACP initialize → session/new） | `agy -p --input-format stream-json --output-format stream-json` |
 | `send()` | stdin へ `{"type":"user","message":{"role":"user","content":"..."}}\n` | `turn/start {threadId, input}` / 実行中は `turn/steer` | ACP `session/prompt` | stdin へ `{"event":"user","message":{"content":"..."}}\n` |
 | 投入 ACK | **`--replay-user-messages` のエコー** | JSON-RPC の `id` 応答 | JSON-RPC の `id` 応答 | 明示 ACK なし（`step_update` の到着で代用） |
 | `text`（本文） | `assistant` メッセージの `text` ブロック | `item/agentMessage/delta` → `item/completed` | ACP `session/update`（agent_message_chunk） | `step_update` / `result` |
@@ -697,7 +729,7 @@ chat 化で以下が**構造的に**解決する:
 | `inbound` | from / tag(`reply`\|`idle`\|`message`) / text | **エビ返信**（ワイヤ側にしか無い）。`[reply]` タグは剥がして構造化済み＝UI に生タグを出さない |
 | `text` / `thinking` | text / partial | `partial:true` はトークン差分（`--include-partial-messages`・PR-M3 で有効化） |
 | `toolCall` / `toolResult` | id / name / input ／ id / ok / content | UI は 1 つの `<details>` に畳む |
-| `permission` / `question` | id / … | 応答は `chatAnswer`（実配線は PR-M5） |
+| `permission` / `question` | id / … | 応答は `chatAnswer`（PR-M5 で実配線）。決着は `permissionSettled`（§0.6-Q） |
 | `turnEnd` | ok / aborted / usage / costUsd / **totalCostUsd** / errorText | `totalCostUsd` はプロセス跨ぎの累計（`MasterCostLedger`）。`aborted:true` は「中断しました」でエラー表示にしない |
 | `notice` | level / text | 起動警告・stderr など |
 | `exit` | code / signal | 直後に自動復帰（notice が別途出る） |
@@ -790,7 +822,7 @@ chat 化で以下が**構造的に**解決する:
 |---|---|---|
 | `npm test` / `test:unit` | unit のみ | 使わない |
 | `e2e:all-terminal` | control / send / reverse-notify / notify-fallback / delivery-hardening / usage / viewer / viewer-persist / supervisor / fixed / minaebi / context-guard / spawn-delivery | 末尾の spawn-delivery のみ |
-| `e2e:all-chat` | context-guard（偽 claude スタブ）→ master-chat → master-chat-image | master-chat / master-chat-image |
+| `e2e:all-chat` | context-guard（偽 claude スタブ）→ master-chat → master-chat-image → master-chat-approval | master-chat / master-chat-image / master-chat-approval の実配線チェック |
 | 新規登録 | `e2e:fixed`（未登録だった `e2e-fixed-ebi.mjs`）/ `e2e:master-brain` / `compare:contextpct`（PR-M6 持ち越し） | 後 2 つは opt-in |
 
 ---
@@ -839,7 +871,7 @@ stdin への user メッセージ投入は **4 つの CLI すべてが公式に�
 | **PR-M2** ✅完了 | **`MasterSession` とサーバ配線**。feature flag `ui:"chat"`／PTY 経路の分岐／WS プロトコル拡張（`chatSend`/`chatEvent`/`chatState`/`chatSnapshot`）／会話 JSONL 永続化／mailbox → `send()` の載せ替え | `scripts/e2e-master-chat.mjs`：`chatSend` → `text`/`turnEnd`、`/control/reverse-inject` → `inbound` が**連続 10 回 100%**（2026-09-05 実測 10/10・10/10。unit +26 本 green・既存 fail 0・build 成功・`ui` 未指定で外形ゼロ差分） | **1 日** | PR-M1 |
 | **PR-M3** ✅完了 | **チャット UI**。md レンダリング（`markdown.ts` 再利用）・ツール `<details>`・`[reply]`/`[idle]` バブル・partial 逐次描画・自動追従とスクロール・再接続復元・入力欄（Enter 送信 / ⏹ 停止）・「新しい会話」 | Playwright 実画面スクショ 9 枚（`tmp/shots-m3/`）。375px でログが指スクロールできることを実測（scrollTop 0→781）。`ui:"terminal"` はピクセル比較でゼロ差分。unit +19 本 green・既存 fail 0・build 成功 | **1 日** | PR-M2 |
 | **PR-M4** ✅完了 | **入力系**。送信・⏹ 停止（`interrupt()`）・入力履歴（↑/↓ / localStorage）・画像添付・大きな貼り付けのファイル誘導 | 停止 → 続行を unit と `e2e-master-chat.mjs` で確認（10/10 継続）。履歴は再読み込み後も残る（Playwright 実測）。画像添付は `e2e-master-chat-image.mjs` が実 claude(haiku) で 7/7（ツール不使用のまま色を回答＝image ブロックが読まれている）。unit +16 本・既存 fail 0・build 成功。スクショは `tmp/shots-m4/` | **0.5 日** | PR-M3 |
-| **PR-M5** | **承認 / 質問 UI**。ebi-control（master ロール）に `approve` ツール新設 → `--permission-prompt-tool` 配線／`AskUserQuestion` の `tool_use` を選択肢 UI に／未応答スティッキーバー | `scripts/e2e-master-chat-approval.mjs`：承認往復でツール実行が継続する。未応答時に master が止まり、UI に待ち件数が出る | **1 日** | PR-M4 |
+| **PR-M5** ✅完了 | **承認 / 質問 UI**。ebi-control（master ロール）に `permission_prompt` ツール新設 → `--permission-prompt-tool` 配線／`POST /control/chat-permission`（ボスが答えるまで応答を返さない long-poll）／`PermissionBroker` と `brain.answer()` の実装／`AskUserQuestion` を選択肢 UI（複数選択・その他自由入力）に／未応答スティッキーバーの実配線／保留の破棄（プロセス終了・新しい会話・サーバ再起動） | `scripts/e2e-master-chat-approval.mjs` **17/17 green**（偽 claude 12 ＋ 実 claude(haiku) 5）。承認往復でツール実行が継続・拒否でツールが実行されず会話は続く・未応答時は master が止まり `pending=1`/waiting が出る・AskUserQuestion の選択肢応答が届く。unit +27 本 green・既存 fail 0（443 本）・`npm run build` 成功・`e2e:master-chat` 7/7 継続・`e2e-context-guard` 18/18 継続。スクショ 4 枚 `tmp/shots-m5/` | **1 日** | PR-M4 |
 | **PR-M6** ✅完了 | **usage / context / cost**。ヘッダに コスト / 文脈% / 5h・週次の枠を表示（65/70/85% で色分け・算出不能は「—」）。`MasterSession` の turnEnd 順序修正（idle → usage）で chat でも `/clear` 促しが発火する。`e2e-context-guard.mjs` に chat 経路（偽 claude・枠なし課金なし）を追加 | `e2e-context-guard.mjs` 改修版 **18/18 green**（terminal C1〜C5 ＋ chat D1〜D6）。unit +9 本 green・既存 fail 0（400 本）・`npm run build` 成功・`e2e:master-chat` 7/7（往復 10/10）。**statusLine 併走比較の誤差は最大 0.5pt**（3 ターン・haiku・statusLine の整数丸めぶんのみ）。スクショ 3 枚 `tmp/shots-m6/` | **1 日** | PR-M2 |
 | **PR-M7** ✅完了 | **移行と docs**。`docs/ops/master-chat-ui.md`（3 段移行・ロールバック・再起動で切れる/残る表・添付の掃除）／`docs/backends/claude.md` 新設（ヘッドレス master とサブスク担保の三重の歯止め）／`codex.md` §9・`gemini.md` §13（規約原文と対象外の理由）／README の「master チャット UI」節／config 例の `ui`/`brain`／`.env.sample` の 3 キー／npm scripts の整理（`test`・`e2e:fixed`・`e2e:master-brain`・`compare:contextpct` 登録と `e2e:all-terminal` / `e2e:all-chat` の束ね）。**src/ の変更 0** | `npm run e2e:all-terminal` **全 green**（control 12/12・send 9/9・reverse-notify 14/14・notify-fallback 10/10・delivery-hardening 10/10・usage 14/14・viewer 40/40・viewer-persist 16/16・supervisor 7/7・fixed 7/7・minaebi 4/4・context-guard 18/18・spawn-delivery 5/5）／`npm run e2e:all-chat` は context-guard 18/18 ＋ master-chat・master-chat-image を実 claude で 1 回ずつ／unit 415 pass 0 fail・`npm run build` 成功／規約の原文と URL は codex.md §9・claude.md §2 に記載 | **0.5 日** | PR-M5 / PR-M6 |
 | **必須合計** | | | **6.0〜7.5 日** | |

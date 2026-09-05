@@ -131,10 +131,11 @@ node scripts/gen-master-mcp.mjs
 | --- | --- | --- |
 | `npm test` / `npm run test:unit` | unit のみ | 使わない |
 | `npm run e2e:all-terminal` | `ui` 未指定（terminal）の一式: control / send / reverse-notify / notify-fallback / delivery-hardening / usage / viewer / viewer-persist / supervisor / fixed / minaebi / context-guard / spawn-delivery | **最後の `e2e:spawn-delivery` のみ使う** |
-| `npm run e2e:all-chat` | chat 経路の一式: context-guard（偽 claude スタブ）→ master-chat → master-chat-image | **master-chat / master-chat-image が使う** |
+| `npm run e2e:all-chat` | chat 経路の一式: context-guard（偽 claude スタブ）→ master-chat → master-chat-image → master-chat-approval | **master-chat / master-chat-image / master-chat-approval の実配線チェックが使う** |
 | `npm run e2e:context-guard` | terminal C1〜C5 ＋ chat D1〜D6（chat 側は `scripts/fake-claude-stream.mjs` を `claude` として PATH 先頭に置く） | 使わない |
 | `npm run e2e:master-chat` | chat の往復 + `reverse-inject` → `inbound` を連続 10 回 | 使う（haiku・`EBI_E2E_CHAT_ROUNDS` で回数を減らせる） |
 | `npm run e2e:master-chat-image` | 画像添付が実際に turn に届くか（色を答えさせる） | 使う（haiku・1 往復） |
+| `npm run e2e:master-chat-approval` | 承認 / 質問の応答（ブローカ・MCP `permission_prompt`・UI 配線）17 チェック | 使う（haiku・承認 1 往復 + 質問 1 往復。`EBI_E2E_APPROVAL_REAL=0` で偽 claude のみに絞れる） |
 | `npm run e2e:master-brain` | `ClaudeHeadlessBrain` 単体の 2 ターン結合 | 使う（opt-in） |
 | `npm run compare:contextpct` | ヘッドレスの算出 `ctx%` と statusLine の突き合わせ | 使う（opt-in・haiku） |
 
@@ -176,4 +177,30 @@ find .ebi-team/chat-attachments -type f -mtime +30 -delete
 | 起動直後に master が停止して notice が出る | `ANTHROPIC_API_KEY` 等が env に残っている（従量課金への転落を防ぐ preflight が起動を拒否する） | env から外す（`docs/backends/claude.md` §2） |
 | `brain:"gemini"` で起動しない | 未実装（裁定 Q-2 で対象外） | `claude`（既定）に戻す |
 | ヘッダが全部 `—` | まだ 1 ターンも終わっていない | 1 往復すると埋まる |
-| 承認 / 質問のバブルが出たまま master が止まる | 未応答の承認が 1 件でもあるとターンが進まない。**応答の送信は PR-M5 で対応中**（現状はバブルの表示と待ち件数のスティッキーバーのみ） | 当面は `permissionMode: "auto"` で承認が要らない範囲の作業に留めるか、PR-M5 のマージを待つ |
+| 承認 / 質問のバブルが出たまま master が止まる | 未応答の承認が 1 件でもあるとターンが進まない（**自動拒否もタイムアウトも無い**。§9 参照） | チャットのバブルで「許可 / 拒否」を答える（質問なら回答を選ぶ）。承認そのものを減らしたいなら `permissionMode: "auto"` の範囲で使う |
+
+## 9. 承認 / 質問（permission / question）
+
+`ui:"chat"` の master が承認の要るツール（Bash など）や `AskUserQuestion` を呼ぶと、チャットに**承認バブル**が出て、
+入力欄の上に待ち件数のスティッキーバーが出る。**応答は UI から必須**で、答えるまでそのターンは進まない。
+
+- **自動拒否はしない・タイムアウトも無い**（ボス裁定）。放置すると master は止まったままになる。
+- 保留が消えるのは次の 4 系統だけ:
+  1. ボスが UI で答えた（許可 / 拒否 / 質問への回答）
+  2. HTTP 接続が切れた（claude 側がツール呼び出しを諦めた）
+  3. 頭脳プロセスが終わった / 新しい会話になった
+  4. サーバを再起動した
+- 2〜4 はいずれも **deny で畳まれる**（ツールは実行されない）ので、「気付かないうちに実行されていた」は起こらない。
+- 「以後このツールは常に許可」は持たない（毎回聞く）。`permissionMode: "auto"` を弱めないため。
+
+**裏側の仕組み**（詰まったときの当たりを付ける用）:
+
+- 承認の往復は claude の NDJSON には**一切現れない**。`--permission-prompt-tool mcp__<server>__<tool>` が指す
+  MCP ツールの呼び出しとして届く（引数は `{tool_name, input, tool_use_id}`）。ebi-team ではこれが
+  **`permission_prompt`（master ロール専用ツール。作業エビの MCP には露出しない）**。
+- `--permission-prompt-tool` は **`--mcp-config` があるときだけ**付ける。無い状態で付けると
+  `MCP tool ... not found. Available MCP tools: none` で**起動即死**する（隠しフラグ・2.1.258 で動作確認）。
+- 決着は `permissionSettled` として会話 JSONL に載るので、再接続 / 再起動のあとに
+  「どのバブルをまだ出してよいか」が復元できる。サーバ再起動時、未決着のものは `discarded` として畳まれる。
+- 受け入れ e2e は `npm run e2e:master-chat-approval`（大半は偽 claude スタブ。最後の 2 チェックだけ実 claude で
+  `--permission-prompt-tool` → `permission_prompt` → 制御 API の実配線を確かめる。`EBI_E2E_APPROVAL_REAL=0` で省ける）。

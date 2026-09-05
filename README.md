@@ -228,6 +228,8 @@ UI では各エビに backend バッジ（🟣 claude / 🟢 codex / 🔵 gemini
 - **スマホ**: ログが通常の DOM スクロールになるため、ターミナル表示で起きていた「スマホでログを遡れない」問題が構造的に消えます。
 - **ヘッダの表示**: 累計コスト / 文脈使用率 / 5h・週次の枠を表示します（65 / 70 / 85% で色分け・算出できない値は `—`）。**枠（5h / 週）はアカウント単位の最新値**で、PTY で動いている作業エビの statusLine 由来の値と混ざります（chat master 単独の消費量ではありません）。文脈使用率は chat master 自身のターン結果だけを使うのでこの混線はありません。
 - **頭脳（`brain`）**: 既定 `claude`。`codex` は **OpenAI 公式が「programmatic な Codex CLI ワークフローには API キーを使え」と明記しており規約グレー**のため、明示指定したときだけの opt-in です（原文と URL は `docs/backends/codex.md` §9）。`gemini` は現行 CLI に `--input-format` が無いため対象外（`docs/backends/gemini.md` §13）。未実装 id は黙って claude に落とさず明示エラーになります。
+- **承認 / 質問（重要）**: claude が承認の要るツール（Bash など）や `AskUserQuestion` を使うと、チャットに承認バブルが出て**そのターンは応答があるまで進みません**。**自動拒否もタイムアウトもありません**（ボス裁定）。保留が消えるのは ①ボスが UI で答える ②HTTP 接続が切れる ③頭脳プロセスの終了 / 新しい会話 / サーバ再起動 の 4 系統だけで、②③は deny で畳まれツールは実行されません。**未応答のまま放置すると master は止まったままになる**ので、バブル（と入力欄上のスティッキーバー）が出たら必ず答えてください。
+- **承認の裏側**: 承認の往復は claude の NDJSON には現れず、`--permission-prompt-tool` が指す MCP ツール — ebi-team では **`permission_prompt`（master ロール専用。作業エビには見えない）** — の呼び出しとして届きます。このフラグは `--mcp-config` があるときだけ付けます（無い状態で付けると `MCP tool ... not found` で起動即死するため）。
 - **会話ログ / 添付**: 会話は `.ebi-team/master-chat.jsonl` に残り、サーバ再起動後もチャット画面に復元されます（ターミナル時代は再起動で消えていました）。画像などの添付は `.ebi-team/chat-attachments/` に保存され、**自動削除はありません**（運用で消す。目安と手順は `docs/ops/master-chat-ui.md` §7）。
 - **切り替えとロールバック**: env `EBI_MASTER_UI=terminal|chat` が config より優先します。まず別ポートで `EBI_MASTER_UI=chat` を試し、問題なければ config に `"ui": "chat"` を入れる、という 3 段移行を推奨します。戻すのは env か config を戻して再起動するだけ（1 手）。手順と「再起動で切れるもの／残るもの」の表は **[docs/ops/master-chat-ui.md](docs/ops/master-chat-ui.md)**。
 

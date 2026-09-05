@@ -6,6 +6,7 @@ import type {
 } from "../shared/protocol.ts";
 import {
   ChatTranscript,
+  firstUnsettledPending,
   formatBytes,
   formatContextPct,
   formatCost,
@@ -14,6 +15,7 @@ import {
   LARGE_PASTE_CHARS,
   NO_RATE_LIMITS,
   oneLine,
+  settledLabel,
   stateLabel,
   stringifyInput,
   summarizeToolInput,
@@ -37,8 +39,10 @@ import { renderMarkdownInto } from "./viewer.ts";
  * 入力系（PR-M4）: ↑/↓ の入力履歴（localStorage 永続・直近 50 件）、画像のペースト/ドロップ添付
  * （サーバへ保存してから image ブロックとして送る）、大きな貼り付けのファイル誘導。
  *
- * 表示のみで完結しない部分（承認/質問への応答＝chatAnswer）は **PR-M5**。
- * ここでは pending バブルを出すが送信ボタンは無効（灰色 + tooltip）にしてある。
+ * 承認/質問（PR-M5）: pending バブルに実ボタンを出し、`chatAnswer` で応答を返す。
+ * 承認は「許可 / 拒否」、質問は選択肢（複数選択は checkbox）＋「その他（自由入力）」。
+ * 決着済みかどうかは `permissionSettled` イベント由来の `settled` で決まるので、
+ * 再接続やサーバ再起動のあとでもボタンが復活したりしない。
  */
 export class ChatPanel {
   private readonly head: HTMLElement;
@@ -80,6 +84,12 @@ export class ChatPanel {
     private readonly onSend: (id: string, text: string, attachments: ChatAttachment[]) => void,
     private readonly onStop: (id: string) => void,
     private readonly onNew: (id: string) => void,
+    /** 承認/質問への応答（PR-M5）。WS `chatAnswer` を送る。 */
+    private readonly onAnswer: (
+      id: string,
+      requestId: string,
+      answer: { allow?: boolean; choice?: string[]; text?: string },
+    ) => void = () => {},
   ) {
     this.el.classList.add("chat");
 
@@ -117,6 +127,8 @@ export class ChatPanel {
     const foot = div("chat-foot");
     this.pendingBar = div("chat-pending-bar");
     this.pendingBar.hidden = true;
+    this.pendingBar.title = "クリックすると未応答の承認/質問までスクロールします";
+    this.pendingBar.addEventListener("click", () => this.scrollToPending());
     this.input = document.createElement("textarea");
     this.input.className = "chat-input";
     this.input.rows = 1;
@@ -407,10 +419,21 @@ export class ChatPanel {
     this.newBtn.disabled = this.state === "starting";
     if (this.pending > 0) {
       this.pendingBar.hidden = false;
-      this.pendingBar.textContent = `⏸ 未応答の承認/質問が ${this.pending} 件あります（応答は PR-M5 で対応）`;
+      this.pendingBar.textContent =
+        `⏸ 未応答の承認/質問が ${this.pending} 件あります（応答するまで master は止まったままです）`;
     } else {
       this.pendingBar.hidden = true;
     }
+  }
+
+  /** 未応答の承認/質問までスクロールする（スティッキーバーのクリック）。 */
+  private scrollToPending(): void {
+    const index = firstUnsettledPending(this.transcript.items);
+    const el = index >= 0 ? this.rendered[index] : null;
+    if (!el) return;
+    el.scrollIntoView({ block: "center" });
+    el.classList.add("flash");
+    window.setTimeout(() => el.classList.remove("flash"), 1200);
   }
 
   private onScroll(): void {
@@ -484,7 +507,10 @@ export class ChatPanel {
   private renderItem(index: number): void {
     const item = this.transcript.items[index];
     if (!item) return;
-    const next = buildItem(item);
+    const next = buildItem(item, (requestId, answer) => {
+      if (!this.masterId) return;
+      this.onAnswer(this.masterId, requestId, answer);
+    });
     const prev = this.rendered[index];
     if (prev) {
       // ツールの `<details>` は開閉状態をユーザーが持っているので引き継ぐ。
@@ -502,7 +528,10 @@ export class ChatPanel {
 // ===== アイテム 1 件 → DOM =====
 
 /** 1 アイテムを表す要素を作る（テキストはすべて textContent 経由＝XSS 安全）。 */
-function buildItem(item: ChatItem): HTMLElement {
+function buildItem(
+  item: ChatItem,
+  onAnswer: (requestId: string, answer: { allow?: boolean; choice?: string[]; text?: string }) => void,
+): HTMLElement {
   switch (item.kind) {
     case "user": {
       const row = bubbleRow("user");
@@ -577,24 +606,23 @@ function buildItem(item: ChatItem): HTMLElement {
     }
     case "pending": {
       const row = bubbleRow("assistant");
-      const bubble = div("chat-bubble pending");
+      const bubble = div(`chat-bubble pending${item.settled ? ` settled-${item.settled}` : ""}`);
       bubble.append(meta(item.variant === "permission" ? "⏸ 承認待ち" : "❓ 質問", item.ts));
       const t = div("chat-pending-title");
       t.textContent = item.title;
       const d = div("chat-pending-detail");
       d.textContent = oneLine(item.detail, 400);
       bubble.append(t, d);
-      const actions = div("chat-pending-actions");
-      const labels = item.options.length > 0 ? item.options : ["許可", "拒否"];
-      for (const label of labels) {
-        const b = document.createElement("button");
-        b.className = "chat-pending-btn";
-        b.textContent = label;
-        b.disabled = true;
-        b.title = "PR-M5 で対応（この PR では応答を送信しません）";
-        actions.appendChild(b);
+      if (item.settled) {
+        // 決着済み。結果だけを出してボタンは一切出さない（二度押しの余地を作らない）。
+        const done = div("chat-pending-settled");
+        done.textContent = settledLabel(item.settled, item.variant, item.answer);
+        bubble.appendChild(done);
+      } else if (item.variant === "permission") {
+        bubble.appendChild(permissionActions(item.requestId, onAnswer));
+      } else {
+        bubble.appendChild(questionForm(item, onAnswer));
       }
-      bubble.appendChild(actions);
       row.appendChild(bubble);
       return row;
     }
@@ -627,6 +655,84 @@ function buildItem(item: ChatItem): HTMLElement {
 }
 
 /** 長すぎるツール結果を丸める（全文は PR-M4 で「全部見る」を付ける）。 */
+// ===== 承認 / 質問の応答 UI（PR-M5）=====
+
+/**
+ * 承認（permission）のボタン列。
+ *
+ * 押した瞬間にボタンを畳む（＝二度押しを構造的に潰す）。実際の「決着」表示は
+ * サーバから返る `permissionSettled` で置き換わるので、ここでは押下済みを示すだけ。
+ */
+function permissionActions(
+  requestId: string,
+  onAnswer: (requestId: string, answer: { allow?: boolean; choice?: string[]; text?: string }) => void,
+): HTMLElement {
+  const actions = div("chat-pending-actions");
+  const mk = (label: string, allow: boolean, cls: string): HTMLButtonElement => {
+    const b = document.createElement("button");
+    b.className = `chat-pending-btn ${cls}`;
+    b.textContent = label;
+    b.addEventListener("click", () => {
+      for (const el of actions.querySelectorAll("button")) el.disabled = true;
+      onAnswer(requestId, { allow });
+    });
+    return b;
+  };
+  actions.append(mk("✅ 許可", true, "allow"), mk("⛔ 拒否", false, "deny"));
+  return actions;
+}
+
+/**
+ * 質問（AskUserQuestion）の選択肢フォーム。
+ *
+ * 複数選択（multiSelect）は checkbox、単一選択は radio。加えて **「その他」の自由入力**を
+ * 常に置く（AskUserQuestion の Other 相当）。何も選ばず自由入力だけでも送れる。
+ */
+function questionForm(
+  item: Extract<ChatItem, { kind: "pending" }>,
+  onAnswer: (requestId: string, answer: { allow?: boolean; choice?: string[]; text?: string }) => void,
+): HTMLElement {
+  const wrap = div("chat-question");
+  const group = `q-${item.requestId}-${item.seq}`;
+  const inputs: HTMLInputElement[] = [];
+  item.options.forEach((label, i) => {
+    const row = document.createElement("label");
+    row.className = "chat-question-option";
+    const box = document.createElement("input");
+    box.type = item.multi ? "checkbox" : "radio";
+    box.name = group;
+    box.value = label;
+    inputs.push(box);
+    const text = span("chat-question-label", label);
+    row.append(box, text);
+    const note = item.optionNotes[i];
+    if (note) row.appendChild(span("chat-question-desc", note));
+    wrap.appendChild(row);
+  });
+
+  const other = document.createElement("input");
+  other.type = "text";
+  other.className = "chat-question-other";
+  other.placeholder = "その他（自由入力）";
+
+  const actions = div("chat-pending-actions");
+  const submit = document.createElement("button");
+  submit.className = "chat-pending-btn allow";
+  submit.textContent = "回答する";
+  submit.addEventListener("click", () => {
+    const choice = inputs.filter((b) => b.checked).map((b) => b.value);
+    const text = other.value.trim();
+    if (choice.length === 0 && !text) return; // 空回答は送らない（master が空文字で困る）
+    submit.disabled = true;
+    for (const b of inputs) b.disabled = true;
+    other.disabled = true;
+    onAnswer(item.requestId, { choice, ...(text ? { text } : {}) });
+  });
+  actions.appendChild(submit);
+  wrap.append(other, actions);
+  return wrap;
+}
+
 function clip(text: string, max = 2000): string {
   return text.length > max ? `${text.slice(0, max)}\n…（${text.length - max} 文字省略）` : text;
 }
