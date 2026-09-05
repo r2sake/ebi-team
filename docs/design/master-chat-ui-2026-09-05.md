@@ -1,7 +1,9 @@
 # master を「専用チャット UI + バックエンド非依存のヘッドレス頭脳」に作り直す設計
 
 - 作成: 2026-09-05 engineer エビ（master 委譲・**設計のみ / 実装なし**）
-- ブランチ: `ebi/ebiteam-master-chat-ui-design`（worktree・push なし）
+- **r2: 2026-09-05 更新**（PR-M0 PoC の実測とボス裁定を反映。PR-M1 実装と同じ PR で改訂）。
+  変更点の一覧は §0.1。実測の一次資料は `docs/poc/master-headless-poc-2026-09-05.md`
+- ブランチ: `ebi/ebiteam-master-chat-ui-design` → r2 は `ebi/ebiteam-master-chat-m1`
 - 前提資料: `docs/multibackend-plan-r2.md` / `docs/backends/codex.md` / `docs/backends/gemini.md` /
   `docs/research/antigravity-cli-2026-09-05.md`（別ブランチ `772bd06`）/
   `docs/research/master-quota-claude-pro-2026-09-05.md`（別ブランチ `998bd51`）
@@ -41,12 +43,49 @@
    （先行調査の結論どおり）。MasterBrain の射影表には載せるが、**実装は保留**（§1.4）。
 9. **最大の設計リスクは「master の usage/context をどこから取るか」。** 現行 `contextGuard` は
    **master の statusLine（PTY 経由）** を唯一の入力にしているが、ヘッドレスに statusLine は無い。
-   → stream-json の `result` イベントの `usage` / `total_cost_usd` に載せ替える（§8-R3）。ここは **要 PoC**。
+   → stream-json の**ターン最後の `assistant` イベントの `message.usage`** と
+    `result.modelUsage[model].contextWindow` から算出して載せ替える（§8-R3）。**r2 で PoC 済み・確定**。
 10. **並存は feature flag 1 個で足りる。** `fixedEbi[].ui: "terminal" | "chat"`（既定 `terminal`）。
     chat のとき **PTY を一切起動しない**別ライフサイクルに分岐する。ロールバックは config を戻して再起動するだけ。
 11. **PR は 8 本（各 ≤1 日）、必須 6.0〜7.5 日**。codex/gemini の MasterBrain は任意 PR で +2〜3 日（§9）。
 12. **ボス裁定が要るのは 5 点**（§10）。うち最重要は「codex を master 頭脳に使うか（規約グレー）」と
     「長文脈 313k 中央値のヘッドレス resume 運用をどう切るか」。
+
+---
+
+## 0.1 r2 での変更（PR-M0 実測 + ボス裁定の反映）
+
+**ボス裁定（2026-09-05・確定）**
+
+| # | 裁定 |
+|---|---|
+| Q-1 | **codex も master 頭脳の対象に入れる**。既定は claude、codex は `brain:"codex"` 明示時のみの opt-in。規約グレーの点は docs に原文と URL を明記する |
+| Q-2 | **gemini は対象外**（PR-M9 は切らない） |
+| Q-3 | 長文脈は **「新しい会話」ボタン先行**（自動切断は入れない） |
+| Q-4 | **ターミナル master は残す**（flag 併存） |
+| Q-5 | **permissionMode は `auto` 継続** |
+| Q-6 | **contextGuard の閾値は割合ベース（65/70/85%）で据え置き**（§5-D の再裁定要求への回答） |
+
+**PoC 実測による設計の訂正（本文の該当節も書き換え済み）**
+
+| # | 訂正 | 反映先 |
+|---|---|---|
+| A | `system/init` は**最初の user メッセージ送信後**にしか出ず、**毎ターン再送**される。init 待ちで ready 判定するとデッドロックする | §3.1 `start()` / §4.3 |
+| B | 起動直後に SessionStart hook の `system/hook_started` `system/hook_response` が巨大本文で流れる。**未知の `system.subtype` は捨てる** | §4.3 |
+| C | contextGuard の入力は `result.usage` では**なく**「ターン最後の `assistant` の `message.usage`（input + cache_read + cache_creation）」÷「`result.modelUsage[model].contextWindow`」。`result.usage` はターン内 API リクエストの合計で**非単調** | §3.1 `MasterUsage` / §8-R3 |
+| D | opus-5 の文脈窓は **1,000,000**。65/70/85% は 200k 窓前提の数字だったが、**割合据え置き**（Q-6）。到達点が変わることを README に注記する | §8-R3 / §10 Q-6 |
+| E | `total_cost_usd` は**プロセス単位**の積算で `--resume` すると 0 に戻る。累計はサーバ側でプロセスを跨いで足す（`MasterCostLedger`） | §3.1 / §8-R1 |
+| F | busy 中の投入は**キューされず走行中ターンに合流**する（`queued_turn_count` は 0 のまま）＝「待機 N 件」UI は不要。replay ACK は `tool_result` も同じ `type:"user"` で流れるので **text ブロック一致で照合し tool_result を弾く**。ACK は即時でない（3.4s / 4.7s）ので**短いタイムアウトで再送しない** | §2.3 / §5.2 |
+| G | 中断は SIGINT ではなく **`control_request` の `interrupt`（stdin 1 行・実測 19ms）**。直後の `result` は `is_error:true` / `subtype:"error_during_execution"` / `terminal_reason:"aborted_streaming"` で来るので、**通常エラー通知に化けさせない分岐**（`turnEnd.aborted`）を入れる | §3.1 / §8-R8 |
+| H | **CLI の既定モデルは opus ではない**（実測 `claude-fable-5-1`）ので `--model opus` を明示する。`--strict-mcp-config` でも ebi-control は connected になり、`--dangerously-load-development-channels` は**不要** | §3.2 |
+| I | `system/init.apiKeySource` が **`"none"`** を返す＝サブスク OAuth のプロセス自己申告。**`none` 以外なら起動拒否**（`--bare` 拒否 + env deny に加えた三重目の歯止め） | §1.1 / §8-R2 |
+| J | codex: `turn/start` の `input` は**配列**、`turn/steer` は `expectedTurnId` 必須、item は `item.type`、最終回答は `agentMessage` かつ `phase === "final_answer"` | §3.2 |
+| K | 枠（レート制限）の可視化は**バックエンド依存**。codex は `account/rateLimits/updated` で 5h / 週次と `planType` が取れるが、claude 頭脳では取れない | §5.2 |
+
+**PR-M1 で実装したもの（本 PR）**: `src/server/master/`（`brain.ts` 抽象 / `claudeArgs.ts` 引数・env deny・preflight /
+`claudeEvents.ts` NDJSON 正規化 / `claudeBrain.ts` 実装 / `codexBrain.ts` stub）＋ unit 50 本
+＋ opt-in 結合スクリプト `scripts/e2e-master-brain.mjs`（既定では走らせない）。
+サーバ本体からは**まだ 1 箇所も呼ばれていない**（外形ゼロ差分）。UI 配線は PR-M2。
 
 ---
 
@@ -234,9 +273,14 @@ sequenceDiagram
 
 - **`--replay-user-messages` が「届いた」の一次証拠**になる。現行の「PTY へ書いた本文が画面にエコーされたか」という
   脆い照合（`src/shared/deliveryTag.ts` の不変条件）を、**プロトコル上の ACK に置き換えられる**。
-- master が busy（ターン実行中）でも stdin へ書ける。claude 側が**キューイングして順に処理する**
-  （Agent SDK docs: "Queued messages: send multiple messages that process sequentially"）。
-  → 現行の「busy だと注入が滞留する」問題が消える。**要 PoC**（CLI 単体でのキュー挙動確認）。
+- master が busy（ターン実行中）でも stdin へ書ける。**r2 実測（修正点 F）: キューではなく
+  「走行中のターンに合流」する**（`result.queued_turn_count` は 0 のまま、同じターンの応答で
+  割り込み内容を受領し、次ターンでも取りこぼさない）。→ 現行の「busy だと注入が滞留する」問題が
+  消えるだけでなく、**「待機 N 件」という UI 概念そのものが不要**になる。
+- **r2 実測: ACK は即時ではない**（起動直後 3.4s / 走行中割り込み 4.7s）。短いタイムアウトでの
+  再送は二重投入になるので、**待つが再送はしない**設計にする。
+- **r2 実測: replay には `tool_result` も同じ `type:"user"` で混ざる**。ACK 照合は
+  「自分が投げた text ブロックと一致する user イベント」で行い、`tool_result` を弾くこと。
 
 ---
 
@@ -245,7 +289,8 @@ sequenceDiagram
 ### 3.1 インターフェース案
 
 ```ts
-// src/server/master/brain.ts（新設）。既存 EbiBackend（PTY 起動引数の抽象）とは**別物**。
+// src/server/master/brain.ts（**r2: PR-M1 で実装済み。SoT は実ファイル側**）。
+// 既存 EbiBackend（PTY 起動引数の抽象）とは**別物**。
 // 共有するのは ControlMcpSpec（backends/types.ts）だけ。
 
 export type MasterBrainId = "claude" | "codex" | "gemini" | "agy";
@@ -267,28 +312,50 @@ export interface MasterBrainStartOptions {
 
 /** UI へ流す正規化イベント（backend 非依存）。 */
 export type MasterEvent =
-  | { kind: "session";   sessionId: string; model: string | null; mcpServers: {name:string;status:string}[] }
+  | { kind: "session";   sessionId: string; model: string | null;
+      /** r2: init の自己申告。"none" 以外なら従量課金経路の疑いで起動拒否（修正点 I）。 */
+      apiKeySource: string | null;
+      mcpServers: {name:string;status:string}[]; capabilities: string[] }
+  /** r2: 投入 ACK（--replay-user-messages）。tool_result と区別するため text 一致で照合する（修正点 F）。 */
+  | { kind: "ack";       text: string }
   | { kind: "text";      text: string; partial: boolean }          // assistant 本文（partial=トークン差分）
   | { kind: "thinking";  text: string; partial: boolean }
   | { kind: "toolCall";  id: string; name: string; input: unknown }
   | { kind: "toolResult";id: string; ok: boolean; content: string }
   | { kind: "permission";id: string; toolName: string; input: unknown; suggestions?: string[] }
   | { kind: "question";  id: string; header: string; question: string; options: {label:string;description?:string}[]; multi: boolean }
-  | { kind: "turnEnd";   ok: boolean; usage: MasterUsage | null; costUsd: number | null }
+  | { kind: "turnEnd";   ok: boolean;
+      /** r2: ユーザー中断か（修正点 G）。true のとき UI は「中断しました」を出しエラー扱いしない。 */
+      aborted: boolean;
+      usage: MasterUsage | null;
+      /** このプロセスの累積コスト。resume で 0 に戻るのでサーバ側で足し込む（修正点 E）。 */
+      costUsd: number | null;
+      errorText: string | null }
   | { kind: "notice";    level: "info"|"warn"|"error"; text: string }
-  | { kind: "exit";      code: number | null };
+  | { kind: "exit";      code: number | null; signal: string | null };
 
 export interface MasterUsage {
   input: number | null; output: number | null;
   cacheRead: number | null; cacheCreation: number | null;
+  /**
+   * r2（修正点 C）: 文脈占有トークン = input + cache_read + cache_creation。
+   * 供給源は **ターン最後の assistant イベントの message.usage**。
+   * `result.usage` はターン内 API リクエストの合計で**非単調**なので使ってはならない。
+   */
+  contextTokens: number | null;
+  /** 文脈窓。claude は result.modelUsage[model].contextWindow（opus-5 は 1,000,000）。 */
+  contextSize: number | null;
   /** 文脈使用率(%)。算出できない backend は null（UI は「—」）。 */
   contextUsedPct: number | null;
-  contextSize: number | null;
 }
 
 export interface MasterBrain {
   readonly id: MasterBrainId;
-  /** 起動（プロセス生成 + MCP 接続待ち）。resolve は「1 通目を受け付けられる」状態。 */
+  /**
+   * 起動。resolve は「1 通目を受け付けられる」状態＝**プロセスが立って stdin が書ける**まで。
+   * r2（修正点 A）: **`system/init` を待ってはいけない**。init は最初の user メッセージ送信後に
+   * しか出ないため、init 待ちで ready 判定するとデッドロックする（実測: 2 分待っても出ない）。
+   */
   start(opts: MasterBrainStartOptions): Promise<void>;
   /** ユーザー発話（およびエビからの reply）を投入する。 */
   send(input: { text: string; images?: {mediaType:string; base64:string}[] }): Promise<{ acked: boolean }>;
@@ -296,7 +363,11 @@ export interface MasterBrain {
   events(): AsyncIterable<MasterEvent>;
   /** 承認/質問への応答（permission / question の id に対して返す）。 */
   answer(id: string, decision: { allow?: boolean; choice?: string[]; note?: string }): Promise<void>;
-  /** 実行中ターンの中断（会話は殺さない）。 */
+  /**
+   * 実行中ターンの中断（会話は殺さない）。
+   * r2（修正点 G）: SIGINT / SIGTERM は使わない。stdin へ `control_request`（subtype:"interrupt"）を
+   * 1 行書くだけで止まる（実測 19ms）。
+   */
   interrupt(): Promise<void>;
   /** 再開に必要な id（プロセス落ち後の resume 用に MasterSession が永続化する）。 */
   sessionId(): string | null;
@@ -323,7 +394,7 @@ export interface MasterBrainCapabilities {
 
 | MasterBrain | **claude**（`-p --input-format stream-json`） | **codex**（`app-server` JSON-RPC） | **gemini**（`--acp`） | **agy**（`-p --input-format stream-json`） |
 |---|---|---|---|---|
-| `start()` | `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --mcp-config <path> --strict-mcp-config --permission-mode auto --permission-prompt-tool mcp__ebi-control__approve --append-system-prompt <role> --model fable`（**`--bare` は付けない**） | `codex app-server` を spawn → `thread/start`（model / cwd / sandbox） | `gemini --acp`（ACP initialize → session/new） | `agy -p --input-format stream-json --output-format stream-json` |
+| `start()` | **r2（実測でそのまま通った列）**: `claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --mcp-config <path> --strict-mcp-config --permission-mode auto --append-system-prompt <role> --model opus`（**`--bare` は付けない** / **`--model` を明示**＝既定は opus ではない / `--include-partial-messages` は PoC 未検証なので PR-M3 で有効化 / `--permission-prompt-tool` は PR-M5 で追加） | `codex app-server` を spawn → `thread/start`（model / cwd / sandbox） | `gemini --acp`（ACP initialize → session/new） | `agy -p --input-format stream-json --output-format stream-json` |
 | `send()` | stdin へ `{"type":"user","message":{"role":"user","content":"..."}}\n` | `turn/start {threadId, input}` / 実行中は `turn/steer` | ACP `session/prompt` | stdin へ `{"event":"user","message":{"content":"..."}}\n` |
 | 投入 ACK | **`--replay-user-messages` のエコー** | JSON-RPC の `id` 応答 | JSON-RPC の `id` 応答 | 明示 ACK なし（`step_update` の到着で代用） |
 | `text`（本文） | `assistant` メッセージの `text` ブロック | `item/agentMessage/delta` → `item/completed` | ACP `session/update`（agent_message_chunk） | `step_update` / `result` |
@@ -332,10 +403,10 @@ export interface MasterBrainCapabilities {
 | `toolCall` / `toolResult` | ✅ `tool_use` / `tool_result` ブロック | ✅ `item/started` / `item/completed`（`commandExecution` 等）＋ `item/commandExecution/outputDelta` | ✅ `session/update`（tool_call） | ⚠️ `step_update` 内（構造は要確認） |
 | `permission`（承認） | ✅ `--permission-prompt-tool` に指定した **MCP ツールへの呼び出し**として届く（ebi-control に `approve` を新設） | ✅ `item/commandExecution/requestApproval` / `item/fileChange/requestApproval` → `accept`/`acceptForSession`/`decline`/`cancel` | ✅ ACP `session/request_permission` | ❌（`--dangerously-skip-permissions` か policy 設定の二択） |
 | `question`（AskUserQuestion 相当） | ✅ 通常の `tool_use`（`AskUserQuestion`）として stream に出る。**`--permission-prompts none` にすると消える**ので使わない | ⚠️ 相当機能なし（`mcpServer/elicitation/request` は MCP 由来のみ） | ⚠️ 相当機能なし | ❌ |
-| `interrupt()` | ⚠️ **SIGINT**（`SIGTERM` はターンを未完で残す・exit 143）。stdin 制御リクエストでの中断は `capabilities: interrupt_receipt_v1` を feature-detect して使う（**要 PoC**） | ✅ `turn/interrupt`（`status:"interrupted"`） | ✅ ACP `session/cancel` | ⚠️ 未確認 |
+| `interrupt()` | ✅ **r2 実測: `control_request`（`{"type":"control_request","request_id":…,"request":{"subtype":"interrupt"}}` を stdin へ 1 行）で 19ms**。SIGINT / SIGTERM は不要。直後の `result` は `is_error:true` / `error_during_execution` / `terminal_reason:"aborted_streaming"` | ✅ `turn/interrupt`（`status:"interrupted"`） | ✅ ACP `session/cancel` | ⚠️ 未確認 |
 | `resume` | ✅ `--resume <session_id>` / `--session-id <uuid>` / `--fork-session` | ✅ `thread/resume` / `thread/fork` | ✅ `-r latest`（ACP 経由の可否は要確認） | ⚠️ 未確認 |
 | `cost` | ✅ `result.total_cost_usd`（client-side estimate） | ⚠️ `turn/completed` の usage（要確認） | ⚠️ `result.stats` | ⚠️ 未確認 |
-| `contextPct` | ⚠️ **直接は出ない**。`result.usage`（input + cache_read + cache_creation）と model の context window から**算出**する（要 PoC） | ❌ | ❌ | ❌ |
+| `contextPct` | ✅ **r2 確定**: 「ターン最後の `assistant` の `message.usage`（input + cache_read + cache_creation）」÷「`result.modelUsage[model].contextWindow`」。**`result.usage` は非単調なので使わない** | ❌ | ❌ | ❌ |
 | `images` | ✅ content ブロックに `{"type":"image","source":{"type":"base64",...}}` | ✅ `turn/start` の input が images 対応 | ⚠️ 未確認 | ⚠️ 未確認 |
 
 **対応不能／欠測の扱い（設計原則）**: `unsupported` に列挙し、**UI は該当機能を灰色 + ツールチップで「この backend は未対応」と明示**する。
@@ -392,6 +463,15 @@ master のヘッドレス化で新規に必要なのは「射影先が増える�
 - `system/init` イベントの `mcp_servers` / `mcp_server_errors` を見れば、**ebi-control が本当に載ったか**を
   プロトコル上で確認できる。→ **`MasterSession` は init で `ebi-control` が `connected` でなければ起動失敗として notice を出す**
   （codex の「静かな故障」= ツールが見えないまま会話を始める、を master でも構造的に防ぐ）。
+- **r2 訂正 A（重要）**: その `system/init` は **「最初の user メッセージを送るまで出ない」**。
+  実測で spawn 後 2 分待っても出なかった。したがって **ready 判定を init 待ちにしてはならない**
+  （デッドロックする）。順序は `spawn → ready（stdin が書ける）→ 1 通目を送る → 初回 init で
+  session_id と mcp_servers を確定` とする。init は**毎ターン再送**されるので、2 回目以降は捨てる。
+- **r2 訂正 B**: 起動直後に SessionStart hook の `system/hook_started` / `system/hook_response` が流れ、
+  本文はプラグインの skill 全文で 1 イベント数万字になる。**未知の `system.subtype` は捨てる**設計にし、
+  UI へは流さない（`ClaudeStreamNormalizer` は `subtype !== "init"` を無条件で捨てる）。
+- **r2 訂正 I**: init の `apiKeySource` が `"none"` なら **API キー無しの OAuth（サブスク）で走っている**
+  ことのプロセス自己申告。`none` 以外なら起動失敗として扱う（`evaluateInitApiKeySource()`）。
 
 ---
 
@@ -421,6 +501,8 @@ flowchart TB
 | エビ返信の `[reply]`/`[idle]` | `inbound` イベントを**ユーザー発話とは別スタイルのバブル**（左寄せ・エビ絵文字・送信元 id 付き）で出す。`[reply]` = 実線ボーダー、`[idle]` = 破線 + 淡色（本文なしの合図）。`deliveryTag()` のタグをサーバ側で剥がして構造化フィールドに移す（UI に生タグを出さない） |
 | 画像 / ビューア埋め込み | ① assistant が画像を出したら `<img>` で inline ② `open_viewer` が呼ばれたら chat 内に**カード**（📄 タイトル + パス）を出し、タップでメイン領域を viewer に切り替える（現行の viewer 行選択と同じ遷移）。画像バイトは既存 `GET /control/viewer-file?id=` を流用 |
 | 承認 UI | `permission` イベントで**バブル内にボタン 3 つ**（許可 / 今回だけ / 拒否）。未応答の間は入力欄上に「承認待ち 1 件」のスティッキーバー。応答は `chatAnswer` |
+| **r2: 待機件数の表示** | **不要**（修正点 F）。busy 中の投入はキューされず走行中ターンに合流するため「待機 N 件」という状態が存在しない。`chatState.pending` は**未応答の承認/質問の件数**だけを意味する |
+| **r2: 枠（レート制限）** | **バックエンド依存**（修正点 K）。codex 頭脳は `account/rateLimits/updated` で 5h / 週次の使用率と `planType` が取れるが、**claude 頭脳では機械可読な枠情報が出ない**（`rate_limit_event` は出るが値のスケールが未検証）。claude では「—（未対応）」表示にする |
 | 質問 UI（AskUserQuestion） | `question` イベントで選択肢ボタン（`multi` なら複数選択 + 決定）。「その他」は自由入力欄にフォールバック |
 | 途中停止 | 入力欄の送信ボタンが**ターン実行中は ⏹ に変わる**。押すと `chatStop` → `MasterBrain.interrupt()`。停止後は「中断しました」システム行を残す |
 | 入力履歴 | ↑/↓ でローカル履歴（`localStorage`、直近 100 件・master セッション単位）。スマホは入力欄長押しで履歴ポップオーバー |
@@ -541,14 +623,14 @@ stdin への user メッセージ投入は **4 つの CLI すべてが公式に�
 
 | # | リスク | 深刻度 | 対策 |
 |---|---|---|---|
-| **R1** | **サブスク OAuth がヘッドレス常駐で維持できるか未実証**。docs 上は非 bare の `-p` が OAuth を読むと明記されているが、**数日〜数週間 1 プロセスを生かし続けた実績がない**（トークン更新・レート枠のリセット跨ぎ） | **高** | **要 PoC**（§9 PR-M0）。1 プロセスを 24h 以上生かして `result` の `total_cost_usd` が積算されるか／`api_retry` の `error: authentication_failed` が出ないかを観測。加えて **MasterSession に「プロセス死亡 → `--resume <sessionId>` で自動復帰」**を必ず入れる（PTY 時代の自動再起動と同じ役割） |
+| **R1** | **サブスク OAuth がヘッドレス常駐で維持できるか未実証**。docs 上は非 bare の `-p` が OAuth を読むと明記されているが、**数日〜数週間 1 プロセスを生かし続けた実績がない**（トークン更新・レート枠のリセット跨ぎ） | **高** | **r2**: ①〜⑦は PR-M0 で実測 green（⑧24h 生存のみ継続観測中）。`total_cost_usd` は**プロセス単位**の積算で `--resume` すると 0 に戻る（修正点 E）ため、累計は `MasterCostLedger` がプロセスを跨いで足す。1 プロセスを 24h 以上生かして `result` の `total_cost_usd` が積算されるか／`api_retry` の `error: authentication_failed` が出ないかを観測。加えて **MasterSession に「プロセス死亡 → `--resume <sessionId>` で自動復帰」**を必ず入れる（PTY 時代の自動再起動と同じ役割） |
 | **R2** | **`ANTHROPIC_API_KEY` の混入で静かに従量課金**（Gemini の `GOOGLE_CLOUD_PROJECT` 事故と同型） | **高** | master の spawn env に **deny list**（`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` / `CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX`）を適用。**deny 対象が env に残っていたら起動を拒否**する preflight（既存 `backendPreflight.ts` と同じ流儀）。`--bare` が args に含まれていたら**起動を拒否**する |
-| **R3** | **contextGuard が死ぬ**。現行は master の statusLine 使用率が唯一の入力（`contextGuard.ts` が `usage.id !== "master"` を無視）だが、ヘッドレスに statusLine は無い | **高** | `turnEnd` の `usage`（`input + cache_read + cache_creation`）と model の context window から使用率を**算出**して `UsageStore` へ流す。`contextGuard` 側は入力インターフェースを変えずに済む。**算出式の妥当性は要 PoC**（statusLine の値と 1 セッション並走させて突き合わせる） |
+| **R3**（r2 解決） | **contextGuard が死ぬ**。現行は master の statusLine 使用率が唯一の入力（`contextGuard.ts` が `usage.id !== "master"` を無視）だが、ヘッドレスに statusLine は無い | **高** | **r2 確定（修正点 C）**: 「ターン最後の `assistant` の `message.usage`（input + cache_read + cache_creation）」÷「`result.modelUsage[model].contextWindow`」を `UsageStore` へ流す。`contextGuard` 側は入力インターフェースを変えずに済む。**`result.usage` は使わない**（使うと「65% 到達 → 次ターン 40%」のチャタリングが起きて通知が壊れる）。**閾値は割合据え置き（Q-6 裁定）**だが、opus-5 の窓は 1,000,000 で 65% = 650k のため現行の中央値 313k では到達しない点を README に注記する |
 | **R4** | **長文脈（中央値 313k / p90 673k / 最大 993k）での resume が重い or 失敗する** | 中 | ① `--session-id` を ebi-team 側で採番して**再開先を確定的にする** ② 起動時に `--resume` が失敗したら**新規セッションで起動し、直前 N ターンの要約を 1 通目として投入**するフォールバック（要約は既存 supervisor に投げる） ③ `master-quota` 調査 §5 の削減策（`read_scrollback` 抑制・`ask_supervisor` 経由の要約・タスク境界での分割）を**チャット UI から 1 タップで打てる「新しい会話」ボタン**として実装 |
 | **R5** | **codex の「静かな故障」が master でも起きる**（役割プロンプト ACK で「reply_to_master が使えない」と述べて以後動かない／`docs/backends/codex.md` §7.1） | 中 | master では `system/init` 相当（`mcpServerStatus/list`）で **ebi-control の接続を起動時にプロトコルで検証**し、未接続なら起動失敗にする。既存 `ackRespawn.ts` の文面監視は PTY 前提なので、**chat モードでは「ツールが見えているか」の構造的チェックに置き換える**（文面を疑うヒューリスティックを捨てられる＝改善） |
 | **R6** | **`--permission-mode auto` 相当をヘッドレスでどう出すか**（承認が UI に出ずに黙って deny されると「動かない master」になる） | 中 | `--permission-mode auto` ＋ **`--permission-prompts` は既定 `host` のまま**（`none` にしない）＋ `--permission-prompt-tool mcp__ebi-control__approve` を必ず付ける。approve ツールはサーバの `MasterSession` に問い合わせ、**UI が応答するまで待つ**（タイムアウトは長めに取り、切れたら deny + notice）。**未応答の承認が 1 件でもあると master は止まる**ので、UI のスティッキーバー（§5.2）は必須要件 |
 | **R7** | **stream-json の既知制限** | 中 | ① `--include-partial-messages` は `--print` + `stream-json` 必須 ② 消費が遅いと**最大 30 秒**出力ドレインを待って終了する（v2.1.214 以降。それ以前は約 2 秒で末尾が切れた）→ サーバ側は**背圧をかけずに読み切る**実装にする ③ piped stdin は 10MB 上限（**大きな貼り付けはファイル経由**に誘導する UI が要る） ④ サブエージェントのテキストは既定で流れない（`--forward-subagent-text` / v2.1.211+） |
-| **R8** | **中断の意味論**。`SIGTERM` はターンを未完で残し exit 143。誤って使うと会話が壊れる | 中 | `interrupt()` は **SIGINT のみ**。プロセス終了は「SIGINT → 3s → SIGKILL」。`system/init` の `capabilities` に `interrupt_receipt_v1` があれば制御リクエスト方式へ切り替える（feature-detect・**要 PoC**） |
+| **R8**（r2 解決） | **中断の意味論**。`SIGTERM` はターンを未完で残し exit 143。誤って使うと会話が壊れる | 中 | **r2 確定（修正点 G）**: `interrupt()` は **stdin の `control_request`（subtype:"interrupt"）のみ**（実測 19ms・プロセスは生存し次ターンも通る）。プロセス終了は「stdin close → SIGINT → 3s → SIGKILL」。中断直後の `result` は `is_error:true` で来るので `turnEnd.aborted` に分岐し、**通常エラー通知に化けさせない** |
 | **R9** | **codex の規約リスク**（§1.2） | 中 | **ボス裁定（Q-1）まで実装しない**。実装する場合も `brain: "codex"` を明示指定したときだけ動く opt-in にし、README に規約の原文と URL を書く |
 | **R10** | **UI の再接続で会話が欠ける** | 低 | `seq` 単調増加 + `chatSnapshot` の `hasMore` ページング。サーバ側は master の会話イベントを **JSONL で永続化**（既存 `jsonlLog.ts` の流儀）し、再起動後も直近を復元できるようにする（PTY 時代は再起動で消えていたので**改善**） |
 | **R11** | **チャット UI が xterm を捨てることで「生ログが見たい」需要が満たせない** | 低 | chat パネルに「生イベント」トグル（NDJSON をそのまま等幅表示）を置く。デバッグ時のみ使う |
@@ -559,8 +641,8 @@ stdin への user メッセージ投入は **4 つの CLI すべてが公式に�
 
 | PR | 内容 | 受け入れ基準 | 工数 | 依存 |
 |---|---|---|---|---|
-| **PR-M0** | **PoC（使い捨てスクリプト `scripts/poc-master-headless.mjs` のみ・本体無変更）**<br/>`claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --mcp-config <既存 master config> --strict-mcp-config --permission-mode auto --append-system-prompt <master 役割>` を spawn し、①多ターン往復 ②`--replay-user-messages` の ACK ③busy 中の追加投入がキューされるか ④`system/init` に ebi-control が載るか ⑤`result.usage` から文脈%が出せるか ⑥SIGINT 中断 ⑦`--resume` 復帰 ⑧24h 生存 を実測 | ①〜⑦が確認でき、⑧は少なくとも 6h 連続で `authentication_failed` が出ない | **1 日**（+ 放置観測） | ボス GO |
-| **PR-M1** | **`MasterBrain` 抽象 + `ClaudeHeadlessBrain`**（サーバ内のみ・UI 未接続）。NDJSON パーサ・イベント正規化・env deny list・`--bare` 拒否 preflight。**純関数中心**でユニットテストを厚く | 新規 unit（イベント正規化・引数組み立て・deny list）green。既存 unit 229 に fail 0。**外形ゼロ差分**（`ui` 未指定なら現行と完全同一の起動） | **1 日** | PR-M0 |
+| **PR-M0** ✅完了 | **PoC（使い捨てスクリプト `scripts/poc-master-headless.mjs` のみ・本体無変更）**<br/>`claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --mcp-config <既存 master config> --strict-mcp-config --permission-mode auto --append-system-prompt <master 役割>` を spawn し、①多ターン往復 ②`--replay-user-messages` の ACK ③busy 中の追加投入がキューされるか ④`system/init` に ebi-control が載るか ⑤`result.usage` から文脈%が出せるか ⑥SIGINT 中断 ⑦`--resume` 復帰 ⑧24h 生存 を実測 | ①〜⑦が確認でき、⑧は少なくとも 6h 連続で `authentication_failed` が出ない | **1 日**（+ 放置観測） | ボス GO |
+| **PR-M1** ✅完了 | **`MasterBrain` 抽象 + `ClaudeHeadlessBrain`**（サーバ内のみ・UI 未接続）。NDJSON パーサ・イベント正規化・env deny list・`--bare` 拒否 preflight・`apiKeySource` 検証。codex は interface + stub まで（Q-1 の opt-in） | 新規 unit 50 本 green（`test/masterBrain{Args,Events,Stream}.test.ts`）。既存 unit fail 0（合計 338）。`npm run build` 成功。**外形ゼロ差分**（既存ファイルの変更 0・サーバから未参照）。実プロセス結合は opt-in の `scripts/e2e-master-brain.mjs`（既定では走らせない＝サブスク枠を食わない） | **1 日** | PR-M0 |
 | **PR-M2** | **`MasterSession` とサーバ配線**。feature flag `ui:"chat"`／PTY 経路の分岐／WS プロトコル拡張（`chatSend`/`chatEvent`/`chatState`/`chatSnapshot`）／会話 JSONL 永続化／mailbox → `send()` の載せ替え | `scripts/e2e-master-chat.mjs`：`chatSend` → `text`/`turnEnd`、`/control/reverse-inject` → `inbound` が**連続 10 回 100%** | **1 日** | PR-M1 |
 | **PR-M3** | **チャット UI（表示のみ）**。md レンダリング（`markdown.ts` 再利用）・ツール `<details>`・`[reply]`/`[idle]` バブル・自動追従とスクロール・再接続復元 | 手動 UI 確認 + スクショ（`tmp/master-chat-ui/`）。スマホ幅（375px）でログが指スクロールできること | **1 日** | PR-M2 |
 | **PR-M4** | **入力系**。送信・⏹ 停止（`interrupt()`）・入力履歴（↑/↓ / localStorage）・画像添付・大きな貼り付けのファイル誘導 | 停止で `turnEnd(ok:false)` が出て会話が継続できる。履歴が再読み込み後も残る | **0.5 日** | PR-M3 |
@@ -568,8 +650,8 @@ stdin への user メッセージ投入は **4 つの CLI すべてが公式に�
 | **PR-M6** | **usage / context / cost**。`turnEnd.usage` → `UsageStore` → `contextGuard` の入力載せ替え。ヘッダのコスト・文脈%表示。算出不能 backend は「—」 | `e2e-context-guard.mjs` 改修版が green。statusLine 併走比較で文脈%の誤差が許容内（**PoC ⑤ の結果次第**） | **1 日** | PR-M2 |
 | **PR-M7** | **移行と docs**。`EBI_MASTER_UI` env・ロールバック手順・e2e 再構成・README / `docs/backends/*.md` 追記・OSS 向け構成例 | 第 1 段（`ui` 未指定）で既存 e2e が全部 green。docs に規約の原文と URL が載っている | **0.5 日** | PR-M5 / PR-M6 |
 | **必須合計** | | | **6.0〜7.5 日** | |
-| **PR-M8**（任意） | **`CodexAppServerBrain`**（`thread/*` `turn/*` `item/*` の射影・承認往復） | `brain:"codex"` で master が起動し、`e2e-master-chat.mjs` が 10/10 | 1.5 日 | **Q-1 裁定** |
-| **PR-M9**（任意） | **`GeminiAcpBrain`**（ACP JSON-RPC） | 同上 | 1.5 日 | Q-2 裁定 |
+| **PR-M8**（Q-1 裁定済み・opt-in） | **`CodexAppServerBrain`**（`thread/*` `turn/*` `item/*` の射影・承認往復） | `brain:"codex"` で master が起動し、`e2e-master-chat.mjs` が 10/10 | 1.5 日 | **Q-1 裁定** |
+| ~~**PR-M9**（任意）~~ | ~~**`GeminiAcpBrain`**（ACP JSON-RPC）~~ | **Q-2 裁定により切らない（対象外）** | — | — |
 
 ---
 
@@ -577,11 +659,12 @@ stdin への user メッセージ投入は **4 つの CLI すべてが公式に�
 
 | # | 論点 | 選択肢 | **推奨** |
 |---|---|---|---|
-| **Q-1** | **codex を master の頭脳に使うか**。OpenAI 公式が「programmatic な Codex CLI ワークフロー（CI/CD 等）には API キーを使え」と明記しており、ChatGPT サブスク資格情報でのヘッドレス常駐は**規約グレー** | (a) 使わない（claude 専用） / (b) opt-in で実装し自己責任 / (c) API キーで実装（**従量課金**） | **(a) 当面使わない**。master は claude、GPT が要るときは engineer 側で codex を使う現行構成で十分。ボスが (b) を選ぶなら README に原文と URL を明記して opt-in にする |
-| **Q-2** | **gemini を master 対象にするか**。現行 CLI（0.58.0）は `--input-format` を持たず、多ターンは `--acp` だけ | (a) 対象外 / (b) ACP で実装（+1.5 日） | **(a) 対象外**。Gemini CLI は Antigravity CLI へリタイア移行中（2026-06-18 移行期限）で、いま ACP に投資する価値が薄い |
-| **Q-3** | **長文脈（中央値 313k）の運用方針**。ヘッドレス 1 プロセス常駐だと文脈が単調増加し、コストの 78% を占める cache read が膨らむ | (a) 無制限（現行踏襲） / (b) 閾値超過で自動「新しい会話 + 要約引き継ぎ」 / (c) UI に手動ボタンだけ置く | **(c) を先に入れて (b) は後**。自動切断は文脈喪失の事故が怖い。まず contextGuard の通知 + 手動ボタンで運用し、実測後に (b) を検討 |
-| **Q-4** | **現行ターミナル master を残すか** | (a) 当面残す（flag 併存） / (b) chat 移行後に削除 | **(a) 当面残す**。§6.2 の 3 段移行が成立した後、1〜2 週間様子を見てから削除判断 |
-| **Q-5** | **master の permissionMode**。現行 config は `auto` | (a) `auto` 継続（承認は UI へ） / (b) `bypassPermissions`（承認 UI 不要・速い） | **(a) `auto`**。承認 UI（PR-M5）は工数が要るが、「master が勝手に破壊的操作をしない」という現行の安全性を落とさない。(b) にすると PR-M5 を落とせて **-1 日** |
+| **Q-1**<br>**裁定: (b) opt-in で実装** | **codex を master の頭脳に使うか**。OpenAI 公式が「programmatic な Codex CLI ワークフロー（CI/CD 等）には API キーを使え」と明記しており、ChatGPT サブスク資格情報でのヘッドレス常駐は**規約グレー** | (a) 使わない（claude 専用） / (b) opt-in で実装し自己責任 / (c) API キーで実装（**従量課金**） | **(a) 当面使わない**。master は claude、GPT が要るときは engineer 側で codex を使う現行構成で十分。ボスが (b) を選ぶなら README に原文と URL を明記して opt-in にする |
+| **Q-2**<br>**裁定: (a) 対象外** | **gemini を master 対象にするか**。現行 CLI（0.58.0）は `--input-format` を持たず、多ターンは `--acp` だけ | (a) 対象外 / (b) ACP で実装（+1.5 日） | **(a) 対象外**。Gemini CLI は Antigravity CLI へリタイア移行中（2026-06-18 移行期限）で、いま ACP に投資する価値が薄い |
+| **Q-3**<br>**裁定: (c) 手動ボタン先行** | **長文脈（中央値 313k）の運用方針**。ヘッドレス 1 プロセス常駐だと文脈が単調増加し、コストの 78% を占める cache read が膨らむ | (a) 無制限（現行踏襲） / (b) 閾値超過で自動「新しい会話 + 要約引き継ぎ」 / (c) UI に手動ボタンだけ置く | **(c) を先に入れて (b) は後**。自動切断は文脈喪失の事故が怖い。まず contextGuard の通知 + 手動ボタンで運用し、実測後に (b) を検討 |
+| **Q-4**<br>**裁定: (a) 残す** | **現行ターミナル master を残すか** | (a) 当面残す（flag 併存） / (b) chat 移行後に削除 | **(a) 当面残す**。§6.2 の 3 段移行が成立した後、1〜2 週間様子を見てから削除判断 |
+| **Q-5**<br>**裁定: (a) `auto`** | **master の permissionMode**。現行 config は `auto` | (a) `auto` 継続（承認は UI へ） / (b) `bypassPermissions`（承認 UI 不要・速い） | **(a) `auto`**。承認 UI（PR-M5）は工数が要るが、「master が勝手に破壊的操作をしない」という現行の安全性を落とさない。(b) にすると PR-M5 を落とせて **-1 日** |
+| **Q-6**（r2 で追加）<br>**裁定: (a) 据え置き** | **contextGuard の閾値**。opus-5 の文脈窓は **1,000,000** で、65/70/85% は 200k 窓の PTY master 前提の数字。1M 窓では 65% = 650k となり、現行の中央値 313k では**そもそも発火しない** | (a) 割合据え置き + README 注記 / (b) 絶対トークン数との二段構え | **(a) 割合据え置き**（ボス裁定 2026-09-05）。実運用の到達点が変わることを README に注記し、実測後に (b) を再検討する |
 
 ---
 
