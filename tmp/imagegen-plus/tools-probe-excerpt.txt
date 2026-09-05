@@ -1,0 +1,18 @@
+# codex 0.146.0 / ChatGPT Plus のセッションで image_gen が配られていることの生ログ抜粋
+# 取得: RUST_LOG=trace codex exec -s read-only ... 2> tools-probe.err （全文 1.3MB のため抜粋）
+
+## 1) トップレベル関数ツール一覧（image_gen は出てこない＝この見方では判定できない）
+"name":"collaboration"
+"name":"exec"
+"name":"followup_task"
+"name":"interrupt_agent"
+"name":"list_agents"
+"name":"request_user_input"
+"name":"send_message"
+"name":"spawn_agent"
+"name":"wait_agent"
+"name":"wait"
+
+## 2) exec ツールの TS 宣言 / tool_usage に image_gen が出る（こちらが判定根拠）
+5Po6co","service_tier":"auto","store":false,"temperature":1.0,"text":{"format":{"type":"text"},"verbosity":"low"},"tool_choice":"auto","tool_usage":{"image_gen":{"input_tokens":0,"input_tokens_details":{"image_tokens":0,"text_tokens":0},"output_tokens":0,"output_tokens_details":{"image_tokens":0,"text_tokens":0},"total_tokens":0},"web_search":{"num_requests":0}},"tools":[{"type":"function","description":"W
+ still running.\n  session_id?: number;\n  // Elapsed wall time spent waiting for output in seconds.\n  wall_time_seconds: number;\n}>; };\n```\n\n## image_gen\nTools in the image_gen namespace.\n\n### `image_gen__imagegen`\nThe `image_gen.imagegen` tool enables image generation from descriptions and editing of existing images based on specific instructions. Use it when:\n\n- The user requests an image bas
