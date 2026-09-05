@@ -1,0 +1,54 @@
+[poc] server pid=41059 port=8812 tmp=/var/folders/cz/mlg8ngmd16x8sffhm2yl5zr00000gn/T/ebi-poc-imagegen-plus-bwafst
+[srv] [ebi-team] カスタム役割を登録: imagegen
+[srv] [ebi-team] サーバ起動: http://127.0.0.1:8812  (WS: ws://127.0.0.1:8812/ws)
+[srv] [ebi-team] 制御API: http://127.0.0.1:8812/control/*  (loopback 無認証 / 非loopbackはトークン必須)
+[ebi-team] 認証: EBI_AUTH_TOKEN 設定あり（非 loopback はトークン必須・/login で入力）
+[ebi-team] spawn コマンド: claude
+[ebi-team] デフォルト cwd: /Users/yoimaro/workspace/GitHub/ebi-team/.worktrees/ebi-ebiteam-poc-imagegen-plus
+[ebi-team] idle しきい値: 900ms / registry ダンプ: /var/folders/cz/mlg8ngmd16x8sffhm2yl5zr00000gn/T/ebi-poc-imagegen-plus-bwafst/registry.json
+[ebi-team] viewer 許可ルート: /Users/yoimaro/workspace
+[ebi-team] context-guard: on / 監視対象=master / soft=65% notify=70% critical=85%
+[srv] [ebi-team] viewer 永続化: /var/folders/cz/mlg8ngmd16x8sffhm2yl5zr00000gn/T/ebi-poc-imagegen-plus-bwafst/viewers.json（復元 0件）
+[ebi-team] 配送ログ: /var/folders/cz/mlg8ngmd16x8sffhm2yl5zr00000gn/T/ebi-poc-imagegen-plus-bwafst/delivery.log
+[ebi-team] 固定エビログ: /var/folders/cz/mlg8ngmd16x8sffhm2yl5zr00000gn/T/ebi-poc-imagegen-plus-bwafst/fixed-ebi.log
+[ebi-team] master MCP config: /Users/yoimaro/workspace/GitHub/ebi-team/.worktrees/ebi-ebiteam-poc-imagegen-plus/.ebi-team/master-control.mcp.json
+[srv] [ebi-team] 監督・要約: 有効（サブスク claude CLI / haiku ワンショット要約）
+[ebi-team] dev フロント: http://localhost:5173 （Vite）
+[srv] [ebi-team] 固定エビを自動起動: master(master)
+[srv] [fixed-ebi:spawned] 起動: master (master) model=- cwd=/Users/yoimaro/workspace/GitHub/ebi-team/.worktrees/ebi-ebiteam-poc-imagegen-plus
+[poc] spawn: 200 {"id":"ebi-1"}
+[poc] spawn 所要 0.8s
+[poc] send: 200 {"ok":true,"id":"ebi-1","spawned":false,"status":"idle","via":"pty"}
+[poc] reply 着弾=true 生成所要 76.6s
+=== master scrollback (tail) ===
+MASTER_UP
+[from:ebi-1] [reply] 生成できた
+ファイルパス: docs/poc/imagegen-plus-ebi.png
+使ったツール名: image_gen__imagegen[from:ebi-1] [reply] 生成できた
+ファイルパス: docs/poc/imagegen-plus-ebi.png
+
+使ったツール名: image_gen__imagegen
+
+[poc] PNG 存在=true size=888052
+[poc] open-viewer: 200 {"id":"viewer-1","path":"/Users/yoimaro/workspace/GitHub/ebi-team/.worktrees/ebi-ebiteam-poc-imagegen-plus/docs/poc/imagegen-plus-ebi.png","title":"imagegen-plus-ebi","format":"image"}
+[poc] viewer-file: {"status":200,"contentType":"image/png","length":888052,"pngMagic":true,"nosniff":"nosniff","cacheControl":"no-store"}
+[srv] 
+[ebi-team] 終了処理: 全 agent を kill します
+
+=== 結果 ===
+{
+  "replied": true,
+  "pngExists": true,
+  "pngBytes": 888052,
+  "genSeconds": 76.6,
+  "totalSeconds": 85.1,
+  "viewer": {
+    "status": 200,
+    "contentType": "image/png",
+    "length": 888052,
+    "pngMagic": true,
+    "nosniff": "nosniff",
+    "cacheControl": "no-store"
+  }
+}
+[poc] 撤収完了

@@ -27,6 +27,28 @@ export {
 const ACK_WINDOW_BODY_LIMIT = 20;
 
 /**
+ * ACK 監視設定に役割別の窓（ms）を反映する純関数。
+ * - backend が監視を持たない（claude / gemini）なら常に null＝挙動不変。
+ * - override 未指定なら backend 既定をそのまま使う。
+ * - override が 0 ならこの役割では監視しない。
+ * - minObserveMs が窓を超えないよう丸める（超えると「成功 ACK で閉じる」判定が一生効かない）。
+ */
+export function resolveAckWatchSpec(
+  base: AckFailureWatchSpec | null,
+  overrideMs: number | null | undefined,
+): AckFailureWatchSpec | null {
+  if (base === null) return null;
+  if (overrideMs === null || overrideMs === undefined) return base;
+  if (!Number.isFinite(overrideMs) || overrideMs < 0) return base;
+  if (overrideMs === 0) return null;
+  return {
+    ...base,
+    windowMs: overrideMs,
+    minObserveMs: Math.min(base.minObserveMs, Math.floor(overrideMs / 2)),
+  };
+}
+
+/**
  * 注入時、本文を書いてから Enter(`\r`) を別 write で送るまでの待ち時間(ms)。
  * claude TUI は一括入力をペースト扱いし、本文と同一 write の末尾 `\r` を「改行」と解釈して
  * 送信されない。本文と Enter を時間的に分離し、Enter を独立キー入力として届けて確実に送信する。
@@ -316,6 +338,13 @@ export interface LaunchParams {
    * gemini は per-エビ GEMINI.md 経由で渡すため buildEnv にも渡す（PR-C）。
    */
   systemPrompt?: string | null;
+  /**
+   * ACK 監視窓（ms）の役割別上書き。未指定なら backend 既定（codex は 90 秒）。
+   * 0 なら監視しない。ackFailureWatch を持たない backend では無視される＝挙動不変。
+   * 由来は EbiRole.ackWatchMs（roles.ts）。設計 §6.4 の「生成が長い役割で失敗報告が
+   * 監視窓に落ちて誤 respawn される」重なりを断つための口。
+   */
+  ackWatchMs?: number | null;
 }
 
 /** Agent からのイベントを購読するためのコールバック束。 */
@@ -540,7 +569,7 @@ export class Agent {
     this.killProcessGroup = backend.killProcessGroup;
     this.readyPattern = backend.readyPattern ?? null;
     this.fatalPatterns = backend.fatalPatterns ?? [];
-    this.ackWatchSpec = backend.ackFailureWatch ?? null;
+    this.ackWatchSpec = resolveAckWatchSpec(backend.ackFailureWatch ?? null, launch.ackWatchMs);
     this.gateSpec = backend.startupGates;
     this.bootGraceMs = MIN_BOOT_MS + (backend.readyWarmupMs ?? 0);
     this.autoAnswerStartupGates = this.gateSpec

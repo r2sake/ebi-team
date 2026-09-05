@@ -133,3 +133,14 @@ test("master 以外の固定エビ・既に claude の master は素通し（同
   const master = spec("master", "claude");
   assert.equal(applyMasterBackendFailsafe(master), master);
 });
+
+test("カスタム役割: ackWatchMs は 0 以上の整数だけ受け付ける（imagegen 用の ACK 監視窓上書き）", () => {
+  registerCustomRoles({ imagegen: { backend: "codex", permissionMode: "acceptEdits", ackWatchMs: 45000 } });
+  assert.equal(resolveRole("imagegen")?.ackWatchMs, 45000);
+  // 未指定なら持たない＝backend 既定のまま（既存役割の挙動は変わらない）。
+  registerCustomRoles({ nowatch: { backend: "codex" } });
+  assert.equal(resolveRole("nowatch")?.ackWatchMs, undefined);
+  assert.throws(() => registerCustomRoles({ bad: { ackWatchMs: -1 } }), /0 以上の整数/);
+  assert.throws(() => registerCustomRoles({ bad: { ackWatchMs: 1.5 } }), /0 以上の整数/);
+  assert.throws(() => registerCustomRoles({ bad: { ackWatchMs: "45000" } }), /0 以上の整数/);
+});
