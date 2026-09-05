@@ -293,6 +293,23 @@ button:hover { filter: brightness(1.07); }
   border: 1px solid var(--border);
 }
 
+/* backend バッジ（🟣 claude / 🟢 codex / 🔵 gemini）。registry の id セルと pane ヘッダで使う。 */
+.backend-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 5px;
+  vertical-align: middle;
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.backend-badge.backend-claude { border-color: #6b4cff; color: #c9bcff; }
+.backend-badge.backend-codex { border-color: #2f9f5a; color: #9fe3bb; }
+.backend-badge.backend-gemini { border-color: #3d7fd6; color: #a9cdf7; }
+
 /* 固定エビの registry 行は左端アクセントバーで常駐を示す。 */
 .registry tr.agent-row.kind-master td:first-child {
   box-shadow: inset 3px 0 0 #6b4cff;
@@ -371,6 +388,9 @@ button:hover { filter: brightness(1.07); }
 }
 .dash-table th { color: var(--muted); font-weight: 600; }
 .dash-table td.dash-waiting { color: var(--muted); text-align: center; }
+/* usage 非対応 backend（codex / gemini）のセル・行。空欄ではなく「—（未対応）」を淡色で出す。 */
+.dash-table td.dash-unsupported { color: var(--muted); font-style: italic; }
+.dash-table tr.dash-row-unsupported td:first-child { color: var(--muted); }
 .dash-total {
   font-size: 13px;
   font-weight: 700;
@@ -448,6 +468,22 @@ button:hover { filter: brightness(1.07); }
   color: var(--text);
 }
 .viewer-empty { color: var(--muted); font-size: 12px; }
+
+/* 画像 viewer（バイト列は /control/viewer-file から取得）。 */
+.viewer-body.image { display: flex; align-items: flex-start; justify-content: center; }
+.viewer-img {
+  max-width: 100%;
+  height: auto;
+  /* 透過 PNG が背景に溶けないよう市松模様を敷く。 */
+  background-color: #ffffff;
+  background-image:
+    linear-gradient(45deg, #e8e8e8 25%, transparent 25%, transparent 75%, #e8e8e8 75%),
+    linear-gradient(45deg, #e8e8e8 25%, transparent 25%, transparent 75%, #e8e8e8 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 8px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
 
 /* .txt は等幅の生テキスト。 */
 .viewer-txt {

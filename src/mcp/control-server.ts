@@ -20,27 +20,43 @@
 //
 // 注意: このプロセス自体は claude を起動しない。あくまで制御API を呼ぶブリッジ。
 
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { EBI_ROLES, registerCustomRoles, type EbiRoleId } from "../server/roles.ts";
+import { availableRoleIds, registerCustomRoles, type EbiRoleId } from "../server/roles.ts";
+import { ALL_BACKEND_IDS } from "../server/backends/index.ts";
 import { loadRawCustomRoles } from "../server/config.ts";
 import { deliveryText } from "../shared/deliveryTag.ts";
+import { resolveConfigPath } from "./configPath.ts";
 
 const CONTROL_URL = (process.env.EBI_CONTROL_URL ?? "http://127.0.0.1:8787").replace(/\/$/, "");
 
-// このプロセスは gen-master-mcp.mjs が生成する mcp config で cwd をリポジトリルートに固定して
-// spawn される（EBI_CONFIG_PATH で明示上書きも可）ため、index.ts と同じ既定パス規則で
-// ebi-team.config.json を解決できる。role z.enum(ROLE_IDS)（下記）の選択肢に、サーバ側
-// （index.ts）が起動時にマージするのと同じカスタム役割を反映させるため、ここでも
-// registerCustomRoles を「ツールスキーマを組み立てる前」に呼ぶ（呼ばないと master が
-// spawn_ebi/send_message でカスタム role を指定した瞬間、この bridge の zod バリデーションで
-// 弾かれてしまう＝サーバ側の対応だけでは機能しない）。
-const CONFIG_PATH = process.env.EBI_CONFIG_PATH ?? join(process.cwd(), "ebi-team.config.json");
+// role の選択肢と検証に、サーバ側（index.ts）が起動時にマージするのと同じカスタム役割を
+// 反映させるため、ここでも registerCustomRoles を「ツールスキーマを組み立てる前」に呼ぶ。
+//
+// config の探索は **cwd に依存しない**（configPath.ts 参照）。この stdio MCP は
+// gen-master-mcp.mjs が生成した mcp config の "cwd" どおりに起動されるとは限らず（実測:
+// master のブリッジは master セッションのプロジェクトディレクトリで動いていた）、
+// cwd 直下だけを見ると config が見つからず「役割は engineer だけ」に縮退する。
+const CONFIG = resolveConfigPath({
+  envPath: process.env.EBI_CONFIG_PATH,
+  cwd: process.cwd(),
+  moduleDir: dirname(fileURLToPath(import.meta.url)),
+  exists: existsSync,
+  join,
+  dirname,
+});
+if (CONFIG.source === "missing") {
+  console.error(
+    `[ebi-control-mcp] ebi-team.config.json が見つからない（探索: env EBI_CONFIG_PATH → cwd=${process.cwd()} → モジュール位置の上位）。` +
+      "カスタム役割は登録されず engineer のみになる",
+  );
+}
 try {
-  const rawRoles = await loadRawCustomRoles(CONFIG_PATH);
+  const rawRoles = await loadRawCustomRoles(CONFIG.path);
   registerCustomRoles(rawRoles);
 } catch (err) {
   console.error(
@@ -100,8 +116,36 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
  */
 const ROLE = process.env.EBI_MCP_ROLE === "engineer" ? "engineer" : "master";
 
-/** spawn_ebi / send_message で指定できる役割 id（EBI_ROLES のキー）。 */
-const ROLE_IDS = Object.keys(EBI_ROLES) as [EbiRoleId, ...EbiRoleId[]];
+/**
+ * spawn_ebi / send_message の role パラメータ。
+ *
+ * **z.enum ではなく z.string()** にしている。理由（2026-09-05 の実障害）:
+ * 役割一覧は config 駆動で動的（roles.imagegen を足すなど）なのに、enum はこの stdio
+ * ブリッジ**プロセスの起動時点**のスナップショットで固まる。config を読めていなかったり、
+ * サーバだけ再起動して役割を足したりすると、ブリッジの zod が呼び出しを先に弾いてしまい
+ * 「サーバ側は知っている役割なのに master からは永久に使えない」状態になる。
+ * 役割の妥当性判定の SoT は**稼働中のサーバ**（/control/spawn → spawnAgent）に一本化し、
+ * 未知の役割はサーバが利用可能な役割名を列挙したエラーで返す（roles.ts unknownRoleError）。
+ * ここでは選択肢を説明文で案内するだけに留める。
+ */
+const ROLE_PARAM = z.string().min(1);
+
+/** ツール説明に載せる、現在このブリッジが把握している役割一覧（config マージ後）。 */
+function roleChoicesText(): string {
+  return availableRoleIds().join(" / ");
+}
+
+/**
+ * spawn_ebi / spawn_engineer / send_message で指定できる backend id。
+ * claude / codex / gemini とも実装済み（PR-C / PR-D）。実装済みでない id を渡した場合は
+ * サーバ側（spawnAgent → resolveBackendId）が明示エラーで弾く。
+ */
+const BACKEND_IDS = [...ALL_BACKEND_IDS] as [string, ...string[]];
+const BACKEND_DESC =
+  "バックエンド（省略時は役割の既定 → config.defaultBackend → env EBI_BACKEND → claude）。" +
+  "claude / codex / gemini とも実装済み。" +
+  "codex / gemini は cost・context を報告しない（ダッシュボードは「—（未対応）」表示）ほか、" +
+  "model は backend ごとに語彙が違う（claude の opus/sonnet は codex/gemini では不可）";
 
 /** 制御API を呼ぶ共通ヘルパー。失敗時は { ok:false, error } を返す（throw しない）。 */
 async function callControl(
@@ -232,15 +276,17 @@ async function spawnRoleAndInject(args: {
   role: EbiRoleId;
   task: string;
   model?: string;
+  backend?: string;
   cwd?: string;
   useWorktree?: boolean;
   repoPath?: string;
   branch?: string;
 }) {
-  const { role, task, model, cwd, useWorktree, repoPath, branch } = args;
+  const { role, task, model, backend, cwd, useWorktree, repoPath, branch } = args;
   const spawnRes = await callControl("POST", "/control/spawn", {
     role,
     model,
+    backend,
     cwd,
     useWorktree,
     repoPath,
@@ -271,12 +317,16 @@ async function spawnRoleAndInject(args: {
 server.tool(
   "spawn_ebi",
   "役割(role)を指定して動的エビを起動しタスクを委譲する。engineer=実装（既定で同梱される汎用役割）。" +
-    "カスタム役割を追加した場合はそれも指定できる。" +
+    `現在利用可能な役割: ${roleChoicesText()}。` +
     "プロンプト・権限・既定モデルは役割レジストリ（EBI_ROLES）から自動適用される。{ id } を返す。",
   {
-    role: z.enum(ROLE_IDS).describe("役割（engineer: 実装。roles.ts の EBI_ROLES にカスタム役割を追加すればそれも選べる）"),
+    role: ROLE_PARAM.describe(
+      `役割（現在利用可能: ${roleChoicesText()}）。engineer=実装。` +
+        "役割は ebi-team.config.json の roles で追加でき、未知の役割はサーバが利用可能な一覧付きで拒否する",
+    ),
     task: z.string().describe("委譲するタスク内容（起動後に注入される）"),
     model: z.string().optional().describe("モデル上書き（未指定は役割の既定モデル）"),
+    backend: z.enum(BACKEND_IDS).optional().describe(BACKEND_DESC),
     cwd: z.string().optional().describe("作業ディレクトリ（未指定はサーバ既定）"),
     useWorktree: z.boolean().optional().describe("true なら git worktree を切って隔離 cwd で起動"),
     repoPath: z.string().optional().describe("worktree の元 repo パス"),
@@ -292,6 +342,7 @@ server.tool(
   {
     task: z.string().describe("engineer に委譲するタスク内容（起動後に注入される）"),
     model: z.string().optional().describe("モデル（既定 opus）"),
+    backend: z.enum(BACKEND_IDS).optional().describe(BACKEND_DESC),
     cwd: z.string().optional().describe("作業ディレクトリ（未指定はサーバ既定）"),
     useWorktree: z.boolean().optional().describe("true なら git worktree を切って隔離 cwd で起動"),
     repoPath: z.string().optional().describe("worktree の元 repo パス"),
@@ -313,17 +364,17 @@ server.tool(
       .boolean()
       .optional()
       .describe("送信先が存在しない場合に role の役割で自動起動するか（既定 false）"),
-    role: z
-      .enum(ROLE_IDS)
-      .optional()
-      .describe("spawnIfMissing で起動する役割（EBI_ROLES に登録された役割。既定 engineer）"),
+    role: ROLE_PARAM.optional().describe(
+      `spawnIfMissing で起動する役割（現在利用可能: ${roleChoicesText()}。既定 engineer）`,
+    ),
     model: z.string().optional().describe("spawn 時のモデル上書き（未指定は役割の既定）"),
+    backend: z.enum(BACKEND_IDS).optional().describe(`spawn 時の${BACKEND_DESC}`),
     cwd: z.string().optional().describe("spawn 時の作業ディレクトリ（未指定はサーバ既定）"),
     useWorktree: z.boolean().optional().describe("spawn 時に git worktree を切って隔離 cwd で起動"),
     repoPath: z.string().optional().describe("worktree の元 repo パス"),
     branch: z.string().optional().describe("worktree ブランチ名（未指定は ebi/<id> 採番）"),
   },
-  async ({ to, message, spawnIfMissing, role, model, cwd, useWorktree, repoPath, branch }) => {
+  async ({ to, message, spawnIfMissing, role, model, backend, cwd, useWorktree, repoPath, branch }) => {
     const r = await callControl("POST", "/control/send", {
       to,
       message,
@@ -332,6 +383,7 @@ server.tool(
       // 未起動の宛先を spawn する場合の役割（既定 engineer）。
       role: role ?? "engineer",
       model,
+      backend,
       cwd,
       useWorktree,
       repoPath,
@@ -382,14 +434,18 @@ server.tool(
   },
 );
 
-// ---- open_viewer: md/txt ファイルを読み取り専用パネルとして UI に開く（master 専用）----
+// ---- open_viewer: md/txt/画像ファイルを読み取り専用パネルとして UI に開く（master 専用）----
 server.tool(
   "open_viewer",
-  "指定した md/txt ファイルを、UI の読み取り専用プレビュー（viewer）として開く。" +
-    "レビュー用のプランやレポートをユーザーに『見せる』ための明示操作。開くと自動でそのパネルに切り替わる。" +
-    "パスは許可ルート（既定 $HOME/workspace・EBI_VIEWER_ROOTS で設定）配下の .md/.markdown/.txt のみ。",
+  "指定した md/txt/画像ファイルを、UI の読み取り専用プレビュー（viewer）として開く。" +
+    "レビュー用のプランやレポート、エビが生成した画像をユーザーに『見せる』ための明示操作。" +
+    "開くと自動でそのパネルに切り替わる。" +
+    "パスは許可ルート（既定 $HOME/workspace・EBI_VIEWER_ROOTS で設定）配下の " +
+    ".md/.markdown/.txt/.png/.jpg/.jpeg/.webp/.gif のみ。",
   {
-    path: z.string().describe("開くファイルの絶対パス（許可ルート配下の .md/.markdown/.txt）"),
+    path: z
+      .string()
+      .describe("開くファイルの絶対パス（許可ルート配下の .md/.markdown/.txt/.png/.jpg/.jpeg/.webp/.gif）"),
     title: z.string().optional().describe("表示タイトル（未指定はファイル名）"),
   },
   async ({ path, title }) => {

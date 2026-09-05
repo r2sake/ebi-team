@@ -8,6 +8,7 @@ import {
   type AgentRecord,
   type ViewerRecord,
 } from "../shared/protocol.ts";
+import { backendBadge } from "../shared/backendBadge.ts";
 
 // ===== DOM 参照 =====
 const stage = document.getElementById("stage") as HTMLElement;
@@ -18,6 +19,8 @@ const spawnRepo = document.getElementById("spawn-repo") as HTMLInputElement;
 const spawnBranch = document.getElementById("spawn-branch") as HTMLInputElement;
 // spawn 後に自動でそのエビへ移動するか（既定 OFF）。C: 誤送信防止のため既定は追従しない。
 const spawnFollow = document.getElementById("spawn-follow") as HTMLInputElement;
+// spawn するバックエンド（空＝サーバ既定: 役割の既定 → config → env → claude）。
+const spawnBackend = document.getElementById("spawn-backend") as HTMLSelectElement;
 const connStatus = document.getElementById("conn-status") as HTMLElement;
 const registryBody = document.querySelector("#registry-table tbody") as HTMLElement;
 const noticeList = document.getElementById("notice-list") as HTMLElement;
@@ -144,6 +147,8 @@ function handleServerMessage(msg: ServerMessage): void {
   switch (msg.type) {
     case "registry":
       registry = sortAgents(msg.agents);
+      // ダッシュボードは registry の backend を見て「—（未対応）」行を出す（PR-E）。
+      dashboard.updateAgents(registry);
       syncPanes();
       renderRegistry();
       break;
@@ -402,6 +407,17 @@ function renderRegistry(): void {
       badge.title = `${a.kind}（削除不可）${a.model ? ` / model: ${a.model}` : ""}`;
       idTd.append(document.createTextNode(" "), badge);
     }
+    // backend バッジ（🟣 claude / 🟢 codex / 🔵 gemini）。全エビに出す（PR-E）。
+    {
+      const bb = backendBadge(a.backend);
+      const badge = document.createElement("span");
+      badge.className = `backend-badge backend-${bb.id}`;
+      badge.textContent = bb.emoji;
+      badge.title = bb.reportsUsage
+        ? `backend: ${bb.label}${a.model ? ` / model: ${a.model}` : ""}`
+        : `backend: ${bb.label}（cost / context は未対応）${a.model ? ` / model: ${a.model}` : ""}`;
+      idTd.append(document.createTextNode(" "), badge);
+    }
 
     // mode トグルセル（クリックで connected ⇄ isolated）。行選択へ伝播させない。
     const modeTd = document.createElement("td");
@@ -442,7 +458,8 @@ function renderRegistry(): void {
     const td = document.createElement("td");
     td.colSpan = 5;
     td.className = "viewer-row-label";
-    td.append(document.createTextNode(`📄 ${v.title}`));
+    // 画像 viewer は一覧でも一目で分かるようアイコンを変える（パネル側と揃える）。
+    td.append(document.createTextNode(`${v.format === "image" ? "🖼" : "📄"} ${v.title}`));
 
     // ✗（閉じる）セル。行選択へ伝播させない。
     const closeTd = document.createElement("td");
@@ -554,18 +571,21 @@ spawnFollow.addEventListener("change", () => {
 
 spawnBtn.addEventListener("click", () => {
   const cwd = spawnCwd.value.trim();
+  // 空文字は「サーバ既定に任せる」＝ backend を送らない（従来どおりの挙動）。
+  const backend = spawnBackend.value || undefined;
   if (spawnUseWorktree.checked) {
     const repoPath = spawnRepo.value.trim();
     const branch = spawnBranch.value.trim();
     sendMsg({
       type: "spawn",
       cwd: cwd || undefined,
+      backend,
       useWorktree: true,
       repoPath: repoPath || undefined,
       branch: branch || undefined,
     });
   } else {
-    sendMsg({ type: "spawn", cwd: cwd || undefined });
+    sendMsg({ type: "spawn", cwd: cwd || undefined, backend });
   }
 });
 

@@ -13,17 +13,23 @@ import { isAbsolute, resolve, dirname } from "node:path";
 import { homedir } from "node:os";
 import type { AgentKind } from "../shared/protocol.ts";
 import type { LaunchParams } from "./agent.ts";
+import {
+  buildLaunchArgs,
+  getBackend,
+  isImplementedBackendId,
+  resolveBackend,
+  backendIdError,
+  DEFAULT_BACKEND_ID,
+  IMPLEMENTED_BACKEND_IDS,
+  PERMISSION_MODES,
+  type BackendId,
+  type PermissionMode,
+} from "./backends/index.ts";
 
-/** claude --permission-mode が受け付ける値（`claude --help` で確認済み）。 */
-export const PERMISSION_MODES = [
-  "acceptEdits",
-  "auto",
-  "bypassPermissions",
-  "default",
-  "dontAsk",
-  "plan",
-] as const;
-export type PermissionMode = (typeof PERMISSION_MODES)[number];
+// permission-mode の語彙は backends/types.ts（バックエンド非依存の抽象語彙）が SoT。
+// 既存の import 元（roles.ts / index.ts / control-server.ts 等）を壊さないよう再エクスポートする。
+export { PERMISSION_MODES };
+export type { PermissionMode };
 
 /**
  * 全エビ共通の permission-mode 既定。
@@ -52,6 +58,13 @@ interface RawFixedEbi {
   /** テスト用にバイナリを差し替えたい場合（既定は claude / EBI_COMMAND）。 */
   command?: unknown;
   /**
+   * この固定エビを動かすバックエンド id（claude / codex / gemini）。
+   * 未指定なら従来どおり command から解決する（挙動不変）。
+   * 指定すると (a) command 未指定時の既定バイナリ、(b) 起動引数の方言、(c) launch.backend の
+   * 3 つがそのバックエンドに揃う（command と backend を別々に書いてズレる事故を作らない）。
+   */
+  backend?: unknown;
+  /**
    * notification（mailbox 購読）経路で受信するか（既定 true）。
    * false にすると「受信を PTY 注入に固定」する（外部チャンネル待機セッションで、
    * 自セッションに ebi-control channel を登録しない＝notification が黙って捨てられる場合に使う）。
@@ -68,6 +81,10 @@ interface RawConfig {
    * 組込み（server:ebi-control）に足す形。ワイルドカード・部分一致は不可。
    */
   devChannelsAllowlist?: unknown;
+  /** サーバ既定のバックエンド id（env EBI_BACKEND より優先）。検証は loadBackendSettings。 */
+  defaultBackend?: unknown;
+  /** バックエンド別の既定（command / defaultModel）。検証は loadBackendSettings。 */
+  backends?: unknown;
 }
 
 /**
@@ -123,6 +140,90 @@ export async function loadDevChannelsAllowlist(configPath: string): Promise<stri
   return raw as string[];
 }
 
+// ===== バックエンド既定（PR-E: top-level "defaultBackend" / "backends"） =====
+
+/** バックエンド 1 件分の既定（ebi-team.config.json の backends[<id>]）。 */
+export interface BackendConfigEntry {
+  /** 起動バイナリ（未指定なら backend の defaultCommand）。 */
+  command?: string;
+  /** そのバックエンドの既定モデル（未指定なら env EBI_<ID>_MODEL → CLI 既定）。 */
+  defaultModel?: string;
+}
+
+/** config 由来のバックエンド既定（サーバ既定 backend と backend 別の設定）。 */
+export interface BackendSettings {
+  /** config.defaultBackend（未指定なら null → env EBI_BACKEND → claude）。 */
+  defaultBackend: BackendId | null;
+  /** backend 別の既定。未定義の backend は空オブジェクト相当（参照側は ?. で読む）。 */
+  backends: Partial<Record<BackendId, BackendConfigEntry>>;
+}
+
+/** バックエンド既定が何も無いときの値（config 無し・キー無し）。 */
+export const EMPTY_BACKEND_SETTINGS: BackendSettings = { defaultBackend: null, backends: {} };
+
+/**
+ * top-level "defaultBackend" / "backends" を検証・正規化する純関数（I/O 無し＝単体テスト対象）。
+ * - 未指定は「既定なし」。未実装/未知の backend id は throw（黙って claude に落とさない）。
+ * - backends のキーは実装済み backend id のみ許容。値は { command?, defaultModel? }。
+ */
+export function normalizeBackendSettings(raw: {
+  defaultBackend?: unknown;
+  backends?: unknown;
+}): BackendSettings {
+  let defaultBackend: BackendId | null = null;
+  if (raw.defaultBackend !== undefined && raw.defaultBackend !== null) {
+    if (typeof raw.defaultBackend !== "string") {
+      throw new Error("defaultBackend は文字列である必要があります");
+    }
+    if (!isImplementedBackendId(raw.defaultBackend)) throw backendIdError(raw.defaultBackend);
+    defaultBackend = raw.defaultBackend;
+  }
+
+  const backends: Partial<Record<BackendId, BackendConfigEntry>> = {};
+  if (raw.backends !== undefined && raw.backends !== null) {
+    if (typeof raw.backends !== "object" || Array.isArray(raw.backends)) {
+      throw new Error("backends はオブジェクト（{ backendId: 定義 }）である必要があります");
+    }
+    for (const [id, def] of Object.entries(raw.backends as Record<string, unknown>)) {
+      if (!isImplementedBackendId(id)) {
+        throw new Error(
+          `backends のキーが不正です: ${id}（許容: ${IMPLEMENTED_BACKEND_IDS.join(", ")}）`,
+        );
+      }
+      if (def === null || typeof def !== "object" || Array.isArray(def)) {
+        throw new Error(`backends."${id}" の定義はオブジェクトである必要があります`);
+      }
+      const d = def as Record<string, unknown>;
+      const entry: BackendConfigEntry = {};
+      for (const field of ["command", "defaultModel"] as const) {
+        const v = d[field];
+        if (v === undefined) continue;
+        if (typeof v !== "string") {
+          throw new Error(`backends."${id}" の ${field} は文字列である必要があります`);
+        }
+        entry[field] = v;
+      }
+      backends[id] = entry;
+    }
+  }
+  return { defaultBackend, backends };
+}
+
+/**
+ * ebi-team.config.json の top-level "defaultBackend" / "backends" を読み、正規化して返す。
+ * - ファイルが無ければ EMPTY_BACKEND_SETTINGS（既定なし＝従来どおり env → claude）。
+ * - 検証失敗は throw（呼び出し側で警告ログにして起動継続する想定）。
+ */
+export async function loadBackendSettings(configPath: string): Promise<BackendSettings> {
+  const parsed = await readRawConfig(configPath);
+  if (parsed === null) return EMPTY_BACKEND_SETTINGS;
+  try {
+    return normalizeBackendSettings(parsed);
+  } catch (err) {
+    throw new Error(`${configPath} の ${(err as Error).message}`);
+  }
+}
+
 /** 正規化済みの固定エビ定義。サーバが spawn にそのまま使える形。 */
 export interface FixedEbiSpec {
   id: string;
@@ -136,39 +237,74 @@ export interface FixedEbiSpec {
   notifySubscribe: boolean;
 }
 
+/**
+ * ワンショット要約エンジン（ask_supervisor / WS summarize）の起動設定。
+ * 常駐 supervisor 固定エビの backend / model をそのまま流用する
+ *（config 1 箇所を書き換えれば「常駐セッション」と「要約エンジン」が揃って切り替わる）。
+ */
+export interface SupervisorEngineConfig {
+  backend: BackendId;
+  /** 固定エビ config の model（未指定なら null → 各エンジンの既定モデル）。 */
+  model: string | null;
+}
+
+/**
+ * 固定エビ定義から要約エンジンの設定を取り出す純関数。
+ * kind === "supervisor" の最初の 1 件を使う。無ければ null（＝従来どおり claude/haiku の既定）。
+ */
+export function supervisorEngineFrom(specs: FixedEbiSpec[]): SupervisorEngineConfig | null {
+  const spec = specs.find((s) => s.kind === "supervisor");
+  if (!spec) return null;
+  return { backend: spec.launch.backend ?? DEFAULT_BACKEND_ID, model: spec.launch.model };
+}
+
 /** 固定エビをビルドするための既定値（サーバの spawnConfig から渡す）。 */
 export interface ConfigDefaults {
   /** command 未指定の固定エビに使う既定コマンド（EBI_COMMAND 由来）。 */
   command: string;
+  /**
+   * サーバ既定のバックエンド id（config.defaultBackend / env EBI_BACKEND 解決済み）。
+   * 未指定なら "claude"。PR1 時点では常に "claude"。
+   */
+  backend?: BackendId;
 }
 
 /**
- * claude 起動引数を組み立てる共通ヘルパー。
- * 固定エビ（config 経由）と動的 engineer エビ（制御API 経由）の双方で使う。
+ * 制御MCP ブリッジ無しの起動引数を組み立てる共通ヘルパー（固定エビ config 経由の起動）。
  *
  * 起動引数の組み立て順:
  *   [--model M]? [--permission-mode P]? [--append-system-prompt S]? ...任意 args
  *
- * テスト等で command を bash 等に差し替えた場合は claude 固有フラグを付けない
- * （bash が解釈できず即終了→crashloop になるのを防ぐ）。
+ * 実体は backends/index.ts の buildLaunchArgs（バックエンド抽象の唯一の入口）。
+ * command に一致するバックエンドが無い場合（テストで bash 等に差し替えた場合）は
+ * 固有フラグを付けない（bash が解釈できず即終了→crashloop になるのを防ぐ）。
+ *
+ * 注: 固定エビは `--mcp-config` を config の args に直書きする運用のため、ここでは
+ * mcpConfigPath を渡さない（args はそのまま extraArgs として末尾に付く＝従来どおり）。
  */
 export function buildClaudeArgs(opts: {
   command: string;
+  /**
+   * バックエンドの明示指定（config の fixedEbi[].backend 由来）。
+   * 指定された場合は command ではなくこちらで方言を決める（command を残したまま
+   * backend だけ差し替えたケースでも、引数が backend 側に揃う）。
+   */
+  backendId?: BackendId | null;
   model?: string | null;
   permissionMode?: PermissionMode;
   appendSystemPrompt?: string | null;
   extraArgs?: string[];
 }): string[] {
-  const { command, model, permissionMode, appendSystemPrompt, extraArgs = [] } = opts;
-  const isClaude = command === "claude" || command.endsWith("/claude");
-  const args: string[] = [];
-  if (isClaude) {
-    if (model) args.push("--model", model);
-    if (permissionMode) args.push("--permission-mode", permissionMode);
-    if (appendSystemPrompt) args.push("--append-system-prompt", appendSystemPrompt);
-  }
-  args.push(...extraArgs);
-  return args;
+  const input = {
+    model: opts.model ?? null,
+    permissionMode: opts.permissionMode ?? null,
+    systemPrompt: opts.appendSystemPrompt ?? null,
+    mcpConfigPath: null,
+    notifyMode: false,
+    extraArgs: opts.extraArgs ?? [],
+  };
+  if (opts.backendId) return getBackend(opts.backendId).buildArgs(input);
+  return buildLaunchArgs(opts.command, input);
 }
 
 /** permissionMode 文字列を検証して返す。不正なら throw。 */
@@ -269,14 +405,56 @@ function normalizeOne(raw: RawFixedEbi, configDir: string, defaults: ConfigDefau
   const appendSystemPrompt = asString(raw.appendSystemPrompt);
   // args は $EBI_TEAM / $HOME / ~ を展開する（--mcp-config の絶対パス指定を machine 非依存に）。
   const extraArgs = asStringArray(raw.args).map((a) => expandEnv(a, configDir));
-  const command = asString(raw.command) ?? defaults.command;
 
-  const args = buildClaudeArgs({ command, model, permissionMode, appendSystemPrompt, extraArgs });
+  // backend の明示指定（任意）。未指定なら従来どおり command から解決する＝挙動不変。
+  const backendRaw = asString(raw.backend);
+  let backendId: BackendId | null = null;
+  if (backendRaw !== undefined) {
+    if (!isImplementedBackendId(backendRaw)) {
+      throw new Error(`固定エビ "${id}" の ${backendIdError(backendRaw).message}`);
+    }
+    backendId = backendRaw;
+  }
+  // backend を書いたなら command の既定もそのバックエンドのバイナリにする
+  //（"backend": "gemini" だけ書いて command を書き忘れ、claude が起動する事故を防ぐ）。
+  const command =
+    asString(raw.command) ?? (backendId ? getBackend(backendId).defaultCommand : defaults.command);
+
+  const args = buildClaudeArgs({
+    command,
+    backendId,
+    model,
+    permissionMode,
+    appendSystemPrompt,
+    extraArgs,
+  });
 
   // notifySubscribe（既定 true）。false は「受信を PTY 注入に固定」する印。
   const notifySubscribe = raw.notifySubscribe === undefined ? true : asBoolean(raw.notifySubscribe, id);
 
-  return { id, kind, launch: { command, args, cwd, model }, notifySubscribe };
+  return {
+    id,
+    kind,
+    // 固定エビの backend は **明示指定 > command から解決**（サーバ既定を波及させない）。
+    // 理由: 設計上 master は常に claude（統括系を落とさない）で、EBI_BACKEND=codex のような
+    // サーバ既定をそのまま master に付けると、claude/bash のプロセスに codex の性質
+    //（readyPattern 待ち・プロセスグループ kill）が乗って ready 判定が壊れる。
+    // command がどの backend にも一致しないスタブ起動（bash 等）は既定（claude）の性質を使う
+    // ＝ 従来どおり（PR-D 時点で挙動不変）。
+    launch: {
+      command,
+      args,
+      cwd,
+      model,
+      backend: backendId ?? resolveBackend(command)?.id ?? defaults.backend ?? DEFAULT_BACKEND_ID,
+      // 役割プロンプトは args だけでは足りない。gemini は `--append-system-prompt` 相当を
+      // 持たず per-エビ GEMINI.md（backend.buildEnv 経由）で注入するため、生の本文を
+      // launch にも載せて agent.ts → backend.buildEnv へ渡す。
+      // claude / codex の buildEnv はこの値を見ないので、従来経路は挙動不変。
+      systemPrompt: appendSystemPrompt ?? null,
+    },
+    notifySubscribe,
+  };
 }
 
 /**

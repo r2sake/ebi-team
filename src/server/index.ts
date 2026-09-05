@@ -9,30 +9,51 @@ import {
   Registry,
   hasControlBridge,
   isNotifyMode,
+  supportsChannelInject,
   type DeliverOutcome,
   type WorktreeMeta,
 } from "./registry.ts";
 import { Mailbox } from "./mailbox.ts";
 import { configureDeliveryLog, deliveryLogPath, logDelivery } from "./deliveryLog.ts";
-import type { SpawnConfig, AgentHandlers, LaunchParams } from "./agent.ts";
-import { BASE_ALLOWED_DEV_CHANNELS } from "./agent.ts";
+import { buildAckFatalMessage, decideAckFailureAction } from "./ackRespawn.ts";
+import type { Agent, SpawnConfig, AgentHandlers, LaunchParams } from "./agent.ts";
+import {
+  BASE_ALLOWED_DEV_CHANNELS,
+  DEFAULT_BACKEND_ID,
+  EBI_CONTROL_MCP_NAME,
+  applyEnvDenyList,
+  buildLaunchArgs,
+  getBackend,
+  initialInjectFor,
+  resolveBackend,
+  resolveBackendId,
+  type BackendId,
+  type BackendLaunchInput,
+  type ControlMcpSpec,
+} from "./backends/index.ts";
 import { addWorktree, removeWorktree } from "./git.ts";
 import { Supervisor } from "./supervisor.ts";
 import {
   loadFixedEbi,
+  supervisorEngineFrom,
   loadRawCustomRoles,
   loadDevChannelsAllowlist,
-  buildClaudeArgs,
+  loadBackendSettings,
   validatePermissionMode,
   DEFAULT_PERMISSION_MODE,
+  EMPTY_BACKEND_SETTINGS,
+  type BackendSettings,
 } from "./config.ts";
-import { EBI_ROLES, resolveRole, registerCustomRoles } from "./roles.ts";
+import { EBI_ROLES, resolveRole, registerCustomRoles, unknownRoleError } from "./roles.ts";
 import { isRunningFromSrc, mcpConfigPathFor, type McpConfigRole } from "./mcpConfigPath.ts";
-import { FixedEbiManager, applyMasterMcpConfig } from "./fixedEbi.ts";
+import { needsPreflight, runPreflight } from "./backendPreflight.ts";
+import { FixedEbiManager, applyMasterBackendFailsafe, applyMasterMcpConfig } from "./fixedEbi.ts";
 import { configureFixedEbiLog, fixedEbiLogPath } from "./fixedEbiLog.ts";
 import { NoticeBuffer, DEFAULT_NOTICE_BUFFER_SIZE } from "./noticeBuffer.ts";
 import { createControlApi, type GeneralizedSpawnParams } from "./control.ts";
 import { UsageStore } from "./usageStore.ts";
+import { configureUsageHistory, usageHistoryPath } from "./usageHistory.ts";
+import { ContextGuard, contextGuardConfigFromEnv, type GuardNotice } from "./contextGuard.ts";
 import { ViewerRegistry } from "./viewerRegistry.ts";
 import {
   loadAuthConfig,
@@ -68,6 +89,13 @@ const HOST = process.env.EBI_HOST ?? "127.0.0.1";
 const authConfig = loadAuthConfig();
 // spawn する対象コマンド。claude が PATH に無い環境では EBI_COMMAND=bash 等で fallback。
 const COMMAND = process.env.EBI_COMMAND ?? "claude";
+// config 由来のバックエンド既定（top-level "defaultBackend" / "backends"）。
+// listen 前に loadAndApplyBackendSettings() が確定させる（それまでは「既定なし」）。
+let backendSettings: BackendSettings = EMPTY_BACKEND_SETTINGS;
+// サーバ既定のバックエンド id。優先度は spawn 引数 > 役割(EbiRole.backend) >
+// config.defaultBackend > env EBI_BACKEND > "claude"。
+// 未実装 id を指定されたら起動前に throw する（黙って claude に落とさない）。
+let BACKEND_ID = resolveBackendId({ env: process.env.EBI_BACKEND });
 const COMMAND_ARGS = process.env.EBI_ARGS ? process.env.EBI_ARGS.split(" ") : [];
 // agent のデフォルト cwd。
 const DEFAULT_CWD = process.env.EBI_DEFAULT_CWD ?? process.cwd();
@@ -96,6 +124,15 @@ const FIXED_EBI_LOG_PATH =
     ? null
     : (process.env.EBI_FIXED_EBI_LOG_PATH ?? join(process.cwd(), ".ebi-team", "fixed-ebi.log"));
 configureFixedEbiLog(FIXED_EBI_LOG_PATH);
+// レート制限使用率（rate_limits）の恒久ログ（JSONL）。statusLine が運んでくる five_hour /
+// seven_day の used_percentage を、値が変わったときだけ追記する（in-memory の latest しか
+// 持っておらず「先週どれだけ枠を使ったか」を後から追えなかった反省から）。
+// env EBI_USAGE_HISTORY_PATH で変更、"off" で無効化。
+const USAGE_HISTORY_PATH =
+  process.env.EBI_USAGE_HISTORY_PATH === "off"
+    ? null
+    : (process.env.EBI_USAGE_HISTORY_PATH ?? join(process.cwd(), ".ebi-team", "usage-history.jsonl"));
+configureUsageHistory(USAGE_HISTORY_PATH);
 // 再アタッチ用スクロールバックのリングバッファ上限（バイト相当・既定 1MB）。
 // インライン TUI 化（agent.ts の INLINE_TUI_ENV）以降、ここには代替スクリーンの再描画ノイズでは
 // なく「実ログ」が積まれるため、リロード後に十分遡れるよう既定を広げている。
@@ -118,11 +155,55 @@ const ROLE_MCP_CONFIG: Record<McpConfigRole, string> = {
   engineer: process.env.EBI_ENGINEER_MCP_CONFIG ?? defaultMcpConfigPath("engineer"),
   master: process.env.EBI_MASTER_MCP_CONFIG ?? defaultMcpConfigPath("master"),
 };
-// --dangerously-load-development-channels に渡す channel 指定子。
-// 手動設定の MCP サーバは `server:<mcpServersキー名>` 形式でタグ付けが必須
-// （素の "ebi-control" だと claude が起動時エラーで即終了する。実機で確認済み）。
-// キー名は gen-master-mcp.mjs の生成キー "ebi-control" と一致していること。
-const EBI_CONTROL_CHANNEL_SPEC = "server:ebi-control";
+// --dangerously-load-development-channels に渡す channel 指定子は backends/claude.ts が持つ
+// （EBI_CONTROL_CHANNEL_SPEC）。付与条件も含めてバックエンド実装に閉じている。
+
+/**
+ * backend 別の追加起動引数。EBI_ARGS は claude 向けの設定なので非 claude には渡さず、
+ * `EBI_CODEX_ARGS` を使う（フラグ体系が違うため取り違えると即起動失敗になる）。
+ */
+/** 空文字を「未指定」として扱う（config / 役割の defaultModel は空文字を許容するため）。 */
+function nonEmpty(v: string | null | undefined): string | null {
+  return v != null && v !== "" ? v : null;
+}
+
+function extraArgsForBackend(id: BackendId): string[] {
+  if (id === DEFAULT_BACKEND_ID) return [...spawnConfig.args];
+  const raw = process.env[`EBI_${id.toUpperCase()}_ARGS`];
+  return raw ? raw.split(" ").filter((a) => a.length > 0) : [];
+}
+
+/**
+ * 制御MCP（ebi-control）の中立表現。設定ファイルではなく**起動引数に焼く** backend
+ * （codex の `-c mcp_servers.*`）が使う。生成規約は scripts/gen-master-mcp.mjs と同じ
+ * （dev = tsx で src、本番 = node で dist）。
+ * EBI_ID をここで焼くのは、codex では pty env 継承だけに頼れないため（PoC の起動形も同じ）。
+ */
+function controlMcpSpecFor(mcpRole: McpConfigRole, agentId: string): ControlMcpSpec {
+  const root = process.cwd();
+  // dev（src 起点）でも `npx tsx` ではなく **同じ node バイナリ ＋ tsx ローダ**で起動する。
+  // npx は解決に数秒かかり、codex の MCP 起動待ちに間に合わずツールが使えないまま
+  // セッションが始まる（= reply_to_master が飛ばない静かな故障。PR-D の e2e で実測）。
+  const server = RUNNING_FROM_SRC
+    ? {
+        command: process.execPath,
+        args: ["--import", "tsx", join(root, "src/mcp/control-server.ts")],
+      }
+    : { command: "node", args: [join(root, "dist/server/mcp/control-server.js")] };
+  return {
+    name: EBI_CONTROL_MCP_NAME,
+    command: server.command,
+    args: server.args,
+    cwd: root,
+    env: {
+      EBI_CONTROL_URL: `http://${HOST}:${PORT}`,
+      EBI_MCP_ROLE: mcpRole,
+      EBI_ID: agentId,
+      // channel 注入非対応の backend は PTY 注入で受けるため、購読ループは回さない。
+      EBI_NOTIFY_SUBSCRIBE: "off",
+    },
+  };
+}
 
 const spawnConfig: SpawnConfig = {
   command: COMMAND,
@@ -157,7 +238,10 @@ const registry = new Registry(spawnConfig, DUMP_PATH, mailbox);
 const fixedEbi = new FixedEbiManager(registry);
 
 // 監督・要約（既定 OFF）。OFF / キー無しなら enabled=false で API は一切呼ばない。
-const supervisor = new Supervisor();
+// 監督・要約エンジン（ワンショット）。既定は claude/haiku。
+// config の supervisor 固定エビが backend=gemini なら、起動直前に同じ backend/model へ差し替える
+// （loadAndApplySupervisorEngine）。let なのはその 1 点のためだけ。
+let supervisor = new Supervisor();
 
 // 使用状況（usage）ストア。各エビの statusLine が /control/usage に POST してくる
 // cost/context/model と、アカウント単位の rate_limits を最新値で保持する。
@@ -229,6 +313,55 @@ function broadcastUsage(): void {
   broadcast(usageStore.snapshot());
 }
 
+// ===== コンテキスト枯渇ガード（context-guard）=====
+// master のコンテキスト使用率を監視し、自動 compact に食われて PM 文脈が消える前に「促す」。
+// **compact も /clear もサーバは実行しない**（既存方針どおり促すだけ）。設計は
+// docs/plans/context-guard-plan.md。判定本体は contextGuard.ts の純粋ステートマシン。
+const contextGuardConfig = contextGuardConfigFromEnv();
+const contextGuard = new ContextGuard(contextGuardConfig, (n) => onContextGuardNotice(n));
+
+/**
+ * ガードの発火を 2 経路へ流す（ボス裁定 X-2）:
+ *  - ebi-team UI の notice（NoticeBuffer に載るので、通知時にブラウザを開いていなくても replay される）
+ *  - master セッションへの inject（master は notifySubscribe:false ＝ PTY 注入固定で最も堅い）
+ * 発火履歴はデバッグ用に info ログへ残す。
+ */
+function onContextGuardNotice(n: GuardNotice): void {
+  console.info(
+    `[context-guard] fire kind=${n.kind} level=${n.level} pct=${n.usedPct ?? "null"} ` +
+      `quiescent=${n.quiescent} busyDynamic=${n.busyDynamic} target=${contextGuardConfig.targetId}`,
+  );
+  broadcast({ type: "notice", id: "context-guard", text: n.text });
+  // 到達確認（ACK 待ち）を含むため async。促すだけの通知なので投げっぱなしにする。
+  void registry
+    .reverseInject("context-guard", contextGuardConfig.targetId, n.text, "reply")
+    .then((result) => {
+      if (result.delivered.length === 0 && result.rejected.length > 0) {
+        console.warn(
+          `[context-guard] ${contextGuardConfig.targetId} への通知を配信できませんでした: ` +
+            `${result.rejected[0]?.reason}（UI notice には出ています）`,
+        );
+      }
+    })
+    .catch((err) => {
+      console.warn("[context-guard] 通知の配信中にエラー:", err);
+    });
+}
+
+/** usage 取り込みのたびに呼ぶ。監視対象の最新 usage だけをガードへ渡す。 */
+function observeContextGuard(ebiId: string): void {
+  if (!contextGuardConfig.enabled) return;
+  if (ebiId !== contextGuardConfig.targetId) return;
+  const target = usageStore.snapshot().agents.find((a) => a.id === contextGuardConfig.targetId);
+  if (!target) return;
+  try {
+    contextGuard.observe(target, registry.list());
+  } catch (err) {
+    // 監視の失敗で usage 取り込み自体を壊さない（best-effort）。
+    console.warn("[context-guard] 判定中にエラー:", err);
+  }
+}
+
 /** 現在の viewer 一覧を全クライアントへ broadcast する（open/close 時）。 */
 function broadcastViewers(): void {
   broadcast({ type: "viewers", viewers: viewerRegistry.list() });
@@ -275,6 +408,9 @@ const handlers: AgentHandlers = {
     // （remove で Agent が消える前に控える）。
     const managed = fixedEbi.manages(id);
     registry.remove(id);
+    // 静かな故障の作り直し用に控えた spawn 引数も破棄する（作り直し経路は remove の前に
+    // 自分で取り出して delete 済みなので、ここで消えるのは通常終了ぶんだけ）。
+    ackRespawnParams.delete(id);
     broadcast({ type: "exited", id, exitCode });
     broadcastRegistry();
     if (meta) void cleanupWorktree(id, meta);
@@ -283,6 +419,18 @@ const handlers: AgentHandlers = {
   },
   onNotice(id, text) {
     broadcast({ type: "notice", id, text });
+  },
+  onAckFailure(id, reason) {
+    // 役割プロンプト ACK の「静かな故障」検知（codex）。kill →同一 id・同一引数で 1 回だけ
+    // 作り直す。投げっぱなし（spawn の応答を待たせない）にするが、例外は握り潰さない。
+    void handleAckFailure(id, reason).catch((err) => {
+      console.error(`[ebi-team] [${id}] 静かな故障の再 spawn 処理で例外:`, err);
+      broadcast({
+        type: "notice",
+        id,
+        text: `${id} の作り直しに失敗しました: ${(err as Error).message}`,
+      });
+    });
   },
   onIdleNotify(id) {
     // [B] idle 自動通知（保険）。busy→idle のエッジで、master/supervisor 以外かつ
@@ -329,6 +477,8 @@ const controlApi = createControlApi({
     usageStore.update(ebiId, json);
     // 更新のたびに全クライアントへ最新スナップショットを配信する。
     broadcastUsage();
+    // コンテキスト枯渇ガード（監視対象は既定 master）。判定は同期・通知は onNotice 経由。
+    observeContextGuard(ebiId);
   },
   // 各エビの制御MCP ブリッジが自分宛メッセージを long-poll 購読するための経路。
   // 初回購読の確立はサーバログに出す（notification 経路が生きているかの観測点）。
@@ -374,6 +524,8 @@ const controlApi = createControlApi({
     broadcastViewers();
     return rec;
   },
+  // 画像 viewer のバイナリ配信（クライアントの <img src="/control/viewer-file?id=..."> が叩く）。
+  readViewerFile: (id) => viewerRegistry.readImage(id),
 });
 
 /** HTML を期待するリクエスト（ブラウザ遷移）かを Accept ヘッダで大まかに判定する。 */
@@ -660,7 +812,15 @@ function handleClientMessage(ws: WebSocket, msg: ClientMessage): void {
  */
 async function handleSpawn(ws: WebSocket, msg: SpawnMessage): Promise<void> {
   try {
-    await spawnAgent({ id: msg.id, cwd: msg.cwd, useWorktree: msg.useWorktree, repoPath: msg.repoPath, branch: msg.branch });
+    await spawnAgent({
+      id: msg.id,
+      cwd: msg.cwd,
+      useWorktree: msg.useWorktree,
+      repoPath: msg.repoPath,
+      branch: msg.branch,
+      // UI ヘッダの backend セレクトからの指定（未指定なら役割/config/env の既定）。
+      backend: msg.backend,
+    });
   } catch (err) {
     send(ws, { type: "error", text: `spawn 失敗: ${(err as Error).message}` });
   }
@@ -675,7 +835,6 @@ async function handleSpawn(ws: WebSocket, msg: SpawnMessage): Promise<void> {
  */
 async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   const cwd = params.cwd && params.cwd.trim() ? params.cwd.trim() : DEFAULT_CWD;
-  const command = spawnConfig.command;
 
   // 役割（EBI_ROLES）を解決する。後方互換: asEngineer=true は role="engineer" と等価。
   // 未知の role 文字列は 400 相当のエラーにする（黙って素の dynamic にしない）。
@@ -683,8 +842,9 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   const role = resolveRole(roleId);
   if (roleId && !role) {
     // 許容ロールは EBI_ROLES のキーから動的に生成する（カスタム役割を足せば自動で反映される）。
-    const allowed = Object.keys(EBI_ROLES).join(", ");
-    throw new Error(`role が不正です: ${roleId}（許容: ${allowed}）`);
+    // メッセージ生成は roles.ts の unknownRoleError が SoT（MCP ブリッジ側の
+    // 説明文と同じ一覧を使う＝呼び出し側が役割名を推測しなくて済む）。
+    throw unknownRoleError(roleId);
   }
 
   // 適用優先度: 明示指定 > 役割既定 > サーバ既定。
@@ -692,19 +852,54 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     ? validatePermissionMode(params.permissionMode)
     : (role?.permissionMode ?? DEFAULT_PERMISSION_MODE);
   const appendSystemPrompt = params.appendSystemPrompt ?? role?.appendSystemPrompt ?? null;
-  const model = params.model ?? role?.defaultModel ?? null;
+
+  // バックエンド解決: spawn 引数 > 役割既定（EbiRole.backend）> config.defaultBackend >
+  // env EBI_BACKEND > claude（PR-E）。
+  // 実装済みでない backend を明示指定された場合はここで throw し、制御API が
+  // 400 相当のエラーで返す（黙って claude に落とさない）。
+  const backendId = resolveBackendId({
+    explicit: params.backend,
+    role: role?.backend,
+    configDefault: backendSettings.defaultBackend,
+    env: process.env.EBI_BACKEND,
+  });
+  const backend = getBackend(backendId);
+
+  // モデル名の語彙は backend ごとに別物（claude の "opus"/"sonnet" は codex では通らず、
+  // ChatGPT アカウントでは `The 'sonnet' model is not supported` で毎ターン 400 になる）。
+  // よって役割の defaultModel（claude 語彙）は claude にだけ効かせ、非 claude では
+  //   明示指定 > EBI_<ID>_MODEL > 未指定（CLI 既定モデル）
+  // の順で解決する（PR-D）。
+  // 役割の defaultModel は「役割の既定 backend で起動したとき」だけ効かせる（PR-E）。
+  // 役割 backend 未指定の役割は claude 語彙とみなす（従来どおり）。
+  const roleBackendId = role?.backend ?? DEFAULT_BACKEND_ID;
+  const roleModel = role && roleBackendId === backendId ? nonEmpty(role.defaultModel) : null;
+  const model =
+    params.model ??
+    roleModel ??
+    nonEmpty(backendSettings.backends[backendId]?.defaultModel) ??
+    (backendId === DEFAULT_BACKEND_ID
+      ? null
+      : (process.env[`EBI_${backendId.toUpperCase()}_MODEL`] ?? null));
+
+  // 起動バイナリの解決。サーバ既定 command（EBI_COMMAND / 既定 "claude"）がその backend の
+  // ものでなければ backend の既定バイナリを使う（claude サーバから gemini/codex エビを起動する経路）。
+  // ただし **どの backend にも一致しない command（EBI_COMMAND=bash 等のスタブ起動）は
+  // そのまま尊重する**（テスト用の逃げ道を潰さないため。従来挙動と同一）。
+  const serverBackend = resolveBackend(spawnConfig.command);
+  const command =
+    serverBackend === null || serverBackend.id === backendId
+      ? spawnConfig.command
+      : (backendSettings.backends[backendId]?.command ?? backend.defaultCommand);
 
   // 役割付きなら ebi-control MCP（最小権限・reply_to_master 等）を追加する。
-  // - claude command 時のみ --mcp-config を足す（bash 等の非 claude command には付けない＝
-  //   既存 buildClaudeArgs の「非 claude にフラグを付けない」方針と矛盾させない）。
-  // - --strict-mcp-config は付けない。作業に必要な既存 MCP 環境を保ちつつ、
-  //   ebi-control を「追加」で持たせたいため（strict だと他の MCP が落ちる）。
-  // - notify モードが有効なときだけ --dangerously-load-development-channels server:ebi-control
-  //   を足し、ebi-control MCP をセッションの channel として register する。これが無いと
-  //   `notifications/claude/channel` が harness の channels allowlist 判定で skip され、
-  //   notification 注入が成立しない（2026-07-11 harness バイナリ解析＋実機検証で確定。
-  //   capability 宣言は src/mcp/control-server.ts 側）。サーバ名は mcp-config の mcpServers キー
-  //   （scripts/gen-master-mcp.mjs の "ebi-control"）に一致させる。
+  // 「どのフラグをどう付けるか」はバックエンド実装（backends/claude.ts の buildArgs）に閉じており、
+  // ここでは抽象パラメータ（mcpConfigPath / notifyMode）を渡すだけにする。
+  // - 非対応 command（EBI_COMMAND=bash 等のスタブ起動）では buildLaunchArgs が固有フラグを
+  //   一切付けない（bash が解釈できず即終了→crashloop になるのを防ぐ、従来からの方針）。
+  // - notify モードが有効なときだけ dev-channels フラグが付き、ebi-control MCP がセッションの
+  //   channel として register される。これが無いと notification 注入が成立しない
+  //   （2026-07-11 harness バイナリ解析＋実機検証で確定。capability 宣言は control-server.ts 側）。
   //   このフラグを付けた claude は起動時に development channels 警告ダイアログを出すが、
   //   agent.ts の起動ゲート自動応答（maybeAnswerStartupGates）が "1"+Enter で越える
   //   （運用者承認のもと有効化・live e2e 19/20 OK）。安全限定＝dev-channels 値が
@@ -712,18 +907,7 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   //   既定は notify（isNotifyMode()=true）。EBI_INJECT_MODE=pty で旧方式へロールバック可。
   // - id は先に予約しておき、worktree 有無に関わらず EBI_ID として pty env に注入する
   //   （子の stdio MCP が継承し、reply_to_master の from が自分の id になる）。
-  const isClaude = command === "claude" || command.endsWith("/claude");
   const agentId = registry.reserveId(params.id);
-  const roleMcpArgs =
-    role && isClaude
-      ? [
-          "--mcp-config",
-          ROLE_MCP_CONFIG[role.mcpRole],
-          ...(isNotifyMode()
-            ? ["--dangerously-load-development-channels", EBI_CONTROL_CHANNEL_SPEC]
-            : []),
-        ]
-      : [];
   // EBI_ID は全 spawn 経路（master/supervisor/dynamic/engineer）で必ず注入する。
   // - engineer: 子の stdio MCP が継承し reply_to_master の from を自分の id にする。
   // - 全エビ共通: statusLine スクリプトがこの id で usage を /control/usage へ POST し、
@@ -731,26 +915,61 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   // command 種別に関わらず注入してよい（bash テストでも env 継承の確認ができる）。
   const launchEnv = { EBI_ID: agentId };
 
-  // claude フラグ（model/permission-mode/append-system-prompt）を組み立てる。
-  // bash 等の非 claude command 時は buildClaudeArgs 側でフラグを付けない。
-  const claudeArgs = buildClaudeArgs({
-    command,
+  // バックエンド固有の起動引数を組み立てる（claude なら
+  // --model / --permission-mode / --append-system-prompt / --mcp-config / dev-channels）。
+  const mcpConfigPath = role ? ROLE_MCP_CONFIG[role.mcpRole] : null;
+  // 制御MCP の渡し方は backend の方言で異なる（claude=JSON ファイルパス / gemini=env /
+  // codex=`-c` に焼く）。どれを使うかは backend 実装が決めるので、ここでは全部渡す。
+  const launchInputFor = (trustPaths: readonly string[]): BackendLaunchInput => ({
     model,
     permissionMode,
-    appendSystemPrompt,
-    extraArgs: [...roleMcpArgs, ...spawnConfig.args],
+    systemPrompt: appendSystemPrompt,
+    mcpConfigPath,
+    controlMcp: role ? controlMcpSpecFor(role.mcpRole, agentId) : null,
+    // フォルダ信頼ゲートを出させないために宣言するディレクトリ（codex のみ使用）。
+    trustPaths,
+    notifyMode: isNotifyMode(),
+    extraArgs: extraArgsForBackend(backendId),
   });
+
+  // 起動前チェック（認証ファイル / 必須 env / CLI バージョン）。
+  // 確認すべきことを 1 つも持たない backend（claude）では実行されない＝外形ゼロ差分。
+  // errors があれば spawn を止めて明示エラーにする（起動即死 → crashloop より原因が分かる）。
+  if (needsPreflight(backend)) {
+    const pf = await runPreflight(backend, {
+      command,
+      env: applyEnvDenyList(process.env, backend.envDenyList),
+    });
+    for (const w of pf.warnings) {
+      console.warn(`[preflight:${backendId}] 警告: ${w}`);
+    }
+    if (!pf.ok) {
+      throw new Error(
+        `backend "${backendId}" の起動前チェックに失敗しました: ${pf.errors.join(" / ")}`,
+      );
+    }
+  }
 
   // worktree なし: cwd 直指定で起動。
   if (!params.useWorktree) {
+    const input = launchInputFor([cwd]);
     const launch: LaunchParams = {
       command,
-      args: claudeArgs,
+      args: buildLaunchArgs(command, input),
       cwd,
       model,
       env: launchEnv,
+      backend: backendId,
+      mcpConfigPath,
+      systemPrompt: appendSystemPrompt,
+      // 役割プロンプトを起動引数で渡せない backend（codex）は ready 後に PTY 注入する。
+      initialInject: initialInjectFor(command, input),
+      // 役割別の ACK 監視窓（imagegen のように 1 ターンが長い役割で誤 respawn を避ける）。
+      ackWatchMs: role?.ackWatchMs ?? null,
     };
     const agent = registry.spawn(cwd, handlers, { id: agentId, kind: params.kind, role: role?.id, launch });
+    watchEarlyExit(agent, backend, params);
+    watchAckFailure(agent, backend, params);
     broadcast({ type: "spawned", agent: agent.toRecord() });
     broadcastRegistry();
     return agent.id;
@@ -763,12 +982,20 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
 
   const wt = await addWorktree(repoPath, branch);
   if (wt.reused) broadcast({ type: "notice", id: agentId, text: wt.reused });
+  // worktree は git のサブディレクトリ扱いなので、repo root と worktree の**両方**を
+  // 信頼済みとして宣言する（codex のフォルダ信頼ゲート対策・PoC §3.1）。
+  const input = launchInputFor([wt.repoTop, wt.worktreePath]);
   const launch: LaunchParams = {
     command,
-    args: claudeArgs,
+    args: buildLaunchArgs(command, input),
     cwd: wt.worktreePath,
     model,
     env: launchEnv,
+    backend: backendId,
+    mcpConfigPath,
+    systemPrompt: appendSystemPrompt,
+    initialInject: initialInjectFor(command, input),
+    ackWatchMs: role?.ackWatchMs ?? null,
   };
   const agent = registry.spawn(wt.worktreePath, handlers, {
     id: agentId,
@@ -779,9 +1006,182 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     worktreeRepo: wt.repoTop,
     worktreePath: wt.worktreePath,
   });
+  watchEarlyExit(agent, backend, params);
+  watchAckFailure(agent, backend, params);
   broadcast({ type: "spawned", agent: agent.toRecord() });
   broadcastRegistry();
   return agent.id;
+}
+
+/**
+ * 役割プロンプト ACK の「静かな故障」検知で作り直すために、spawn 引数を控えておく。
+ *
+ * 背景（docs/backends/codex.md §7.1）: codex エビは一定確率で、役割プロンプトへの ACK に
+ * 「reply_to_master ツールが利用できない」と書き、以後タスクを実行しない。プロセスは生きて
+ * idle に戻るため、master からは「起動して落ち着いているが報告が来ない」ようにしか見えず、
+ * タスクが 1 件静かに消える。検知（agent.ts の maybeDetectAckFailure）と、その後の
+ * 「kill →同一 id・同一引数で 1 回だけ再 spawn」をここで繋ぐ。
+ *
+ * ackFailureWatch を持たない backend（claude / gemini）では何も登録しない＝挙動不変。
+ */
+const ackRespawnParams = new Map<string, GeneralizedSpawnParams>();
+
+/** 作り直し時に旧プロセスの exit を待つ上限(ms)。プロセスグループ kill の猶予より長く取る。 */
+const ACK_RESPAWN_EXIT_WAIT_MS = Number(process.env.EBI_ACK_RESPAWN_EXIT_WAIT_MS) || 8000;
+
+function watchAckFailure(
+  agent: Agent,
+  backend: ReturnType<typeof getBackend>,
+  params: GeneralizedSpawnParams,
+): void {
+  if (!backend.ackFailureWatch) return;
+  ackRespawnParams.set(agent.id, params);
+}
+
+/**
+ * 「静かな故障」を検知したエビを 1 回だけ作り直す。
+ *
+ * - 1 回目: kill（プロセスグループ）→ 同一 id・同一引数で再 spawn。旧エビの注入キューに
+ *   滞留していた本文（master が送ったタスク）は新エビへ引き継ぐ（捨てると「作り直したが
+ *   タスクは消えた」という、直そうとしている故障そのものになる）。
+ * - 2 回目: 作り直さず **fatal として master へ通知**する（reverseInject＝既存の通知経路）。
+ *   黙って idle のまま放置するのが一番困るため、報告は必ず出す。
+ */
+async function handleAckFailure(id: string, reason: string): Promise<void> {
+  const params = ackRespawnParams.get(id);
+  const agent = registry.get(id);
+  const action = decideAckFailureAction({
+    hasParams: params !== undefined,
+    agentAlive: agent !== undefined,
+    isRetry: params?.retryOfAckFailure === true,
+  });
+  ackRespawnParams.delete(id);
+  if (action === "ignore" || params === undefined || agent === undefined) return;
+  const backendId = agent.backend;
+
+  if (action === "fatal") {
+    const text = buildAckFatalMessage(id, backendId, reason);
+    logDelivery({
+      event: "ack-failure-fatal",
+      level: "warn",
+      msg: `${id} が再 spawn 後も静かな故障（${reason}）。master へ fatal 通知`,
+      id,
+      backend: backendId,
+      reason,
+      attempt: 2,
+    });
+    broadcast({ type: "notice", id, text });
+    const r = await registry.reverseInject(id, "master", text, "reply");
+    if (r.delivered.length === 0) {
+      console.error(`[ebi-team] [${id}] fatal 通知を master へ配信できませんでした`);
+    }
+    return;
+  }
+
+  logDelivery({
+    event: "ack-failure-respawn",
+    level: "warn",
+    msg: `${id} の役割プロンプト ACK で静かな故障（${reason}）。kill して 1 回だけ再 spawn する`,
+    id,
+    backend: backendId,
+    reason,
+    attempt: 1,
+  });
+  broadcast({
+    type: "notice",
+    id,
+    text: `${id}（backend=${backendId}）が「${reason}」。kill して 1 回だけ作り直します`,
+  });
+
+  // 作り直しで引き継ぐ本文（master のタスク）を先に取り出してから kill する。
+  // ready 直後のエビは idle なので、タスクは**注入キューを経ずに PTY へ直接書かれる**。
+  // よってキューの中身だけでは足りず、ACK 監視中に届いた本文（takeAckWindowBodies）を使う
+  // （キューに滞留したぶんもそこに含まれる。drain は二重注入と破棄ログの抑止）。
+  // registry.remove() は worktree を消さない（cleanupWorktree は呼び出し側の責務）ので、
+  // 同じ worktree／ブランチのまま作り直せる。
+  const pending = agent.takeAckWindowBodies();
+  agent.drainInjectQueue();
+  registry.remove(id);
+  broadcast({ type: "exited", id, exitCode: null });
+  broadcastRegistry();
+  // 旧プロセスの exit が処理されるまで待ってから作り直す。exit ハンドラは id だけを見て
+  // registry から remove するため、待たずに新エビを立てると遅れて届いた旧 exit が
+  // 新エビを kill してしまう（同一 id で作り直すこの経路に固有の罠）。
+  if (!(await agent.awaitExit(ACK_RESPAWN_EXIT_WAIT_MS))) {
+    console.warn(`[ebi-team] [${id}] 旧プロセスの exit を待てませんでした（作り直しは続行）`);
+  }
+
+  await spawnAgent({ ...params, id, retryOfAckFailure: true });
+
+  if (pending.length === 0) return;
+  const next = registry.get(id);
+  if (!next) return;
+  const ready = await next.waitUntilReady(READY_WAIT_MS);
+  if (!ready) {
+    logDelivery({
+      event: "ack-failure-requeue-failed",
+      level: "warn",
+      msg: `${id} の再 spawn 後に ready 到達せず、滞留していた注入 ${pending.length} 件を引き継げませんでした`,
+      id,
+      count: pending.length,
+    });
+    return;
+  }
+  for (const body of pending) next.injectRaw(body);
+  logDelivery({
+    event: "ack-failure-requeued",
+    level: "info",
+    msg: `${id} の再 spawn 後に滞留注入 ${pending.length} 件を引き継ぎました`,
+    id,
+    count: pending.length,
+  });
+}
+
+/**
+ * ready 到達前の予期せぬ exit を 1 回だけ再試行する（backend.retryOnEarlyExit が true のとき）。
+ *
+ * 非ブロッキング（spawn の応答は待たせない）。判定は
+ *   「READY_WAIT_MS 以内に ready にならず、かつ registry から消えている（= exit 済み）」
+ * で行う。ready 待ちタイムアウトだけ（プロセスは生きている）では再試行しない
+ * ——生きているエビを二重起動しないため。
+ * 2 回目も ready 前に落ちたら notice で明示する（黙って消えるのが一番困る）。
+ */
+function watchEarlyExit(
+  agent: Agent,
+  backend: ReturnType<typeof getBackend>,
+  params: GeneralizedSpawnParams,
+): void {
+  if (!backend.retryOnEarlyExit) return;
+  const agentId = agent.id;
+  void (async () => {
+    const ready = await agent.waitUntilReady(READY_WAIT_MS);
+    if (ready) return;
+    // まだ registry に居る＝プロセスは生きている（単なる ready 待ちタイムアウト）。何もしない。
+    if (registry.get(agentId) === agent) return;
+    if (params.retryOfEarlyExit) {
+      broadcast({
+        type: "notice",
+        id: agentId,
+        text: `${agentId}（backend=${backend.id}）が ready 前に再び終了しました。再試行は打ち切ります（起動条件を確認してください）`,
+      });
+      console.error(`[spawn:${backend.id}] ${agentId} が ready 前に 2 回終了しました`);
+      return;
+    }
+    broadcast({
+      type: "notice",
+      id: agentId,
+      text: `${agentId}（backend=${backend.id}）が ready 前に終了しました。1 回だけ再起動します`,
+    });
+    try {
+      await spawnAgent({ ...params, id: agentId, retryOfEarlyExit: true });
+    } catch (err) {
+      broadcast({
+        type: "notice",
+        id: agentId,
+        text: `${agentId} の再起動に失敗しました: ${(err as Error).message}`,
+      });
+    }
+  })();
 }
 
 /** sendMessage の入力パラメータ。 */
@@ -806,6 +1206,8 @@ export interface SendMessageParams {
   branch?: string;
   /** spawnIfMissing で起動する際の役割（EBI_ROLES id。未指定は engineer）。 */
   role?: string;
+  /** spawnIfMissing で起動する際のバックエンド（未指定は役割の既定→サーバ既定）。 */
+  backend?: string;
   /** 【後方互換】spawnIfMissing で起動する際 engineer 役割にするか（既定 true 相当）。role が優先。 */
   asEngineer?: boolean;
 }
@@ -867,6 +1269,7 @@ async function sendMessage(params: SendMessageParams): Promise<SendMessageResult
       branch: params.branch,
       kind: "dynamic",
       role: roleId,
+      backend: params.backend,
     });
     spawned = true;
     agent = registry.get(to);
@@ -907,7 +1310,15 @@ async function sendMessage(params: SendMessageParams): Promise<SendMessageResult
   // ただし notifySubscribe:false のエビ（外部チャンネル待機セッション minaebi 等・受信 PTY 固定）は
   // この経路に入らず PTY 注入へ直行する。自セッションに ebi-control channel を登録しないため
   // notification は harness に黙って捨てられる＝購読は永遠に確立せず、待つだけ無駄になるため。
-  if (registry.notifyEnabled() && hasControlBridge(agent) && agent.notifySubscribe !== false) {
+  // さらに、backend が channel 注入に対応しない場合（codex）もこの経路へ入らない。
+  // 制御MCP ブリッジは持つ（reply_to_master は使える）が、受信側の channel が無いため
+  // 購読は永遠に確立せず、待つだけ無駄になる。
+  if (
+    registry.notifyEnabled() &&
+    hasControlBridge(agent) &&
+    supportsChannelInject(agent) &&
+    agent.notifySubscribe !== false
+  ) {
     const subscribed =
       registry.hasActiveSubscriber(to) || (await registry.waitForSubscriber(to, SUBSCRIBE_WAIT_MS));
     if (subscribed) {
@@ -988,10 +1399,13 @@ async function handleSummarize(ws: WebSocket, id: string): Promise<void> {
  */
 async function startFixedEbi(): Promise<void> {
   try {
-    const raw = await loadFixedEbi(CONFIG_PATH, { command: COMMAND });
+    const raw = await loadFixedEbi(CONFIG_PATH, { command: COMMAND, backend: BACKEND_ID });
     // master には役割別 MCP config を spawn 直前に自動付与する（config への手書きを不要にし、
     // dev / 本番のファイル名差分をサーバ側で吸収する）。args に明示があればそちらを優先。
-    const specs = raw.map((s) => applyMasterMcpConfig(s, ROLE_MCP_CONFIG.master));
+    // master は backend=claude に固定する（config/env で他 backend を既定にしても統括系は落とさない）。
+    const specs = raw.map((s) =>
+      applyMasterBackendFailsafe(applyMasterMcpConfig(s, ROLE_MCP_CONFIG.master)),
+    );
     if (specs.length === 0) {
       console.log(`[ebi-team] 固定エビ: なし（${CONFIG_PATH} 未配置または fixedEbi 空）`);
       return;
@@ -1048,9 +1462,56 @@ async function loadAndApplyDevChannelsAllowlist(): Promise<void> {
   }
 }
 
-// spawn 要求（WS / 制御API いずれも）を受け付ける前にカスタム役割・許可リストを確定させる。
+/**
+ * ebi-team.config.json の top-level "defaultBackend" / "backends" を読み、サーバ既定へ反映する。
+ * httpServer.listen()／固定エビ自動起動より前に完了させ、以降の spawn（および固定エビの
+ * backend 解決）が常に config 反映後の既定を見るようにする。
+ * config が無い/未指定なら何もしない。検証失敗時は警告のみで起動を継続する
+ *（env EBI_BACKEND → claude の従来経路で動く）。
+ */
+async function loadAndApplyBackendSettings(): Promise<void> {
+  try {
+    backendSettings = await loadBackendSettings(CONFIG_PATH);
+    BACKEND_ID = resolveBackendId({
+      configDefault: backendSettings.defaultBackend,
+      env: process.env.EBI_BACKEND,
+    });
+    if (backendSettings.defaultBackend || Object.keys(backendSettings.backends).length > 0) {
+      console.log(
+        `[ebi-team] バックエンド既定: ${BACKEND_ID}` +
+          `（config 設定あり: ${Object.keys(backendSettings.backends).join(", ") || "なし"}）`,
+      );
+    }
+  } catch (err) {
+    console.warn(`[ebi-team] backends 設定の読み込みに失敗（env/既定で継続）:`, err);
+  }
+}
+
+/**
+ * ワンショット要約エンジン（ask_supervisor / WS summarize）の backend / model を
+ * config の supervisor 固定エビから引き継ぐ。
+ *
+ * 常駐 supervisor セッションと要約エンジンで別々に backend を書かせない（config 1 箇所で揃う）。
+ * supervisor 固定エビが無い / config が無い / 読み込みに失敗した場合は既定（claude/haiku）のまま。
+ * EBI_SUMMARY_CMD（テスト用スタブ）が優先されるのは resolveSummaryEngine 側で担保している。
+ */
+async function loadAndApplySupervisorEngine(): Promise<void> {
+  try {
+    const specs = await loadFixedEbi(CONFIG_PATH, { command: COMMAND, backend: BACKEND_ID });
+    const engine = supervisorEngineFrom(specs);
+    if (!engine || engine.backend === DEFAULT_BACKEND_ID) return;
+    supervisor = new Supervisor({ backend: engine.backend, model: engine.model });
+  } catch (err) {
+    console.warn(`[ebi-team] 監督・要約エンジン設定の読み込みに失敗（既定 claude で継続）:`, err);
+  }
+}
+
+// spawn 要求（WS / 制御API いずれも）を受け付ける前にカスタム役割・許可リスト・
+// バックエンド既定を確定させる。
+await loadAndApplyBackendSettings();
 await loadAndRegisterCustomRoles();
 await loadAndApplyDevChannelsAllowlist();
+await loadAndApplySupervisorEngine();
 
 // 前回終了時に開いていた viewer を復元する（fail-soft: 個別エントリの失敗は warn して掃除）。
 const viewerRestore = await viewerRegistry.restore();
@@ -1078,11 +1539,17 @@ httpServer.listen(PORT, HOST, () => {
   console.log(`[ebi-team] idle しきい値: ${IDLE_THRESHOLD_MS}ms / registry ダンプ: ${DUMP_PATH}`);
   console.log(`[ebi-team] viewer 許可ルート: ${viewerRegistry.getRoots().join(", ")}`);
   console.log(
+    `[ebi-team] context-guard: ${contextGuardConfig.enabled ? "on" : "off"}`
+      + ` / 監視対象=${contextGuardConfig.targetId}`
+      + ` / soft=${contextGuardConfig.softPct}% notify=${contextGuardConfig.hardPct}% critical=${contextGuardConfig.criticalPct}%`,
+  );
+  console.log(
     `[ebi-team] viewer 永続化: ${VIEWERS_PATH}（復元 ${viewerRestore.restored.length}件` +
       `${viewerRestore.skipped.length > 0 ? ` / skip ${viewerRestore.skipped.length}件` : ""}）`,
   );
   console.log(`[ebi-team] 配送ログ: ${deliveryLogPath() ?? "（無効・console のみ）"}`);
   console.log(`[ebi-team] 固定エビログ: ${fixedEbiLogPath() ?? "（無効・console のみ）"}`);
+  console.log(`[ebi-team] 使用率履歴: ${usageHistoryPath() ?? "（無効）"}`);
   console.log(`[ebi-team] master MCP config: ${ROLE_MCP_CONFIG.master}`);
   // 監督機能の状態のみ表示。キー値は出さない。
   console.log(`[ebi-team] ${supervisor.describeStartup()}`);

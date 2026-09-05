@@ -19,6 +19,11 @@
 // （Node 組込みモジュールのみに依存し、副作用の無い純粋な定数/関数）。
 
 import { DEFAULT_PERMISSION_MODE, validatePermissionMode, type PermissionMode } from "./config.ts";
+import {
+  backendIdError,
+  isImplementedBackendId,
+  type BackendId,
+} from "./backends/index.ts";
 
 /**
  * 役割 id。spawn 時に role として渡す。
@@ -53,7 +58,39 @@ export interface EbiRole {
   permissionMode: PermissionMode;
   /** 既定モデル（alias）。 */
   defaultModel: string;
+  /**
+   * 役割ごとの既定バックエンド（PR-E）。未指定なら「config.defaultBackend → env EBI_BACKEND
+   * → claude」へフォールバックする。
+   * 注意: defaultModel の語彙はバックエンドごとに別物（claude の "opus" は codex では通らない）
+   * ため、defaultModel は **この backend で spawn したときだけ**適用される（index.ts の spawnAgent）。
+   */
+  backend?: BackendId;
+  /**
+   * この役割で spawn したときの ACK 監視窓（ms）の上書き。未指定なら backend 既定
+   * （codex は 90 秒）。0 を指定すると監視そのものを行わない。
+   *
+   * 効かせる理由（imagegen 役割・設計 §6.4）: codex の ACK 監視は役割プロンプト注入から
+   * 90 秒。1 枚 76 秒かかる画像生成タスクが ACK の busy を跨いで注入されると、**正しい失敗報告**
+   * が監視窓の内側に落ちて「静かな故障」と誤判定され、無駄な作り直しが走る。実測の ACK 所要は
+   * 30 秒前後なので、生成が長い役割だけ窓を短くして重なりを断つ。
+   * ackFailureWatch を持たない backend（claude / gemini）では無視される＝挙動不変。
+   */
+  ackWatchMs?: number;
 }
+
+/**
+ * 「必要な画像は自分で作らず、imagegen_job(YAML) にして master へ渡す」節。
+ * engineer 役割プロンプトの末尾に足す（設計 §2.3）。master は届いた YAML を imagegen エビへ
+ * **転記するだけ**で済む。様式の SoT は src/server/imagegen.ts。
+ */
+export const IMAGE_REQUEST_APPEND =
+  "実装に画像素材（アイコン・イラスト・ヒーロー画像等）が必要になった場合、自分で画像を作ろうとしないこと。" +
+  "必要な画像を洗い出し、reply_to_master の本文末尾に次の YAML ブロックを 1 個だけ付けて master に渡す" +
+  "（master がそのまま imagegen エビへ転記する）: " +
+  "imagegen_job: v1 / job_id: <英数と-> / requester: <自分のid> / " +
+  "images: の下に - id / purpose / prompt / count / size(WxH または none) / fit(contain|none) / format(png|webp) を並べる。" +
+  "1 ジョブは合計 6 枚まで。prompt は日本語で、被写体・背景色・画風・禁止事項（文字を入れない等）まで書き切ること。" +
+  "画像が不要なタスクではこのブロックを付けない。";
 
 /**
  * engineer エビの役割注入（--append-system-prompt）。
@@ -65,7 +102,8 @@ export const ENGINEER_APPEND_SYSTEM_PROMPT =
   "作業は与えられた cwd/worktree 内で完結させる。" +
   "完了したら必ず reply_to_master ツールで、結論ファーストの簡潔な報告（成果・差分・次アクション）を master に送る" +
   "（master はこれを待っている。scrollback を読ませない＝トークン節約）。報告後は master に kill される前提でよい。" +
-  "破壊的操作・外部送信・git push は勝手にしない。";
+  "破壊的操作・外部送信・git push は勝手にしない。" +
+  IMAGE_REQUEST_APPEND;
 
 /**
  * 組込みの役割（公開リポジトリに同梱される既定セット）。常にレジストリに存在する
@@ -81,6 +119,8 @@ export const BUILTIN_ROLES: Record<string, EbiRole> = {
     permissionMode: "bypassPermissions",
     // 既定は明示ID運用（"opus" などのエイリアスは CLI 版依存で解決先が変わるため）。
     defaultModel: "claude-opus-5",
+    // 実装役の既定は claude 固定（PR-E 時点。codex/gemini は明示指定 or カスタム役割で使う）。
+    backend: "claude",
     appendSystemPrompt: ENGINEER_APPEND_SYSTEM_PROMPT,
   },
 };
@@ -107,6 +147,22 @@ export function resolveRole(role: string | undefined | null): EbiRole | undefine
   return isEbiRoleId(role) ? EBI_ROLES[role] : undefined;
 }
 
+/**
+ * 現在レジストリに載っている役割 id 一覧（登録順）。
+ * config の roles をマージした後に呼べば、カスタム役割もそのまま含まれる。
+ */
+export function availableRoleIds(): EbiRoleId[] {
+  return Object.keys(EBI_ROLES);
+}
+
+/**
+ * 未知の役割を弾くときの共通エラー。**必ず利用可能な役割名を列挙する**
+ * （master が「では何なら通るのか」を推測しなくて済むようにするため）。
+ */
+export function unknownRoleError(roleId: string): Error {
+  return new Error(`role が不正です: ${roleId}（許容: ${availableRoleIds().join(", ")}）`);
+}
+
 // ===== カスタム役割の登録（v1.1: ebi-team.config.json の top-level "roles"） =====
 
 /** カスタム役割で emoji/label が省略されたときの既定値。 */
@@ -119,6 +175,15 @@ function asOptionalString(v: unknown, field: string, roleId: string): string | u
   if (v === undefined) return undefined;
   if (typeof v !== "string") {
     throw new Error(`カスタム役割 "${roleId}" の ${field} は文字列である必要があります`);
+  }
+  return v;
+}
+
+/** raw なフィールド値を 0 以上の整数として検証する。未指定は undefined、型不正は throw。 */
+function asOptionalNonNegativeInt(v: unknown, field: string, roleId: string): number | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v !== "number" || !Number.isInteger(v) || v < 0) {
+    throw new Error(`カスタム役割 "${roleId}" の ${field} は 0 以上の整数である必要があります`);
   }
   return v;
 }
@@ -160,10 +225,35 @@ function normalizeCustomRole(id: string, raw: unknown): EbiRole {
     }
   }
 
-  const defaultModel = asOptionalString(r.defaultModel, "defaultModel", id) ?? CUSTOM_ROLE_DEFAULT_MODEL;
+  const backendRaw = asOptionalString(r.backend, "backend", id);
+  let backend: BackendId | undefined;
+  if (backendRaw !== undefined) {
+    if (!isImplementedBackendId(backendRaw)) {
+      throw new Error(`カスタム役割 "${id}" の ${backendIdError(backendRaw).message}`);
+    }
+    backend = backendRaw;
+  }
+
+  // defaultModel の既定はバックエンドで変わる。claude 以外は CLI 既定モデルに任せる
+  //（claude 語彙の "sonnet" を codex/gemini に渡すと毎ターン 400 になる）。
+  const ackWatchMs = asOptionalNonNegativeInt(r.ackWatchMs, "ackWatchMs", id);
+
+  const defaultModel =
+    asOptionalString(r.defaultModel, "defaultModel", id) ??
+    (backend === undefined || backend === "claude" ? CUSTOM_ROLE_DEFAULT_MODEL : "");
   const appendSystemPrompt = asOptionalString(r.appendSystemPrompt, "appendSystemPrompt", id) ?? "";
 
-  return { id, label, emoji, mcpRole, permissionMode, defaultModel, appendSystemPrompt };
+  return {
+    id,
+    label,
+    emoji,
+    mcpRole,
+    permissionMode,
+    defaultModel,
+    backend,
+    appendSystemPrompt,
+    ...(ackWatchMs === undefined ? {} : { ackWatchMs }),
+  };
 }
 
 /**

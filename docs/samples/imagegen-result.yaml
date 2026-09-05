@@ -1,0 +1,25 @@
+# imagegen エビからの報告サンプル（reply_to_master 本文の YAML ブロック部分）。
+# 検証: npm run imagegen:check -- result docs/samples/imagegen-result.yaml
+imagegen_result: v1
+job_id: sample-2026-09-05
+summary: 2/3 ok, 1 failed
+results:
+  - id: hero-icon
+    status: ok
+    path: /Users/you/workspace/GitHub/ebi-team/tmp/images/sample-2026-09-05/hero-icon.png
+    pixels: 512x512
+    bytes: 244310
+    format: png
+    tool: image_gen__imagegen
+  - id: empty-state-1
+    status: ok
+    path: /Users/you/workspace/GitHub/ebi-team/tmp/images/sample-2026-09-05/empty-state-1.png
+    pixels: 1024x1024
+    bytes: 831865
+    format: png
+    tool: image_gen__imagegen
+  - id: empty-state-2
+    status: failed
+    error_code: GEN_ERROR
+    note: 生成ツールがエラー応答。同一プロンプトで 1 回だけ再試行し、同じ結果。
+gen_seconds: 233

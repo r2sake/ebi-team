@@ -1,10 +1,31 @@
 {
   "$comment": "固定エビ（削除不可・常駐）の宣言的定義。サーバ起動時に自動 spawn され、exit したら自動再起動される。cwd は $HOME/${VAR}/~ の展開と config 基準の相対解決に対応。command 未指定なら EBI_COMMAND（既定 claude）。claude 起動時のみ --model/--permission-mode/--append-system-prompt が付与される。このファイルは example です。実際に使う場合は ebi-team.config.json という名前でコピーして編集してください（.gitignore 済みなのでコミットされません）。",
   "_comment_customize": "ここに自分の人格・カスタムロールを書く。master/supervisor の appendSystemPrompt は自由に書き換えてよい。動的エビのカスタム役割（engineer 以外の役割）を増やしたい場合は下記の \"roles\" にエントリを追加する（コードを触る必要はない）。",
-  "_comment_roles": "roles は { 役割id: 定義 } の任意追加。各定義のフィールドはすべて省略可: label(表示名/既定=id), emoji(バッジ絵文字/既定=🧩), mcpRole(\"engineer\"のみ許容/既定\"engineer\"=動的エビの唯一の権限ティア), permissionMode(claudeの--permission-mode/既定はサーバ既定値), defaultModel(既定モデルalias/既定\"sonnet\"), appendSystemPrompt(--append-system-promptに渡す役割プロンプト/既定は空)。spawn_ebi/send_message の role にこの id を指定すると使える。組込みの \"engineer\" は同名キーで上書きはできるが削除はできない。",
+  "_comment_roles": "roles は { 役割id: 定義 } の任意追加。各定義のフィールドはすべて省略可: label(表示名/既定=id), emoji(バッジ絵文字/既定=🧩), mcpRole(\"engineer\"のみ許容/既定\"engineer\"=動的エビの唯一の権限ティア), permissionMode(claudeの--permission-mode/既定はサーバ既定値), defaultModel(既定モデルalias/既定\"sonnet\"。backend が claude 以外なら既定は空＝各CLIの既定モデル), backend(その役割の既定バックエンド claude/codex/gemini。未指定ならサーバ既定), appendSystemPrompt(--append-system-promptに渡す役割プロンプト/既定は空), ackWatchMs(codex の ACK 監視窓の上書き ms。既定は backend 既定=90000。0 でその役割だけ監視しない。画像生成のように 1 ターンが長い役割で、正しい失敗報告が監視窓に落ちて誤 respawn されるのを防ぐ)。spawn_ebi/send_message の role にこの id を指定すると使える。組込みの \"engineer\" は同名キーで上書きはできるが削除はできない。",
   "_comment_devChannelsAllowlist": "起動ゲート（development channels 警告）自動応答を許可する dev channel 値の追加許可リスト（正確値・完全一致）。組込みの \"server:ebi-control\" に足す形。ワイルドカード・前方一致・部分一致は不可（列挙した正確値だけが自動 \"1\"+Enter の対象）。外部チャンネル待機セッション（Slack/Discord 秘書エビ等）を固定エビにする場合、その --dangerously-load-development-channels の値（例 \"plugin:slack@<自分の marketplace id>\"）をここに正確値で足すと、無人起動時のダイアログを自動で越えられる。下記は雛形（実際の marketplace id に置き換えて使う。非公開なら ebi-team.config.json 側にのみ書く）。",
   "devChannelsAllowlist": ["plugin:slack@<your-marketplace-id>"],
+  "_comment_backends": "マルチバックエンド（PR-E）。defaultBackend はサーバ既定のバックエンド id（claude/codex/gemini。env EBI_BACKEND より優先。未指定なら env → claude）。backends は backend 別の既定 { command?: 起動バイナリ, defaultModel?: そのバックエンドの既定モデル }。解決順は spawn 引数 backend > 役割の backend > defaultBackend > env EBI_BACKEND > claude。master は何を設定しても常に claude 固定（統括系を落とさない fail-safe）。model の語彙はバックエンドごとに別物（claude の opus/sonnet は codex/gemini では通らない）。詳細は docs/backends/*.md。",
+  "defaultBackend": "claude",
+  "backends": {
+    "codex": { "command": "codex", "defaultModel": "gpt-5.5" },
+    "gemini": { "command": "gemini", "defaultModel": "gemini-flash-latest" }
+  },
+  "_comment_role_backend": "役割に backend を書くと、その役割で spawn したエビは常にそのバックエンドで起動する（下記 researcher / engineer-codex）。defaultModel はその役割の backend で起動したときだけ適用される。組込みの engineer は claude 既定のまま。なお roles の中にコメント用のキーを足すと『役割定義』として検証され起動時エラーになるので、コメントは top-level に書くこと。",
   "roles": {
+    "researcher": {
+      "label": "調査",
+      "emoji": "🔎",
+      "backend": "gemini",
+      "permissionMode": "plan",
+      "appendSystemPrompt": "あなたは下調べ・読解専任の使い捨てセッション。コードや資料を読み、事実と出典を簡潔にまとめて reply_to_master で報告する。実装や破壊的操作は行わない。"
+    },
+    "engineer-codex": {
+      "label": "実装2nd",
+      "emoji": "🧪",
+      "backend": "codex",
+      "defaultModel": "gpt-5.5",
+      "appendSystemPrompt": "あなたは実装のセカンドオピニオン担当の使い捨てセッション。与えられたタスクを実装し、結論ファーストで reply_to_master に報告する。破壊的操作・git push・外部送信は行わない。"
+    },
     "reviewer": {
       "label": "レビュアー",
       "emoji": "🔍",
@@ -12,6 +33,15 @@
       "permissionMode": "default",
       "defaultModel": "sonnet",
       "appendSystemPrompt": "あなたはコードレビュー専任の使い捨てセッション。与えられた差分/PRを読み、正しさ・可読性・設計・セキュリティの観点で指摘を簡潔にまとめ、reply_to_master で報告する。実装の変更は行わない。"
+    },
+    "imagegen": {
+      "label": "画像生成",
+      "emoji": "🎨",
+      "backend": "codex",
+      "mcpRole": "engineer",
+      "permissionMode": "acceptEdits",
+      "ackWatchMs": 45000,
+      "appendSystemPrompt": "あなたはエビチームの imagegen エビ。master から渡された imagegen_job(YAML) の画像を Codex 組み込みの画像生成ツールで作り、1 回だけ結果を報告する使い捨てセッション。\n\n【ツール】画像は必ず code mode の image_gen__imagegen で作る。シグネチャは tools.image_gen__imagegen({ prompt: string, referenced_image_paths?: string[]|null, num_last_images_to_include?: number|null }): Promise<unknown>。引数はこの 3 つだけで、サイズ引数は無い。imagegen skill の SKILL.md を読み直す手順は省くこと（内容はこのプロンプトに要約済み）。$imagegen と書いて skill を明示起動する必要も無い。OPENAI_API_KEY は使わない（ChatGPT ログインの枠で動く）。\n\n【手順】(1) 依頼 YAML の images を上から順に生成する。1 回の実行で複数枚まとめて生成できるならそうしてよい。regenerate: [id, ...] が書かれていたら、その id だけを作り直し、他の画像には触らない（ボス目視で NG だった分の作り直し経路）。1 ジョブは count の合計 6 枚まで。超える依頼なら先頭から 6 枚だけ作り、超過分は status: skipped / error_code: OVER_LIMIT で報告する。(2) 全枚数の生成を終えてから、配置・リサイズ・形式変換・実測を 1 回のシェル実行でまとめて行う（1 枚ごとにシェルを起動しない）。配置先は依頼の dest_root、既定は tmp/images/<job_id>/。ファイル名は依頼の filename、既定は <id>.<format>、count が 2 以上なら <id>-1 <id>-2 の連番。同じ名前のファイルが既にあれば上書きしてよい（作り直しのため）。(3) 最後に reply_to_master を 1 回だけ呼んで報告する。チャットに書いた文章は master に届かない。\n\n【サイズと加工】生成物のピクセル数は指示どおりにならない（1024 と書いても 1254 が返る）。依頼に size があれば sips -Z <長辺> で長辺だけ合わせる（sips -z は歪むので使わない）。format: webp は cwebp -q 90 で PNG から変換し、変換に成功したら中間の PNG を消して WebP だけ残す（sips は webp を書き出せない）。cwebp が入っていなければ PNG のまま残し、その画像の status を skipped、error_code を TOOL_MISSING にする。許された加工はリサイズと形式変換だけ。減色・パレット化・トリム・切り抜き・背景除去・アルファ操作・回転・補正は一切しない。指定サイズとアスペクト比が食い違うときは切らずに長辺だけ合わせ、note にその旨を書く。\n\n【範囲】書き込みは自分の cwd 配下だけ。cwd の外にファイルを作ったり消したりしない。生成物を対象リポジトリへ配るのは master の仕事なので、自分では移動しない。~/.codex/generated_images は読むだけで、掃除はしない。git commit・git push・外部送信・破壊的操作はしない。\n\n【報告】本文は 1 行サマリと次の YAML ブロック 1 個。imagegen_result: v1 / job_id / summary / results: 各要素は id, status(ok|failed|refused|skipped), path(絶対パス), pixels(sips の実測値), bytes, format, tool, error_code?, note? / gen_seconds。path は必ず絶対パスにし（master が open_viewer にそのまま渡す）、pixels は依頼値ではなく sips -g pixelWidth -g pixelHeight の実測値を書く。\n\n【失敗したとき】1 枚でつまずいても残りの生成を続け、その画像だけ status を failed か refused にして報告に含める。原因は error_code(GEN_TOOL_OFF / REFUSED / GEN_ERROR / RESIZE_ERROR / TOOL_MISSING / OVER_LIMIT / TIMEOUT) で示し、note は事実だけを短く書く。画像生成ツールがセッションに配られていない・401 が返るなど認証やプランが原因と見えるときは、ジョブ全体を打ち切って全 results を error_code: GEN_TOOL_OFF にし、note に『ボスに Codex の再ログイン（codex の login をやり直す）を依頼してください（ChatGPT Plus の認証切れが原因）』と入れる。note に『利用』『使用』『提供』『登録』『用意』『呼び出』『実行』『送信』『報告』を否定形で組み合わせた言い回しは書かない（サーバの故障検知に誤ヒットして作り直しが走る）。error_code と『NG』『不可』『未配布』『エラー応答』のような短い語で表現すること。"
     }
   },
   "fixedEbi": [

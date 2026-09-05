@@ -2,6 +2,51 @@ import * as pty from "node-pty";
 import { IdleDetector } from "./idleDetector.ts";
 import type { AgentRecord, AgentStatus, AgentMode, AgentKind } from "../shared/protocol.ts";
 import { deliveryText } from "../shared/deliveryTag.ts";
+import {
+  CLAUDE_BACKEND,
+  applyEnvDenyList,
+  getBackend,
+  matchAckFailure,
+  resolveBackendOrDefault,
+  resolveIdleThresholdMs,
+  type AckFailureWatchSpec,
+  type BackendId,
+  type StartupGateKind,
+  type StartupGateSpec,
+} from "./backends/index.ts";
+
+// 起動ゲート判定・dev channel 許可リストは Claude バックエンド（backends/claude.ts）が SoT。
+// 既存の import 元（index.ts / test/gate.test.ts）を壊さないよう再エクスポートする。
+export {
+  BASE_ALLOWED_DEV_CHANNELS,
+  detectStartupGate,
+  isDevChannelsAutoAnswerEligible,
+} from "./backends/index.ts";
+
+/** ACK 監視中に控える注入本文の上限件数（作り直しでの引き継ぎ用）。 */
+const ACK_WINDOW_BODY_LIMIT = 20;
+
+/**
+ * ACK 監視設定に役割別の窓（ms）を反映する純関数。
+ * - backend が監視を持たない（claude / gemini）なら常に null＝挙動不変。
+ * - override 未指定なら backend 既定をそのまま使う。
+ * - override が 0 ならこの役割では監視しない。
+ * - minObserveMs が窓を超えないよう丸める（超えると「成功 ACK で閉じる」判定が一生効かない）。
+ */
+export function resolveAckWatchSpec(
+  base: AckFailureWatchSpec | null,
+  overrideMs: number | null | undefined,
+): AckFailureWatchSpec | null {
+  if (base === null) return null;
+  if (overrideMs === null || overrideMs === undefined) return base;
+  if (!Number.isFinite(overrideMs) || overrideMs < 0) return base;
+  if (overrideMs === 0) return null;
+  return {
+    ...base,
+    windowMs: overrideMs,
+    minObserveMs: Math.min(base.minObserveMs, Math.floor(overrideMs / 2)),
+  };
+}
 
 /**
  * 注入時、本文を書いてから Enter(`\r`) を別 write で送るまでの待ち時間(ms)。
@@ -28,16 +73,6 @@ const MIN_BOOT_MS = Number(process.env.EBI_MIN_BOOT_MS) || 1500;
 const REPLY_SUPPRESS_MS = Number(process.env.EBI_REPLY_SUPPRESS_MS) || 5000;
 
 /**
- * 起動ゲート自動応答を許可する dev channel 値の「組込み（既定）許可リスト」。
- * ここに載っている**正確値**（完全一致）だけを自動応答対象にする。
- * ワイルドカード・前方一致・部分一致は一切しない（意図せぬ承認を防ぐ）。
- * 運用者が config（ebi-team.config.json の top-level "devChannelsAllowlist"）で
- * 追加の正確値を足せる（例: 外部チャンネル待機セッションの plugin:slack@<marketplace>）。
- * その追加分は index.ts が SpawnConfig.devChannelsAllowlist にマージして Agent に渡す。
- */
-export const BASE_ALLOWED_DEV_CHANNELS: readonly string[] = ["server:ebi-control"];
-
-/**
  * 起動ゲート（trust / dev-channels 警告）自動応答を受け付ける「起動フェーズ」の時間窓(ms)。
  * spawn からこの時間内に出たダイアログにだけ応答する。
  * 注意: これらダイアログはセッションを入力待ちで沈黙させ、その沈黙を idle 検出器が拾って
@@ -48,64 +83,41 @@ export const BASE_ALLOWED_DEV_CHANNELS: readonly string[] = ["server:ebi-control
 const GATE_WINDOW_MS = Number(process.env.EBI_GATE_WINDOW_MS) || 90000;
 
 /**
- * spawn 引数を見て「起動ゲート（trust / dev-channels 警告）の自動応答を有効化してよいか」を判定する。
- *
- * 安全限定（正確値の許可リスト方式）: `--dangerously-load-development-channels` の値が
- * **1個以上あり、そのすべてが `allowlist` の正確値（完全一致）である**ときだけ true。
- * 許可リストに無い値が1つでも混ざる／フラグ自体が無い場合は false
- * （＝自動で危険確認を承認しない。設定書き換えによる意図せぬ承認を防ぐ）。
- * 照合は完全一致のみ。ワイルドカード・前方一致・部分一致は一切導入しない
- * （`plugin:slack@*` のような値は許可リストに正確一致しない限り必ず false）。
- *
- * `allowlist` 未指定時は組込みの BASE_ALLOWED_DEV_CHANNELS（server:ebi-control のみ）を使う。
- * 当該フラグは variadic（`<servers...>`）で、次の `--flag` までの全トークンを値として取る。
- */
-export function isDevChannelsAutoAnswerEligible(
-  args: readonly string[],
-  allowlist: readonly string[] = BASE_ALLOWED_DEV_CHANNELS,
-): boolean {
-  const flagIdx = args.indexOf("--dangerously-load-development-channels");
-  if (flagIdx === -1) return false;
-  const values: string[] = [];
-  for (let i = flagIdx + 1; i < args.length; i++) {
-    if (args[i].startsWith("--")) break;
-    values.push(args[i]);
-  }
-  // 値が1個以上あり、そのすべてが許可リストに完全一致することを要求する。
-  return values.length >= 1 && values.every((v) => allowlist.includes(v));
-}
-
-/**
- * 起動フェーズの対話ダイアログ種別を、素文スキャンバッファから判定する純関数。
- *
- * claude(Ink) TUI は単語間を空白でなくカーソル移動エスケープで描画するため、ANSI 除去後は
- * "Iamusingthisforlocaldevelopment" のように空白が消えることがある（TUI が空白なしで
- * 描画する既知の罠）。よって照合は**空白を全除去した文字列**に対して**空白なしパターン**で行う。
- * これにより空白あり／なしどちらの描画でも同じく検知できる。
- *
- * 戻り値:
- *  - "devChannels": development channels 警告（--dangerously-load-development-channels 使用時）
- *  - "trust": workspace trust 確認（初見 cwd）
- *  - null: どちらのダイアログも検知できない
- */
-export function detectStartupGate(rawScanBuffer: string): "devChannels" | "trust" | null {
-  const compact = rawScanBuffer.replace(/\s+/g, "");
-  if (/Loadingdevelopmentchannels|localchanneldevelopment|Iamusingthisforlocaldevelopment/i.test(compact)) {
-    return "devChannels";
-  }
-  if (/trustthisfolder|Isthisaprojectyou(created|trust)/i.test(compact)) {
-    return "trust";
-  }
-  return null;
-}
-
-/**
  * 起動ゲート自動応答が有効な agent で、「dev-channels ゲートへの応答が済むまで ready 昇格を
  * 待つ」上限(ms)。この時間を過ぎてもゲートを検知しなければ、従来どおりの ready 判定へ degrade する
  * （将来 claude 側がダイアログを出さなくなっても永久に ready にならない事故を防ぐ保険）。
  * 実測ではダイアログは spawn 後 2〜4 秒で出る。env `EBI_GATE_SETTLE_MS` で調整可。
  */
 const GATE_SETTLE_MS = Number(process.env.EBI_GATE_SETTLE_MS) || 20000;
+
+/**
+ * プロセスグループ kill（killProcessGroup=true の backend）で、SIGTERM から SIGKILL までの猶予(ms)。
+ * gemini は PTY リーダの下に「再 exec した子 node」と「その配下の stdio MCP」を持つため、
+ * PTY を閉じるだけでは孤児が残る（PoC で 7 セッション分 21 プロセスの残存を実測）。
+ * まずグループへ SIGTERM を送って正規の終了処理をさせ、居残りをこの猶予後に SIGKILL で刈る。
+ * env `EBI_GROUP_KILL_GRACE_MS` で調整可。
+ */
+const GROUP_KILL_GRACE_MS = Number(process.env.EBI_GROUP_KILL_GRACE_MS) || 2000;
+
+/**
+ * プロセスグループへシグナルを送る（pty の子は forkpty により setsid 済み＝pid がそのまま pgid）。
+ * 既に死んでいる（ESRCH）等は無視する。送れたら true。
+ * 純粋な副作用ヘルパとして切り出してあるのは、単体テストで「グループ kill が呼ばれたか」だけを
+ * 差し替えて確認できるようにするため。
+ */
+export function killProcessGroupSignal(
+  pid: number,
+  signal: NodeJS.Signals,
+  killer: (target: number, sig: NodeJS.Signals) => void = (t, sg) => process.kill(t, sg),
+): boolean {
+  if (!Number.isInteger(pid) || pid <= 1) return false;
+  try {
+    killer(-pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * PTY 注入の結果。
@@ -215,19 +227,9 @@ const IDLE_NOTIFY_ENABLED = !["off", "0", "false"].includes(
 );
 
 /**
- * TUI を「代替スクリーン（alternate screen）」ではなく通常バッファへインライン描画させるための
- * 既定 env。ブラウザ側 xterm.js のスクロールバックを機能させるために必須。
- *
- * 背景（実測 claude 2.1.198）:
- * - claude CLI は起動直後に `ESC[?1049h`（代替スクリーン ON）＋ `ESC[?1000h/1002h/1006h`
- *   （マウストラッキング ON）を送り、セッション中 `ESC[?1049l` を送らない。
- * - 代替スクリーンでは xterm.js は **スクロールバックを一切持たない**（仕様）。さらにマウス
- *   トラッキング中はホイールが端末側スクロールではなくアプリへ転送される。
- *   結果、ブラウザのペインは「claude 内部ビューの見えている範囲」しか見られなくなり、
- *   /compact のような全画面再描画（内部ビューのリセット）が走ると過去ログを辿れなくなる。
- *   タッチ端末はホイールが無いためスクロール手段が完全に消える（既知バックログと同根）。
- * - `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` を与えると 1049/1000/1002/1006 を一切送らず、
- *   通常バッファへインライン追記する（実測で確認）。これで xterm.js の scrollback が効く。
+ * バックエンド既定 env（TUI をインライン描画させる env 等）を注入するか。
+ * 何を敷くかは backend が決める（Claude なら CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN 等。
+ * 背景の詳細は backends/claude.ts のコメントを参照）。
  *
  * env `EBI_INLINE_TUI` を "off"/"0"/"false" にすると注入しない（従来挙動へ戻す非常口）。
  * 親 env / launch.env で同名キーを明示指定した場合はそちらが優先される。
@@ -236,26 +238,27 @@ const INLINE_TUI_ENABLED = !["off", "0", "false"].includes(
   (process.env.EBI_INLINE_TUI ?? "on").toLowerCase(),
 );
 
-/** INLINE_TUI_ENABLED のときに既定値として注入する env。 */
-const INLINE_TUI_ENV: Record<string, string> = {
-  CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN: "1",
-  // 代替スクリーン OFF なら現行版はマウス報告を送らないが、将来版でホイールを奪われないよう保険。
-  CLAUDE_CODE_DISABLE_MOUSE: "1",
-};
-
 /**
  * pty に渡す env を組み立てる純関数。優先度は低い順に
- * 「インライン TUI 既定 < 親 env < launch.env」。
+ * 「バックエンド既定 env < 親 env（envDenyList 適用後） < launch.env」。
  * 親 env に同名キーがあればユーザーの明示指定として尊重する。
+ *
+ * backendEnv 未指定時は Claude バックエンドの既定を使う。EBI_COMMAND=bash 等の
+ * スタブ起動でも従来どおり同じ env が敷かれる（外形ゼロ差分のため意図的）。
  */
 export function buildSpawnEnv(
   parentEnv: Record<string, string | undefined>,
   launchEnv?: Record<string, string>,
   inlineTui: boolean = INLINE_TUI_ENABLED,
+  backendEnv: Record<string, string> = CLAUDE_BACKEND.buildEnv(),
+  envDenyList: readonly string[] = CLAUDE_BACKEND.envDenyList,
 ): Record<string, string> {
-  const merged: Record<string, string> = inlineTui ? { ...INLINE_TUI_ENV } : {};
+  const merged: Record<string, string> = inlineTui ? { ...backendEnv } : {};
+  // 親 env の継承分からだけ deny list のキーを落とす（claude は空＝従来と完全に同一）。
+  // ebi-team 自身が渡す backendEnv / launchEnv は対象外（意図して渡している値のため）。
+  const inherited = applyEnvDenyList(parentEnv, envDenyList);
   // 値が undefined のキーで既定を握り潰さない（spread だと undefined でも上書きされてしまう）。
-  for (const [key, value] of Object.entries(parentEnv)) {
+  for (const [key, value] of Object.entries(inherited)) {
     if (value !== undefined) merged[key] = value;
   }
   for (const [key, value] of Object.entries(launchEnv ?? {})) {
@@ -312,6 +315,36 @@ export interface LaunchParams {
    * 未指定なら親 env をそのまま使う。
    */
   env?: Record<string, string>;
+  /**
+   * このエビを動かすバックエンド id（起動引数/env/起動ゲート/通信路の性質を決める）。
+   * 未指定なら command から解決する（さらに一致しなければ既定 "claude"）。
+   */
+  backend?: BackendId;
+  /**
+   * ready 到達後に一度だけ PTY 注入する本文（未指定なら注入しない）。
+   * `--append-system-prompt` 相当を持たないバックエンド（codex）へ役割プロンプトを
+   * 載せるために使う。位置引数で渡すと MCP 起動と競合するため、必ず ready 後に注入する
+   * （backends/codex.ts・docs/poc/codex-poc-2026-09-04.md §5）。
+   */
+  initialInject?: string | null;
+  /**
+   * 制御MCP（ebi-control）の設定ファイルパス（claude 方言の JSON）。null/未指定なら制御MCP なし。
+   * claude では args（--mcp-config）に既に載っているが、gemini は env 経由で渡すため
+   * backend.buildEnv() にも同じ情報を渡す必要がある（PR-C）。
+   */
+  mcpConfigPath?: string | null;
+  /**
+   * 役割注入プロンプト。claude では args（--append-system-prompt）に載っているが、
+   * gemini は per-エビ GEMINI.md 経由で渡すため buildEnv にも渡す（PR-C）。
+   */
+  systemPrompt?: string | null;
+  /**
+   * ACK 監視窓（ms）の役割別上書き。未指定なら backend 既定（codex は 90 秒）。
+   * 0 なら監視しない。ackFailureWatch を持たない backend では無視される＝挙動不変。
+   * 由来は EbiRole.ackWatchMs（roles.ts）。設計 §6.4 の「生成が長い役割で失敗報告が
+   * 監視窓に落ちて誤 respawn される」重なりを断つための口。
+   */
+  ackWatchMs?: number | null;
 }
 
 /** Agent からのイベントを購読するためのコールバック束。 */
@@ -326,6 +359,12 @@ export interface AgentHandlers {
    * index.ts 側で registry.reverseInject(id, "master", "...", "idle") を発火させる配線に使う。
    */
   onIdleNotify?: (id: string) => void;
+  /**
+   * 役割プロンプト ACK の「静かな故障」検知フック（任意）。
+   * backend.ackFailureWatch を持つエビ（codex）で、ACK 文面が故障パターンに一致したときに
+   * 1 度だけ呼ばれる。index.ts 側で「kill →同一 id・同一引数で 1 回だけ再 spawn」に配線する。
+   */
+  onAckFailure?: (id: string, reason: string) => void;
 }
 
 /**
@@ -356,6 +395,22 @@ export class Agent {
   readonly notifySubscribe: boolean = true;
   /** 表示用モデル名（alias/full ID）。未指定 spawn なら null。 */
   readonly model: string | null = null;
+  /** このエビを動かしているバックエンド id（PR1 時点では常に "claude"）。 */
+  readonly backend: BackendId;
+  /** kill 時にプロセスグループごと落とすか（backend のトレイト。gemini のみ true）。 */
+  private readonly killProcessGroup: boolean;
+  /**
+   * 「入力受付（プロンプト表示）」を示す出力パターン（backend のトレイト。null なら従来判定）。
+   * これを持つ backend は、パターンを一度も見ていない間は ready へ昇格しない。
+   */
+  private readonly readyPattern: RegExp | null;
+  /** readyPattern を検出済みか。 */
+  private readyPatternSeen = false;
+  /** readyPattern 走査用の素文リングバッファ。 */
+  private readyScanBuffer = "";
+  /** 起動フェーズの致命エラー文言（backend のトレイト）。検出済みのものは二度出さない。 */
+  private readonly fatalPatterns: readonly { readonly pattern: RegExp; readonly message: string }[];
+  private readonly reportedFatals = new Set<string>();
   /**
    * 起動に使った実パラメータ。自動再起動（固定エビ）でそのまま再 spawn するために保持する。
    */
@@ -382,6 +437,10 @@ export class Agent {
   private readonly spawnedAt: number = Date.now();
   /** これまでに一度でも ready に達したか。 */
   private hasBeenReady = false;
+  /** PTY プロセスの exit イベントを受け取ったか（awaitExit 用）。 */
+  private exited = false;
+  /** exit を待つ waiter の resolve 関数（awaitExit 用）。 */
+  private readonly exitWaiters: (() => void)[] = [];
   /** ready 化 or dispose を待つ waiter の resolve 関数（waitUntilReady 用）。 */
   private readonly readyWaiters: ((ready: boolean) => void)[] = [];
   /** boot 猶予満了時に ready 昇格を再評価するためのタイマ。 */
@@ -404,12 +463,54 @@ export class Agent {
   //  自動応答しない＝設定書き換えによる意図せぬ承認を防ぐ）。運用者の承認のもと有効化。
   /** この agent で起動ゲート自動応答を有効化してよいか（上記の安全限定を満たすか）。 */
   private readonly autoAnswerStartupGates: boolean;
-  /** workspace trust ダイアログへ既に応答したか（多重送信防止）。 */
-  private trustGateAnswered = false;
-  /** development channels 警告へ既に応答したか（多重送信防止）。 */
-  private devChannelsGateAnswered = false;
+  /** バックエンドの起動ゲート定義（文言・応答・許可リスト）。ゲートを出さない backend は null。 */
+  private readonly gateSpec: StartupGateSpec | null;
+  /** 既に応答済みのゲート種別（多重送信防止）。 */
+  private readonly answeredGates = new Set<StartupGateKind>();
   /** ダイアログはチャンクを跨いで描画されるため、ready 前の出力を素文で溜めて走査する（上限付き）。 */
   private gateScanBuffer = "";
+
+  // ===== 初回注入（役割プロンプト）=====
+  /** ready 後の初回注入を既に送ったか（多重送信防止）。 */
+  private initialInjectSent = false;
+
+  // ===== ACK 監視（役割プロンプトへの応答が「静かな故障」でないかを見る）=====
+  /** backend の ACK 監視定義（持たない backend は null＝挙動不変）。 */
+  private readonly ackWatchSpec: AckFailureWatchSpec | null;
+  /** 監視中か（役割プロンプト注入で on・検知/成功 ACK/上限で off）。 */
+  private ackWatchActive = false;
+  /** 監視開始時刻（minObserveMs / windowMs の起点）。 */
+  private ackWatchStartedAt = 0;
+  /** ACK 走査用の素文リングバッファ。 */
+  private ackScanBuffer = "";
+  /** 監視の上限タイマ。 */
+  private ackWatchTimer: NodeJS.Timeout | null = null;
+  /** 検知を通知済みか（多重発火防止）。 */
+  private ackFailureReported = false;
+  /**
+   * ACK 監視中に届いた注入本文（タグ付け済み）。作り直しのときに新エビへ引き継ぐ。
+   *
+   * 監視中のエビは「役割プロンプトへの応答すら怪しい」状態なので、この間に届いた本文は
+   * **まだ実行されていない**とみなして持ち越す。注入キューだけを持ち越すのでは足りない:
+   * ready 直後は idle なので、master のタスクは**キューを経ずに PTY へ直接書かれる**
+   * （＝故障エビの画面に書かれて消える）。実際に e2e round 2 で 1 件消えた。
+   */
+  private readonly ackWindowBodies: string[] = [];
+
+  /**
+   * PTY への書き込み（本文 → ENTER_DELAY_MS → `\r`）を直列化するためのチェーン。
+   * sendLine は本文と Enter を時間的に分離するため、複数の注入が同時に走ると
+   * 「本文A → 本文B → EnterA → EnterB」のように混ざって 1 通目が壊れる。
+   * ready 時の初回注入（役割プロンプト）と、その直後に届くタスク本文が実際に競合する
+   * （PR-D で codex 運用時に顕在化）。claude 側でも複数送信者が同時に投げれば同じ穴がある。
+   */
+  private writeChain: Promise<void> = Promise.resolve();
+
+  /**
+   * ready 判定に使う boot 猶予(ms)。サーバ既定（MIN_BOOT_MS）に backend の
+   * readyWarmupMs（MCP ツール登録待ち等）を加算したもの。
+   */
+  private readonly bootGraceMs: number;
 
   // ===== 逆方向通知（reverse-notify）の抑制状態 =====
   /** [A] 直近に reply_to_master（kind:"reply"）を発した時刻。B の抑制判定に使う。0 は未発。 */
@@ -460,13 +561,27 @@ export class Agent {
     this.notifySubscribe = opts?.notifySubscribe ?? true;
     this.handlers = handlers;
     this.scrollbackBytes = config.scrollbackBytes;
-    this.autoAnswerStartupGates = isDevChannelsAutoAnswerEligible(
-      launch.args,
-      config.devChannelsAllowlist ?? BASE_ALLOWED_DEV_CHANNELS,
-    );
+    // バックエンドは launch.backend（明示） > command からの解決 > 既定(claude) の順で決める。
+    const backend = launch.backend
+      ? getBackend(launch.backend)
+      : resolveBackendOrDefault(launch.command);
+    this.backend = backend.id;
+    this.killProcessGroup = backend.killProcessGroup;
+    this.readyPattern = backend.readyPattern ?? null;
+    this.fatalPatterns = backend.fatalPatterns ?? [];
+    this.ackWatchSpec = resolveAckWatchSpec(backend.ackFailureWatch ?? null, launch.ackWatchMs);
+    this.gateSpec = backend.startupGates;
+    this.bootGraceMs = MIN_BOOT_MS + (backend.readyWarmupMs ?? 0);
+    this.autoAnswerStartupGates = this.gateSpec
+      ? this.gateSpec.isAutoAnswerEligible(
+          launch.args,
+          config.devChannelsAllowlist ?? this.gateSpec.baseAllowlist,
+        )
+      : false;
 
+    // idle しきい値は backend が上書きできる（null ならサーバ既定＝従来どおり）。
     this.detector = new IdleDetector(
-      config.idleThresholdMs,
+      resolveIdleThresholdMs(backend.idleThresholdMs, config.idleThresholdMs),
       () => this.onIdle(),
       () => this.onBusy(),
     );
@@ -474,7 +589,21 @@ export class Agent {
     // 引数配列方式で起動（シェル非経由）。長文の --append-system-prompt も安全に渡る。
     // launch.env があれば親 env にマージする（engineer の EBI_ID 等。子の stdio MCP が継承する）。
     // さらに TUI をインライン描画させる既定 env を最下位優先で敷く（xterm.js のスクロール確保）。
-    const spawnEnv = buildSpawnEnv(process.env, launch.env);
+    // inlineTui の on/off は backend.buildEnv() へ渡して backend に判断させる
+    // （claude は off なら空を返す＝従来と同一。gemini の system settings パスのように
+    //   「TUI 描画ではなく起動の必須条件」である env まで落とさないため）。
+    const spawnEnv = buildSpawnEnv(
+      process.env,
+      launch.env,
+      true,
+      backend.buildEnv({
+        agentId: id,
+        inlineTui: INLINE_TUI_ENABLED,
+        mcpConfigPath: launch.mcpConfigPath ?? null,
+        systemPrompt: launch.systemPrompt ?? null,
+      }),
+      backend.envDenyList,
+    );
     this.proc = pty.spawn(launch.command, launch.args, {
       name: "xterm-color",
       cols: 80,
@@ -495,6 +624,9 @@ export class Agent {
       if (meaningful.length === 0) return;
       // 起動フェーズ（ready 前）の対話ダイアログへ自動応答（安全限定つき）。
       this.maybeAnswerStartupGates(meaningful);
+      this.maybeMarkReadyPattern(meaningful);
+      this.maybeReportFatal(meaningful);
+      this.maybeDetectAckFailure(meaningful);
       this.detector.notifyOutput();
       this.appendScrollback(meaningful);
       this.handlers.onData(this.id, meaningful);
@@ -512,7 +644,10 @@ export class Agent {
         clearTimeout(this.gateSettleTimer);
         this.gateSettleTimer = null;
       }
+      this.clearAckWatchTimer();
       this.resolveReadyWaiters(false);
+      this.exited = true;
+      while (this.exitWaiters.length > 0) this.exitWaiters.shift()!();
       this.handlers.onExit(this.id, exitCode);
     });
 
@@ -521,7 +656,7 @@ export class Agent {
     this.bootTimer = setTimeout(() => {
       this.bootTimer = null;
       this.promoteReadyIfEligible();
-    }, MIN_BOOT_MS + 50);
+    }, this.bootGraceMs + 50);
 
     // 起動ゲート待ち（degrade）の再評価タイマ。ダイアログを検知できないまま出力も止まった
     // ケースで、GATE_SETTLE_MS 満了後に確実に ready 判定をやり直す。
@@ -540,6 +675,32 @@ export class Agent {
   /** TUI が入力受付（ready）になったか。一度 ready なら以降ずっと true。 */
   isReady(): boolean {
     return this.hasBeenReady;
+  }
+
+  /**
+   * PTY プロセスの exit イベントが処理されるまで待つ（上限つき・best effort）。
+   *
+   * 同じ id で作り直すとき（静かな故障の再 spawn）に必要:
+   * exit イベントのハンドラは id だけを見て registry から remove するため、
+   * 旧プロセスの exit を待たずに新しいエビを立てると、遅れて届いた旧 exit が
+   * **新しいエビを kill する**。
+   */
+  awaitExit(timeoutMs: number): Promise<boolean> {
+    if (this.exited) return Promise.resolve(true);
+    return new Promise<boolean>((resolve) => {
+      let done = false;
+      const finish = (ok: boolean) => {
+        if (done) return;
+        done = true;
+        resolve(ok);
+      };
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      timer.unref?.();
+      this.exitWaiters.push(() => {
+        clearTimeout(timer);
+        finish(true);
+      });
+    });
   }
 
   /**
@@ -598,18 +759,121 @@ export class Agent {
   private promoteReadyIfEligible(): void {
     if (this.disposed || this.hasBeenReady) return;
     const elapsed = Date.now() - this.spawnedAt;
-    if (elapsed < MIN_BOOT_MS) return;
+    // boot 猶予は「サーバ既定 ＋ backend の readyWarmupMs」（codex は MCP ツール登録待ち）。
+    if (elapsed < this.bootGraceMs) return;
+    // backend が「プロンプト表示」の目印を持つなら、それを見るまで ready にしない。
+    // gemini は OAuth トークン再取得中（"Waiting for authentication..."）に沈黙するため、
+    // 「boot 猶予＋初回 idle」だけだとそこで ready 誤昇格して 1 通目が食われる（e2e で実測）。
+    if (this.readyPattern !== null && !this.readyPatternSeen) return;
     // 起動ゲート自動応答が有効な agent は、dev-channels ダイアログへ応答するまで ready にしない。
     // ダイアログはセッションを入力待ちで沈黙させ、その沈黙を idle 検出器が拾うため、従来の
     // 「boot 猶予＋idle」だけだとダイアログ表示中に ready へ誤昇格していた（＝入力欄がまだ
     // 無いのに本文を注入して吸われる／channel も未登録で捨てられる、の温床）。
     // 保険: GATE_SETTLE_MS を過ぎてもゲートを検知できなければ従来判定へ degrade する
     // （将来 claude がダイアログを出さなくなっても永久に ready にならない事故を防ぐ）。
-    if (this.autoAnswerStartupGates && !this.devChannelsGateAnswered && elapsed < GATE_SETTLE_MS) return;
+    const readyBlockingGate = this.gateSpec?.readyBlockingGate ?? null;
+    if (
+      this.autoAnswerStartupGates &&
+      readyBlockingGate !== null &&
+      !this.answeredGates.has(readyBlockingGate) &&
+      elapsed < GATE_SETTLE_MS
+    ) {
+      return;
+    }
     if (this.getStatus() !== "idle") return;
     this.hasBeenReady = true;
     this.handlers.onNotice(this.id, "ready（入力受付になりました）");
+    // 初回注入（役割プロンプト）を **ready 待ちを解放する前に**書き込みキューへ積む。
+    // 解放を先にすると、待っていた配送の本文と役割プロンプトが同時に書かれて混ざる。
+    this.sendInitialInject();
     this.resolveReadyWaiters(true);
+  }
+
+  /**
+   * ready 到達後の初回注入（役割プロンプト）を一度だけ送る。
+   * `--append-system-prompt` 相当が無い backend（codex）で、役割・セキュリティ節を
+   * 「MCP 起動完了後の 1 通目」として載せるための経路。
+   */
+  private sendInitialInject(): void {
+    const text = this.launch.initialInject?.trim();
+    if (!text || this.initialInjectSent || this.disposed) return;
+    this.initialInjectSent = true;
+    this.handlers.onNotice(this.id, "初回注入: 役割プロンプトを送信しました（ready 後）");
+    this.startAckWatch();
+    void this.enqueueWrite(text);
+  }
+
+  /**
+   * 役割プロンプト ACK の監視を開始する（backend が ackFailureWatch を持つときだけ）。
+   * 上限（windowMs）で自動終了する。ACK が来ないまま黙るケースを永久に疑わないため。
+   */
+  private startAckWatch(): void {
+    const spec = this.ackWatchSpec;
+    if (spec === null || this.disposed || this.ackWatchActive || this.ackFailureReported) return;
+    this.ackWatchActive = true;
+    this.ackWatchStartedAt = Date.now();
+    this.ackScanBuffer = "";
+    this.ackWatchTimer = setTimeout(() => {
+      this.stopAckWatch("上限時間に達した");
+    }, spec.windowMs);
+    this.ackWatchTimer.unref?.();
+  }
+
+  /** ACK 監視の上限タイマだけを止める（exit / kill の後始末）。 */
+  private clearAckWatchTimer(): void {
+    this.ackWatchActive = false;
+    if (this.ackWatchTimer) {
+      clearTimeout(this.ackWatchTimer);
+      this.ackWatchTimer = null;
+    }
+  }
+
+  /** ACK 監視を終了する（成功 ACK / 上限 / 検知後 のいずれか）。 */
+  private stopAckWatch(reason: string, keepBodies = false): void {
+    if (!this.ackWatchActive) return;
+    this.ackWatchActive = false;
+    this.ackScanBuffer = "";
+    // 故障検知のときだけ引き継ぎ用に残す。健全に終わったなら控えは不要（二重注入の元）。
+    if (!keepBodies) this.ackWindowBodies.length = 0;
+    if (this.ackWatchTimer) {
+      clearTimeout(this.ackWatchTimer);
+      this.ackWatchTimer = null;
+    }
+    console.log(`[ebi-team] [${this.id}] ACK 監視を終了（${reason}）`);
+  }
+
+  /**
+   * ACK 文面から「静かな故障」（reply_to_master が使えないと述べて終わる応答）を検知する。
+   * 検知したら監視を終了し、onAckFailure フックを 1 度だけ呼ぶ（再 spawn の判断は index.ts）。
+   */
+  private maybeDetectAckFailure(chunk: string): void {
+    const spec = this.ackWatchSpec;
+    if (spec === null || !this.ackWatchActive || this.disposed) return;
+    const plain = chunk
+      .replace(/\x1b\][^\x07]*\x07/g, "")
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+      .replace(/\x1b[()][A-Z0-9]/g, "");
+    this.ackScanBuffer = (this.ackScanBuffer + plain).slice(-8192);
+    const hit = matchAckFailure(this.ackScanBuffer, spec.patterns);
+    if (hit === null) return;
+    this.ackFailureReported = true;
+    this.stopAckWatch("静かな故障を検知", true);
+    const msg = `静かな故障を検知: ${hit.message}`;
+    console.error(`[ebi-team] [${this.id}] ${msg}`);
+    this.handlers.onNotice(this.id, msg);
+    this.handlers.onAckFailure?.(this.id, hit.message);
+  }
+
+  /**
+   * ACK が「故障パターンに一致しないまま完了した」ときに監視を終える。
+   * 判定は busy→idle のエッジ。ただし注入本文のエコーだけで一往復しうるため、
+   * minObserveMs を過ぎるまでは完了とみなさない。
+   */
+  private maybeFinishAckWatch(): void {
+    const spec = this.ackWatchSpec;
+    if (spec === null || !this.ackWatchActive) return;
+    if (Date.now() - this.ackWatchStartedAt < spec.minObserveMs) return;
+    this.stopAckWatch("成功 ACK（故障パターン非該当）");
   }
 
   /**
@@ -728,11 +992,51 @@ export class Agent {
    * ダイアログはチャンクを跨いで届くため、素文（ANSI 除去）を上限付きバッファに
    * 溜めてから判定する。応答したら、どのダイアログへ何を送ったかをサーバログに残す。
    */
+  /**
+   * backend の readyPattern（プロンプト表示の目印）を出力から探す。
+   * 見つかったら ready 昇格を再評価する（この時点で既に idle・boot 猶予経過なら即 ready）。
+   */
+  private maybeMarkReadyPattern(chunk: string): void {
+    if (this.readyPattern === null || this.readyPatternSeen || this.disposed) return;
+    const plain = chunk
+      .replace(/\x1b\][^\x07]*\x07/g, "")
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+      .replace(/\x1b[()][A-Z0-9]/g, "");
+    this.readyScanBuffer = (this.readyScanBuffer + plain).slice(-8192);
+    if (!this.readyPattern.test(this.readyScanBuffer)) return;
+    this.readyPatternSeen = true;
+    this.readyScanBuffer = "";
+    this.promoteReadyIfEligible();
+  }
+
+  /**
+   * backend が宣言した致命エラー文言を出力から探し、見つけたら notice とサーバログへ出す。
+   * ready 待ちが黙ってタイムアウトするより、原因の分かる 1 行を残す方が運用が早い。
+   */
+  private maybeReportFatal(chunk: string): void {
+    if (this.fatalPatterns.length === 0 || this.disposed) return;
+    if (this.reportedFatals.size === this.fatalPatterns.length) return;
+    const plain = chunk
+      .replace(/\x1b\][^\x07]*\x07/g, "")
+      .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
+      .replace(/\x1b[()][A-Z0-9]/g, "");
+    for (const { pattern, message } of this.fatalPatterns) {
+      const key = pattern.source;
+      if (this.reportedFatals.has(key)) continue;
+      if (!pattern.test(plain)) continue;
+      this.reportedFatals.add(key);
+      console.error(`[ebi-team] [${this.id}] 起動エラー: ${message}`);
+      this.handlers.onNotice(this.id, `起動エラー: ${message}`);
+    }
+  }
+
   private maybeAnswerStartupGates(chunk: string): void {
-    if (this.disposed || !this.autoAnswerStartupGates) return;
+    const spec = this.gateSpec;
+    if (this.disposed || !this.autoAnswerStartupGates || spec === null) return;
     // 起動フェーズ限定（spawn からの時間窓）。ready フラグは沈黙で誤昇格するため使わない。
     if (Date.now() - this.spawnedAt > GATE_WINDOW_MS) return;
-    if (this.trustGateAnswered && this.devChannelsGateAnswered) return;
+    // このバックエンドが出しうるゲートに全部応答済みなら走査を打ち切る。
+    if (spec.kinds.every((k) => this.answeredGates.has(k))) return;
 
     // ANSI/OSC を除去して素文にし、直近ぶんだけ保持（ダイアログ全文は数百字に収まる）。
     const plain = chunk
@@ -740,29 +1044,17 @@ export class Agent {
       .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "")
       .replace(/\x1b[()][A-Z0-9]/g, "");
     this.gateScanBuffer = (this.gateScanBuffer + plain).slice(-4096);
-    // 空白なし照合は detectStartupGate（純関数）に集約している（TUI が空白なしで描画する罠に対応）。
-    const gate = detectStartupGate(this.gateScanBuffer);
+    // 空白なし照合等の固有ロジックは backend の detect（純関数）に集約している
+    // （claude TUI が空白なしで描画する罠への対応は backends/claude.ts 参照）。
+    const gate = spec.detect(this.gateScanBuffer);
+    if (gate === null || this.answeredGates.has(gate)) return;
 
-    // development channels 警告（許可リストに正確一致した dev channel を持つ起動でのみ自動許可）。
-    if (gate === "devChannels" && !this.devChannelsGateAnswered) {
-      this.devChannelsGateAnswered = true;
-      this.proc.write("1\r");
-      this.gateScanBuffer = ""; // 次のダイアログ検知のため一旦クリア
-      const msg = `起動ゲート自動応答: development channels 警告に "1"+Enter を送信（許可リスト限定・ready 前）`;
-      console.log(`[ebi-team] [${this.id}] ${msg}`);
-      this.handlers.onNotice(this.id, msg);
-      return;
-    }
-
-    // workspace trust 確認。
-    if (gate === "trust" && !this.trustGateAnswered) {
-      this.trustGateAnswered = true;
-      this.proc.write("1\r");
-      this.gateScanBuffer = "";
-      const msg = `起動ゲート自動応答: workspace trust 確認に "1"+Enter を送信（ready 前）`;
-      console.log(`[ebi-team] [${this.id}] ${msg}`);
-      this.handlers.onNotice(this.id, msg);
-    }
+    this.answeredGates.add(gate);
+    this.proc.write(spec.answerFor(gate));
+    this.gateScanBuffer = ""; // 次のダイアログ検知のため一旦クリア
+    const msg = spec.noticeFor(gate);
+    console.log(`[ebi-team] [${this.id}] ${msg}`);
+    this.handlers.onNotice(this.id, msg);
   }
 
   /**
@@ -779,13 +1071,14 @@ export class Agent {
    */
   inject(from: string, message: string, guard?: EchoGuard, msgId?: number | null): InjectState {
     const body = deliveryText(from, message, msgId);
+    this.recordAckWindowBody(body);
     if (this.getStatus() === "idle") {
       // guard 付き（notify フォールバック由来）は、書く直前に「もう届いていないか」を確認する。
       if (guard && this.isEchoed(guard)) {
         guard.onSuppress?.();
         return "suppressed";
       }
-      void this.sendLine(body);
+      void this.enqueueWrite(body);
       return "sent";
     }
     this.injectQueue.push({ body, guard });
@@ -794,6 +1087,40 @@ export class Agent {
       `busy のため注入をキューに保留（待ち ${this.injectQueue.length} 件）`,
     );
     return "queued";
+  }
+
+  /**
+   * 既にタグ付け済みの本文をそのまま注入する（再タグ付けしない）。
+   * 「静かな故障」検知でエビを作り直すとき、旧エビの注入キューに滞留していた本文
+   * （master が送ったタスク）を新しいエビへ引き継ぐために使う。ここで捨てると
+   * 「エビは作り直されたがタスクは消えた」という、直そうとしている故障そのものになる。
+   */
+  injectRaw(body: string): InjectState {
+    this.recordAckWindowBody(body);
+    if (this.getStatus() === "idle") {
+      void this.enqueueWrite(body);
+      return "sent";
+    }
+    this.injectQueue.push({ body });
+    return "queued";
+  }
+
+  /**
+   * ACK 監視中なら注入本文を控える（作り直しで新エビへ引き継ぐため）。
+   * 上限を超えたら古い方から捨てる（監視窓は数十秒なので実際には数件で収まる）。
+   */
+  private recordAckWindowBody(body: string): void {
+    if (!this.ackWatchActive) return;
+    this.ackWindowBodies.push(body);
+    while (this.ackWindowBodies.length > ACK_WINDOW_BODY_LIMIT) this.ackWindowBodies.shift();
+  }
+
+  /**
+   * ACK 監視中に届いた注入本文を取り出して空にする（作り直し時に 1 度だけ呼ぶ）。
+   * 呼ばれなければ、監視の終了（成功 ACK / 上限）時に破棄される。
+   */
+  takeAckWindowBodies(): string[] {
+    return this.ackWindowBodies.splice(0);
   }
 
   /** 現在 busy で滞留している注入の件数（可視化・破棄ログ用）。 */
@@ -833,6 +1160,18 @@ export class Agent {
   }
 
   /** 本文を stdin へ書き、ENTER_DELAY_MS 待ってから Enter(`\r`) を別 write で送って送信を確定させる。 */
+  /**
+   * 直列化キューに 1 件の書き込みを積む（前の書き込みの Enter 送信が終わるまで待つ）。
+   * 例外は握りつぶす（1 件の失敗で以降の書き込みを止めない）。
+   */
+  private enqueueWrite(body: string): Promise<void> {
+    this.writeChain = this.writeChain.then(
+      () => this.sendLine(body),
+      () => this.sendLine(body),
+    );
+    return this.writeChain;
+  }
+
   private async sendLine(body: string): Promise<void> {
     if (this.disposed) return;
     this.proc.write(body);
@@ -854,6 +1193,7 @@ export class Agent {
       pinned: this.pinned,
       model: this.model,
       role: this.role,
+      backend: this.backend,
     };
   }
 
@@ -870,10 +1210,22 @@ export class Agent {
       clearTimeout(this.gateSettleTimer);
       this.gateSettleTimer = null;
     }
+    this.clearAckWatchTimer();
     this.resolveReadyWaiters(false);
     // MVP は生存 agent のみスクロールバックを保持する方針。exit/kill で破棄する。
     this.scrollbackChunks.length = 0;
     this.scrollbackSize = 0;
+    // backend が要求する場合はプロセスグループごと落とす（gemini: 子 node の再 exec と
+    // その配下の stdio MCP が PTY リーダの kill だけでは孤児として残るため）。
+    if (this.killProcessGroup && this.pid != null) {
+      const pid: number = this.pid;
+      killProcessGroupSignal(pid, "SIGTERM");
+      const sweeper = setTimeout(() => {
+        killProcessGroupSignal(pid, "SIGKILL");
+      }, GROUP_KILL_GRACE_MS);
+      // サーバ終了を妨げない（居残りが無ければ何もせず消える保険タイマ）。
+      sweeper.unref?.();
+    }
     try {
       this.proc.kill();
     } catch {
@@ -887,6 +1239,8 @@ export class Agent {
 
   private onIdle(): void {
     this.handlers.onStatus(this.id, "idle");
+    // 役割プロンプト ACK の監視は「ACK 到着（busy→idle）」で終える。
+    this.maybeFinishAckWatch();
     // ready 判定: boot 猶予を過ぎていて idle に達したら ready とみなす。
     this.promoteReadyIfEligible();
     void this.flushQueue();
@@ -929,7 +1283,7 @@ export class Agent {
         entry.guard.onSuppress?.();
         continue;
       }
-      await this.sendLine(entry.body);
+      await this.enqueueWrite(entry.body);
       sent += 1;
       // 次の件と混ざらないよう、送信確定後に間隔を空ける。
       if (this.injectQueue.length > 0) await sleep(ENTER_DELAY_MS);

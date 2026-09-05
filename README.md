@@ -142,10 +142,63 @@ cp ebi-team.config.example.json ebi-team.config.json
 | `emoji` | UI バッジ絵文字 | `🧩` |
 | `mcpRole` | 動的エビに与える MCP 権限ティア。**`"engineer"` のみ許容**（動的エビが持つ唯一の最小権限ティアで、他エビの spawn/kill/操作はできません） | `"engineer"` |
 | `permissionMode` | Claude Code の権限モード | サーバの既定値 |
-| `defaultModel` | 起動モデル（`opus` / `sonnet` / `haiku` など） | `"sonnet"` |
+| `defaultModel` | 起動モデル（`opus` / `sonnet` / `haiku` など） | `"sonnet"`（`backend` が claude 以外なら空＝各 CLI の既定モデル） |
+| `backend` | その役割の既定バックエンド（`claude` / `codex` / `gemini`）。後述の「マルチバックエンド」参照 | 未指定（サーバ既定へフォールバック） |
 | `appendSystemPrompt` | その役割の人格・振る舞いのルールを注入するシステムプロンプト | 空（注入なし） |
+| `ackWatchMs` | codex の ACK 監視窓（ms）の上書き。`0` でその役割だけ監視しない | 未指定（backend 既定＝codex は 90000） |
 
 組込みの `engineer` は同名キーで上書きできますが、削除はできません（`roles` は既存レジストリへの追加/上書きのみです）。
+
+`ackWatchMs` は「1 ターンが長い役割」向けの逃げ道です。codex エビは役割プロンプト注入から一定時間、応答文を走査して「ツールが無いと述べて黙る静かな故障」を検知し、当たれば 1 回だけ作り直します。画像生成のように 1 ターンが 1 分を超える役割では、**正しい失敗報告**がこの窓の内側に落ちて誤検知されうるため、その役割だけ窓を短くします（同梱サンプルの `imagegen` は 45000）。
+
+### 画像生成役割 (imagegen)
+
+`ebi-team.config.example.json` の `roles.imagegen` は、codex 組込みの画像生成ツールで素材画像を作る役割のサンプルです（要 ChatGPT Plus 以上）。依頼／報告は YAML 1 ブロックに固定していて、様式の定義と検証は `src/server/imagegen.ts`、サンプルは `docs/samples/imagegen-*.yaml` にあります。
+
+```bash
+npm run imagegen:check -- job    docs/samples/imagegen-job.yaml   # 依頼を投げる前に形を確かめる
+npm run imagegen:check -- result docs/samples/imagegen-result.yaml
+ops/clean-generated-images.sh --dry-run                            # ~/.codex/generated_images の掃除
+```
+
+運用は「生成は ebi-team の `tmp/images/<job_id>/` に置き、採否を見てから対象リポジトリへ配る」形です。詳細は `docs/design/imagegen-role-2026-09-05.md` と `docs/ops/imagegen-role.md`。
+
+### マルチバックエンド (claude / codex / gemini)
+
+エビを動かすエージェント CLI（バックエンド）は **claude / codex / gemini** の 3 つから選べます。組込みの `engineer` 役割は `claude` 既定のままで、他バックエンドは「役割ごとの既定」か「spawn 時の明示指定」で使います。
+
+```jsonc
+{
+  "defaultBackend": "claude",            // サーバ既定（env EBI_BACKEND より優先）
+  "backends": {
+    "codex":  { "command": "codex",  "defaultModel": "gpt-5.5" },
+    "gemini": { "command": "gemini", "defaultModel": "gemini-flash-latest" }
+  },
+  "roles": {
+    "researcher":     { "backend": "gemini", "permissionMode": "plan" },   // 下調べ・読解役
+    "engineer-codex": { "backend": "codex",  "defaultModel": "gpt-5.5" }   // 実装セカンドオピニオン
+  }
+}
+```
+
+バックエンドの解決順は **spawn 引数 `backend` > 役割の `backend` > `defaultBackend` > env `EBI_BACKEND` > `claude`**。未実装・未知の id は黙って claude に落とさず明示エラーになります。**master（統括役）は何を設定しても常に claude 固定**です（統括系を落とさないための fail-safe）。
+
+spawn 時の明示指定は master の MCP ツール（`spawn_ebi` / `spawn_engineer` / `send_message` の `backend` 引数）、制御API（`POST /control/spawn` の `backend`）、UI ヘッダの backend セレクトから行えます。
+
+`permissionMode` は抽象語彙で、各 CLI のフラグへ写像されます（**`plan` の厳密な等価物は codex / gemini に無く近似**です）。
+
+| 抽象値 | claude | codex | gemini |
+| --- | --- | --- | --- |
+| `bypassPermissions` | `--permission-mode bypassPermissions` | `-s danger-full-access -a never` | `--approval-mode yolo` |
+| `acceptEdits` | 同名 | `-s workspace-write -a never` | `--approval-mode auto_edit` |
+| `plan` / `default` | 同名 | `-s read-only -a on-request` | `--approval-mode default`（read 寄り運用はプロンプトで担保） |
+| `auto` / `dontAsk` | 同名 | `-s workspace-write -a never` | `--approval-mode yolo` |
+
+`model` の語彙もバックエンドごとに別物です（claude の `opus` / `sonnet` は codex / gemini では通りません）。役割の `defaultModel` は **その役割の `backend` で起動したときだけ**適用され、他バックエンドでは `backends.<id>.defaultModel` → env `EBI_<ID>_MODEL` → CLI 既定の順で解決されます。
+
+UI では各エビに backend バッジ（🟣 claude / 🟢 codex / 🔵 gemini）が付きます。**codex / gemini は Claude の statusLine 相当の usage 報告経路を持たない**ため、ダッシュボードの cost / context は空欄ではなく **「—（未対応）」** と明示表示されます（欠測であって異常ではありません）。
+
+詳細は `docs/backends/codex.md` / `docs/backends/gemini.md` を参照してください。
 
 ### 外部チャンネル待機セッションを固定エビにする (external channel relay)
 
@@ -179,16 +232,38 @@ Slack / Discord などの外部チャンネルに常駐する「待機・秘書�
 
 ルーティングは既存基盤の流用です（新規プロトコルなし）: 外部 → 中継エビ → `reply_to_master` → master（`[from:...]` タグ付き） / master → `send_message`（PTY 注入）→ 中継エビ → 自身の channel reply で外部へ返信。
 
-### md/txt ビューア (viewer)
+### md/txt/画像ビューア (viewer)
 
-統括役（master）がレビュー用のプランやレポート（md/txt）を UI に「見せる」ための **読み取り専用ビューア**です。master 専用の MCP ツール `open_viewer({ path, title? })` で開くと、REGISTRY サイドバーに `📄 <タイトル>` 行が現れ、メイン領域にプレビューが表示されます（開いた瞬間は自動でそのビューアに切り替わります）。行またはパネルヘッダの `✕` で閉じます。
+統括役（master）がレビュー用のプランやレポート（md/txt）、エビが生成した画像を UI に「見せる」ための **読み取り専用ビューア**です。master 専用の MCP ツール `open_viewer({ path, title? })` で開くと、REGISTRY サイドバーに `📄 <タイトル>`（画像は `🖼 <タイトル>`）行が現れ、メイン領域にプレビューが表示されます（開いた瞬間は自動でそのビューアに切り替わります）。行またはパネルヘッダの `✕` で閉じます。
 
 - **レンダリング**: 外部ライブラリを使わない依存ゼロの軽量レンダラで、見出し・箇条書き/番号リスト・コードブロック・インライン code・bold/italic・引用・水平線・表・リンクを描画します（`.txt` は等幅の生テキスト）。
 - **安全性**: 生成は `createElement` / `textContent` のみで行い、`innerHTML` に生コンテンツを入れません。md 中に含まれる HTML タグ（`<script>` 等）は文字列として表示され、実行されません。
-- **アクセス範囲**: 開けるのは許可ルート配下の `.md` / `.markdown` / `.txt` のみ（読み取り専用・サイズ上限あり・シンボリックリンクの脱出は `realpath` で防止）。許可ルートは環境変数 `EBI_VIEWER_ROOTS`（`:` 区切り・未設定時の既定は `$HOME/workspace`）で設定します。上限は `EBI_VIEWER_MAX_BYTES`（既定 1MB）。
+- **画像**: `.png` / `.jpg` / `.jpeg` / `.webp` / `.gif` を `<img>` で表示します（透過 PNG は市松模様の背景で確認できます）。バイト列は WS の `viewers` ブロードキャストには載せず（`content` は空文字）、サーバの読み取り専用エンドポイント `GET /control/viewer-file?id=<viewer id>` から配信します。クライアントが渡すのは **viewer id だけ**（生パスは渡さない）で、配信のたびに許可ルート・`realpath`・サイズを再検証し、`Content-Type` は拡張子から決めて `X-Content-Type-Options: nosniff` / `Cache-Control: no-store` を付けます。`.svg` はスクリプトを埋め込めるため対象外です。
+- **アクセス範囲**: 開けるのは許可ルート配下の `.md` / `.markdown` / `.txt` / 上記の画像拡張子のみ（読み取り専用・サイズ上限あり・シンボリックリンクの脱出は `realpath` で防止）。許可ルートは環境変数 `EBI_VIEWER_ROOTS`（`:` 区切り・未設定時の既定は `$HOME/workspace`）で設定します。上限はテキストが `EBI_VIEWER_MAX_BYTES`（既定 1MB）、画像が `EBI_VIEWER_MAX_IMAGE_BYTES`（既定 8MB）と別枠です。
 - **永続化（再起動後の復元）**: 開いているビューアは `.ebi-team/viewers.json`（`EBI_VIEWERS_PATH` で変更可・gitignore 対象）へ open/close のたびに atomic 保存され、サーバ再起動時に同じタブが復元されます。保存するのは `{id, path, title, openedAt}` のみで、本文は復元時にファイルから読み直します（＝再起動後は最新の内容が表示されます）。復元時にファイルが消えている／許可ルート外になっているエントリは警告ログを出して読み飛ばし、`viewers.json` からも掃除します（起動は止めません）。
 
-> **運用原則**: 統括役（master）がユーザーへ md/txt の成果物・プラン・レポートを提示するときは、**原則 `open_viewer` で UI に表示する**。「どう表示しましょうか」と表示方法を質問する前に、まず `open_viewer` で開いて見せること。ターミナルへの全文貼り付けは、ユーザーが明示的に望んだ場合に限る。
+> **運用原則**: 統括役（master）がユーザーへ md/txt/画像の成果物・プラン・レポートを提示するときは、**原則 `open_viewer` で UI に表示する**。「どう表示しましょうか」と表示方法を質問する前に、まず `open_viewer` で開いて見せること。ターミナルへの全文貼り付けは、ユーザーが明示的に望んだ場合に限る。
+
+### master コンテキスト枯渇ガード (context-guard)
+
+統括役（master）のコンテキスト使用率を監視し、**自動 compact に食われて PM 文脈（配下エビの状況・進行中の依頼）が消える前に「促す」**仕組みです。既定で ON。
+
+**ebi-team は `/compact` も `/clear` も実行しません。促すだけで、実行はユーザーの判断です。**
+
+観測値は各エビの statusLine が `/control/usage` へ POST してくる JSON（`context_window.used_percentage` / `context_window_size`）で、使用状況ダッシュボードと同じ供給元です。モデル別の上限テーブルは持ちません（JSON に上限が入っているため）。
+
+| 段階 | 既定 | 挙動 |
+| --- | --- | --- |
+| 予告 (soft) | 65% | **キリの良し悪しに関係なく**その場で 1 回通知。本文には「そのままユーザーへ転記できる定型文」（現在の使用率・上限・走行中のエビ数入り）が含まれ、master はこれを伝えて走行中タスクの区切りと報告集約を進めます |
+| キリ待ち | — | 「配下 dynamic エビが全員 idle かつ master も idle」になった最初の時点で、`/clear` を促す通知を 1 回 |
+| 通知 (hard) | 70% | キリの良し悪しを問わず 1 回。ハンドオフ要約を残して `/clear` を提案するよう促します |
+| 危険 (critical) | 85% | 同上に加え、`EBI_CTX_GUARD_COOLDOWN_MS`（既定 10 分）ごとに再通知 |
+
+- **通知先**: ebi-team UI の notice（`NoticeBuffer` に載るので、通知時にブラウザを開いていなくても次の接続で replay されます）と、master セッションへの inject の 2 系統。
+- **連打防止**: 各段階は使用率が下がらない限り 1 回（critical のみ再通知間隔あり）。整数刻みの 69↔70 往復は下げ幅マージン（既定 5pt）で吸収し、`/clear` や compact で使用率が落ちれば状態がリセットされて再武装します。
+- **安全側の既定**: 使用率が空（セッション開始直後）や、statusLine が長時間走っておらず値が古い場合は判定をスキップします。空のまま連続で受け続けた場合は「無言の機能停止」を 1 回だけ通知します。
+- 閾値・監視対象・無効化はすべて環境変数で上書きできます（`.env.sample` の `EBI_CTX_GUARD*` を参照）。
+- 検証: `node --import tsx --test test/contextGuard.test.ts`（ユニット）/ `npm run e2e:context-guard`（実サーバ疎通・実課金なし）。
 
 ### spawn 後の表示切り替え
 

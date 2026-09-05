@@ -1,0 +1,28 @@
+# imagegen エビへの依頼サンプル（master がこの本文をそのまま task に貼る）。
+# 検証: npm run imagegen:check -- job docs/samples/imagegen-job.yaml
+imagegen_job: v1
+job_id: sample-2026-09-05
+requester: ebi-3
+dest_root: tmp/images/sample-2026-09-05
+images:
+  - id: hero-icon
+    purpose: トップの見出し横に置くアイコン
+    prompt: |
+      白背景に、エビのマスコットのシンプルでかわいいフラットアイコン。
+      太めの輪郭線、彩度低めのオレンジ、影なし。文字は入れない。
+    count: 1
+    size: 512x512
+    fit: contain
+    format: png
+  - id: empty-state
+    purpose: 一覧が空のときのイラスト
+    prompt: |
+      白背景に、空の皿の前で首をかしげるエビのマスコット。フラット・線画寄り。
+    count: 2
+    size: 1024x1024
+    fit: contain
+    format: png
+# ボス目視で NG だった画像だけを作り直すときは、この行を足して再投入する:
+# regenerate: [empty-state]
+notes: |
+  すべて同一トーンで揃えること。人物・実在ロゴ・文字は入れない。

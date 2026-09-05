@@ -1,0 +1,14 @@
+gemini-2.5-flash                       200  OK | text,thoughtSignature | OK
+gemini-3-flash                         429  RESOURCE_EXHAUSTED | You have exhausted your capacity on this model. Your quota will reset after 58s.
+gemini-3-pro-preview                   404  NOT_FOUND | Requested entity was not found.
+gemini-3.1-pro-preview                 404  NOT_FOUND | Requested entity was not found.
+gemini-3.5-flash                       429  RESOURCE_EXHAUSTED | You have exhausted your capacity on this model. Your quota will reset after 57s.
+gemini-2.5-flash-image                 404  NOT_FOUND | Requested entity was not found.
+gemini-2.5-flash-image-preview         404  NOT_FOUND | Requested entity was not found.
+gemini-3-pro-image-preview             404  NOT_FOUND | Requested entity was not found.
+gemini-3.1-flash-image                 404  NOT_FOUND | Requested entity was not found.
+gemini-3.1-flash-image-preview         404  NOT_FOUND | Requested entity was not found.
+gemini-3.1-flash-lite-image-preview    404  NOT_FOUND | Requested entity was not found.
+gemini-3.8-flash                       404  NOT_FOUND | Requested entity was not found.
+gemini-3.8-flash-image                 404  NOT_FOUND | Requested entity was not found.
+imagen-4.0-generate-001                404  NOT_FOUND | Requested entity was not found.

@@ -30,6 +30,12 @@ export interface GeneralizedSpawnParams {
   appendSystemPrompt?: string | null;
   /** permission-mode（未検証文字列。spawnAgent 側で検証）。 */
   permissionMode?: string;
+  /**
+   * バックエンド（エージェント CLI）id。未検証文字列で受け、spawnAgent 側で検証する。
+   * 未指定なら「役割の既定 → config.defaultBackend → env EBI_BACKEND → claude」。
+   * 実装済みでない backend id は明示エラーで弾く（黙って claude に落とさない）。
+   */
+  backend?: string;
   /** エビ種別（既定 dynamic）。 */
   kind?: AgentKind;
   /**
@@ -45,6 +51,17 @@ export interface GeneralizedSpawnParams {
    * role 未指定かつ true のとき role="engineer" と等価に扱う（index.ts 側で読み替え）。
    */
   asEngineer?: boolean;
+  /**
+   * 内部用（制御API からは受け取らない）。ready 前の予期せぬ exit による再試行での spawn か。
+   * true の spawn はそれ以上再試行しない（無限リトライ防止）。
+   */
+  retryOfEarlyExit?: boolean;
+  /**
+   * 内部用（制御API からは受け取らない）。役割プロンプト ACK の「静かな故障」検知による
+   * 作り直しでの spawn か。true の spawn はそれ以上作り直さず、2 回目の故障は fatal として
+   * master へ通知する（無限リトライ防止・黙って消さない）。
+   */
+  retryOfAckFailure?: boolean;
 }
 
 /** 要約結果（control.ts は supervisor.ts の型に依存しないよう最小形で受ける）。 */
@@ -65,6 +82,8 @@ export interface SendMessageInput {
   branch?: string;
   /** spawnIfMissing で起動する際の役割（EBI_ROLES id。未指定は engineer）。 */
   role?: string;
+  /** spawnIfMissing で起動する際のバックエンド（未指定は役割の既定→サーバ既定）。 */
+  backend?: string;
   /** 【後方互換】spawnIfMissing で起動する際 engineer 役割にするか。role が優先。 */
   asEngineer?: boolean;
 }
@@ -142,6 +161,12 @@ export interface ControlDeps {
    * 検証失敗（許可ルート外/拡張子/サイズ/不存在）は throw（呼び出し側で 400 に振り分ける）。
    */
   openViewer: (path: string, title?: string) => Promise<ViewerRecord>;
+  /**
+   * 画像 viewer のバイト列を読む（`GET /control/viewer-file?id=` の実体）。
+   * 受けるのは **登録済み viewer の id だけ**（生パスは受けない＝新しいパストラバーサル入口を作らない）。
+   * 未登録 id・画像以外は null（404）。許可ルート外/サイズ超過などの検証失敗は throw（400）。
+   */
+  readViewerFile: (id: string) => Promise<{ bytes: Buffer; mime: string; path: string } | null>;
 }
 
 /** JSON レスポンスを返すヘルパー。 */
@@ -195,6 +220,7 @@ function agentSummary(registry: Registry) {
     cwd: a.cwd,
     pinned: a.pinned,
     pid: a.pid,
+    backend: a.backend,
   }));
 }
 
@@ -239,6 +265,7 @@ export function createControlApi(deps: ControlDeps) {
           branch: asString(body.branch),
           appendSystemPrompt: asString(body.appendSystemPrompt) ?? null,
           permissionMode: asString(body.permissionMode),
+          backend: asString(body.backend),
           kind: (kindRaw as AgentKind | undefined) ?? "dynamic",
           role: asString(body.role),
           asEngineer: asBool(body.asEngineer),
@@ -265,6 +292,40 @@ export function createControlApi(deps: ControlDeps) {
           // パス検証エラー（許可ルート外/拡張子/サイズ/不存在）は 400 で理由を返す。
           sendJson(res, 400, { error: (err as Error).message });
         }
+        return true;
+      }
+
+      // ---- GET /control/viewer-file?id=viewer-N ----
+      // 画像 viewer のバイナリ配信（読み取り専用）。クライアントの <img src> がここを叩く。
+      // 認証ゲート（index.ts）を通った後にしか到達しない。id 参照のみで生パスは受け取らない。
+      if (pathname === "/control/viewer-file" && method === "GET") {
+        const id = query.get("id");
+        if (!id) {
+          sendJson(res, 400, { error: "id（クエリ）は必須です" });
+          return true;
+        }
+        let file: { bytes: Buffer; mime: string; path: string } | null;
+        try {
+          file = await deps.readViewerFile(id);
+        } catch (err) {
+          // 許可ルート外・サイズ超過・実体消失など（open 後に差し替えられた場合を含む）。
+          sendJson(res, 400, { error: (err as Error).message });
+          return true;
+        }
+        if (!file) {
+          sendJson(res, 404, { error: `画像 viewer が見つかりません: ${id}` });
+          return true;
+        }
+        res.writeHead(200, {
+          "Content-Type": file.mime,
+          "Content-Length": String(file.bytes.length),
+          // ブラウザに MIME を推測させない（拡張子由来の Content-Type を強制）。
+          "X-Content-Type-Options": "nosniff",
+          "Content-Disposition": "inline",
+          // 同じ id で開き直したときに古い画像が残らないようにする。
+          "Cache-Control": "no-store",
+        });
+        res.end(file.bytes);
         return true;
       }
 
@@ -355,6 +416,7 @@ export function createControlApi(deps: ControlDeps) {
           repoPath: asString(body.repoPath),
           branch: asString(body.branch),
           role: asString(body.role),
+          backend: asString(body.backend),
           asEngineer: asBool(body.asEngineer),
         });
         if (result.ok) {

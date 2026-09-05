@@ -26,8 +26,15 @@
     "e2e:delivery-hardening": "node scripts/e2e-delivery-hardening.mjs",
     "e2e:spawn-delivery": "node scripts/e2e-spawn-delivery.mjs",
     "e2e:usage": "node scripts/e2e-usage.mjs",
+    "usage:report": "node --import tsx scripts/usage-report.mjs",
+    "e2e:codex": "node scripts/e2e-codex-engineer.mjs",
+    "e2e:context-guard": "node scripts/e2e-context-guard.mjs",
+    "e2e:gemini": "node scripts/e2e-gemini-engineer.mjs",
+    "e2e:supervisor-gemini": "node scripts/e2e-supervisor-gemini.mjs",
     "e2e:viewer": "node --import tsx scripts/e2e-viewer.mjs",
     "e2e:viewer-persist": "node scripts/e2e-viewer-persist.mjs",
+    "e2e:imagegen": "node --import tsx scripts/e2e-imagegen.mjs",
+    "imagegen:check": "node --import tsx scripts/imagegen-check.mjs",
     "postinstall": "node scripts/fix-pty-helper.mjs"
   },
   "dependencies": {

@@ -23,6 +23,12 @@
           <input id="spawn-follow" type="checkbox" />
           spawn後に移動
         </label>
+        <select id="spawn-backend" title="起動するバックエンド（既定＝サーバ側の既定: 役割 → config → env → claude）">
+          <option value="">backend: 既定</option>
+          <option value="claude">🟣 claude</option>
+          <option value="codex">🟢 codex</option>
+          <option value="gemini">🔵 gemini</option>
+        </select>
         <button id="spawn-btn">＋ エビを追加</button>
         <span id="conn-status" class="conn">接続中…</span>
       </div>

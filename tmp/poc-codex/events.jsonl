@@ -1,0 +1,19 @@
+{"t":0,"event":"spawn","command":"codex","args":["--no-alt-screen","-s","read-only","-a","never","-c","disable_paste_burst=true","-c","check_for_update_on_startup=false","-c","projects={\"/Users/yoimaro/workspace/GitHub/ebi-team\"={trust_level=\"trusted\"},\"/Users/yoimaro/workspace/GitHub/ebi-team/.worktrees/ebi-ebiteam-poc-codex\"={trust_level=\"trusted\"}}","-c","mcp_servers.ebi-control.command=\"node\"","-c","mcp_servers.ebi-control.args=[\"/Users/yoimaro/workspace/GitHub/ebi-team/dist/server/mcp/control-server.js\"]","-c","mcp_servers.ebi-control.cwd=\"/Users/yoimaro/workspace/GitHub/ebi-team\"","-c","mcp_servers.ebi-control.default_tools_approval_mode=\"approve\"","-c","mcp_servers.ebi-control.env={EBI_CONTROL_URL=\"http://127.0.0.1:8787\",EBI_MCP_ROLE=\"engineer\",EBI_ID=\"poc-codex\",EBI_NOTIFY_SUBSCRIBE=\"off\"}","これは接続テストです。ツールは使わず、次の一語だけを返してください: READY-0"]}
+{"t":7,"event":"pid","pid":75185}
+{"t":7342,"event":"boot","quietAfterMs":7334,"altScreenEnter":false,"mouseReport":true,"bracketedPaste":true,"bytes":28061,"chunks":166,"initialPromptEchoed":true,"initialPromptNote":"READY-0 は composer エコーにも出るため、boot-plain.txt を目視で確認する"}
+{"t":19378,"event":"mcp","nonce":"473334","submittedMs":101,"ms":12035,"answered":true,"sawToolName":true}
+{"t":23832,"event":"inject","n":1,"submitted":true,"answered":true,"ms":1907}
+{"t":27733,"event":"inject","n":2,"submitted":true,"answered":true,"ms":1919}
+{"t":31824,"event":"inject","n":3,"submitted":true,"answered":true,"ms":2115}
+{"t":35915,"event":"inject","n":4,"submitted":true,"answered":true,"ms":2111}
+{"t":39697,"event":"inject","n":5,"submitted":true,"answered":true,"ms":1809}
+{"t":43538,"event":"inject","n":6,"submitted":true,"answered":true,"ms":1808}
+{"t":47483,"event":"inject","n":7,"submitted":true,"answered":true,"ms":1910}
+{"t":51372,"event":"inject","n":8,"submitted":true,"answered":true,"ms":1908}
+{"t":55819,"event":"inject","n":9,"submitted":true,"answered":true,"ms":2415}
+{"t":61170,"event":"inject","n":10,"submitted":true,"answered":true,"ms":3320}
+{"t":63602,"event":"readTask","ok":true,"ms":502}
+{"t":134271,"event":"idle60","totalBytes":0,"totalChunks":0,"samples":[{"sec":5,"bytes":0},{"sec":10,"bytes":0},{"sec":15,"bytes":0},{"sec":20,"bytes":0},{"sec":25,"bytes":0},{"sec":30,"bytes":0},{"sec":35,"bytes":0},{"sec":40,"bytes":0},{"sec":45,"bytes":0},{"sec":50,"bytes":0},{"sec":55,"bytes":0},{"sec":60,"bytes":0}],"quietMsAtEnd":62026,"idleAt900ms":true}
+{"t":134275,"event":"done"}
+{"t":134306,"event":"exit","exitCode":0,"signal":0}
+{"t":135777,"event":"killed","pid":75185}
