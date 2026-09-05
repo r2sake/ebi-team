@@ -115,6 +115,8 @@ interface Harness {
   states: { state: MasterChatState; pending: number }[];
   notices: string[];
   usages: MasterUsageSnapshot[];
+  /** onUsage が呼ばれた瞬間のセッション状態（contextGuard のキリ判定はこれを読む）。 */
+  usageStates: MasterChatState[];
   rateLimits: Partial<UsageRateLimits>[];
 }
 
@@ -125,13 +127,19 @@ function makeSession(opts: { snapshotLimit?: number } = {}): Harness {
     states: [],
     notices: [],
     usages: [],
+    usageStates: [],
     rateLimits: [],
   };
+  // handlers から参照するため、session を後入れできる箱にしておく。
+  let sessionRef: MasterSession | null = null;
   const handlers: MasterSessionHandlers = {
     onEvent: (_id, envelope) => h.events.push(envelope),
     onState: (_id, state, pending) => h.states.push({ state, pending }),
     onNotice: (_id, text) => h.notices.push(text),
-    onUsage: (_id, usage) => h.usages.push(usage),
+    onUsage: (_id, usage) => {
+      h.usages.push(usage);
+      h.usageStates.push(sessionRef?.state ?? "stopped");
+    },
     onRateLimits: (_id, limits) => h.rateLimits.push(limits),
     onRegistryChange: () => {},
   };
@@ -155,6 +163,7 @@ function makeSession(opts: { snapshotLimit?: number } = {}): Harness {
       return b;
     },
   });
+  sessionRef = session;
   return { session, brains, ...h };
 }
 
@@ -246,6 +255,28 @@ test("turnEnd の usage が UsageStore 供給用に流れ、コストはプロ�
   assert.equal(h.usages[0]!.tokens.cacheRead, 5000);
   assert.equal(h.usages[0]!.model, "claude-opus-5");
   assert.equal(h.session.totalCostUsd, 0.25);
+});
+
+test("PR-M6: usage を出す時点で既に idle（contextGuard の /clear 促しが発火できる）", async () => {
+  const h = makeSession();
+  await h.session.start();
+  await h.session.sendUserText("やあ");
+  h.brains[0]!.emit({
+    kind: "turnEnd",
+    ok: true,
+    aborted: false,
+    usage: {
+      input: 1000, output: 20, cacheRead: 5000, cacheCreation: 100,
+      contextTokens: 6100, contextSize: 1_000_000, contextUsedPct: 66,
+    },
+    costUsd: 0.1,
+    errorText: null,
+  });
+  await waitEvents(h, 2);
+  assert.equal(h.usages.length, 1);
+  // busy のまま usage を渡すと registry 上 master が busy に見え、quiescent 通知が永久に出ない。
+  assert.deepEqual(h.usageStates, ["idle"]);
+  assert.equal(h.session.record().status, "idle");
 });
 
 test("ebi-control が connected でなければ notice で知らせる（静かな故障の構造的検出）", async () => {
