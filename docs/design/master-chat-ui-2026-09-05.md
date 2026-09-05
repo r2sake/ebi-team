@@ -3,6 +3,7 @@
 - 作成: 2026-09-05 engineer エビ（master 委譲・**設計のみ / 実装なし**）
 - **r2: 2026-09-05 更新**（PR-M0 PoC の実測とボス裁定を反映。PR-M1 実装と同じ PR で改訂）。
   変更点の一覧は §0.1。実測の一次資料は `docs/poc/master-headless-poc-2026-09-05.md`
+- **r4: 2026-09-05 更新**（PR-M3 実装＝チャット UI に合わせて §0.3 を追加し §9 を更新）。ブランチは `ebi/ebiteam-master-chat-m3`
 - **r3: 2026-09-05 更新**（PR-M2 実装＝`MasterSession` とサーバ配線に合わせて §3.4 / §4.4 / §5.4 / §6.1 を確定）。
   変更点は §0.2。PR-M2 で実測した点（`rate_limit_event` の `utilization` スケール）も反映済み
 - ブランチ: `ebi/ebiteam-master-chat-ui-design` → r2 は `ebi/ebiteam-master-chat-m1` → r3 は `ebi/ebiteam-master-chat-m2`
@@ -108,6 +109,27 @@ unit 26 本追加（`test/masterChatSession.test.ts` / `test/masterChatWiring.te
 | O | **contextGuard の供給元**は `turnEnd.usage` → `UsageStore.updateFromChat()` → 既存の `observeContextGuard()`。閾値も判定も無変更（割合据え置き・裁定 Q-6）。quiescence 判定が `registry.list()` から「master が idle か」を読むため、**MasterSession は registry に合成レコードを載せる**（`status` は chatState の busy/それ以外を写す） | §8-R3 |
 | P | **プロセス死亡 → `--resume` 自動復帰**は MasterSession が持つ（固定エビの `DEFAULT_RESTART_POLICY` と同じ値: 1s から指数バックオフ・上限 30s・短命死 5 連続で停止）。`MasterCostLedger` はセッションが 1 つ持ち、プロセスを跨いで合算した値を `turnEnd.totalCostUsd` として UI へ出す | §8-R1 |
 | Q | **`ui:"chat"` は `kind:"master"` 専用**（他 kind に書いたら config 読み込みで明示エラー）。`brain` の値域は `claude`/`codex`/`gemini`/`agy`（未実装 id は起動時に `MasterBrainNotImplementedError`）。env `EBI_MASTER_UI=terminal\|chat` は config より優先し、不正値は無視する（起動を止めない） | §6.1 / §6.3 |
+
+---
+
+## 0.3 r4 での変更（PR-M3 実装の確定事項）
+
+**PR-M3 で実装したもの**: `src/client/chatModel.ts`（イベント列 → 表示アイテム列の純粋な畳み込み）/
+`src/client/chat.ts`（チャットパネル DOM）＋ `main.ts` の分岐・`index.html`・`style.css`
+＋ サーバ側の最小追加（`chatNew` / `MasterSession.newConversation()` / `--include-partial-messages` 有効化 /
+接続直後の送信順）。unit +19 本（`test/masterChatUi.test.ts` 15 / `masterChatSession.test.ts` に 4）。
+
+| # | 確定した点 | 反映先 |
+|---|---|---|
+| R | **UI の「chat か terminal か」の判定材料は `chatState` の受信**にした。registry（`AgentRecord`）にはモードの情報が無く、増やすと terminal 構成の外形が変わる。サーバは接続直後 **`chatState`/`chatSnapshot` を `registry` より先に送る**ので、クライアントは chat master の xterm ペインを一度も作らない（`ui:"terminal"` では `chatState` が 1 通も来ない＝従来と同じ経路） | §5.1 / §6.1 |
+| S | **「新しい会話」は WS `chatNew` を 1 つだけ足した**（`protocol.ts` の追加はこの 1 型のみ）。ヘッドレス CLI に `/clear` が無いため、`MasterSession.newConversation()` が頭脳プロセスを止めて **`--resume` 無しで起動し直す**。トランスクリプトと JSONL は残り、区切りが notice 行で入る。会話単位の累計コスト（`MasterCostLedger`）もリセットする（裁定 Q-3 の「手動ボタン先行」） | §5.2 / §10 Q-3 |
+| T | **partial（`--include-partial-messages`）を有効化**。`text`/`thinking` は差分を追記し、ブロック完了時に来る `partial:false` の全文で**置き換えて**閉じる（差分の取りこぼし/重複を構造的に消す）。この畳み込みは DOM 非依存の純粋クラス `ChatTranscript` に置き、unit で検証している | §5.2 / §5.4 |
+| U | **承認/質問（permission/question）は表示のみ**。バブルは出すがボタンは無効（tooltip「PR-M5 で対応」）で、`chatAnswer` は送らない。入力欄上のスティッキーバーは `chatState.pending` を出すだけ | §5.2 / PR-M5 |
+| V | **スマホのログスクロール問題は解消を実測**（375 幅で `scrollTop` 0→781・入力欄は下端固定）。chat パネル表示中は Ctrl 武装バー（`key-assist`）を出さない（xterm 専用のため） | §5.3 |
+| W | **`ui:"terminal"` のゼロ差分をピクセル比較で確認**（client dist だけ base/PR-M3 に差し替えて 3 画面比較。2 画面はバイト一致、1 画面はアンチエイリアス由来の 2px・差 1/255 のみ）。証跡は `tmp/shots-m3/` | §6.2 第 1 段 |
+
+**PR-M4 以降への持ち越し**: 入力履歴（↑/↓・localStorage）/ ツール結果の「全部見る」/ `chatHistory` による過去ログのページング
+（いまは `hasMore` を 1 行で示すだけ）/ 画像添付・`open_viewer` カードの chat 内表示 / 承認・質問の応答送信（PR-M5）。
 
 ---
 
@@ -723,7 +745,7 @@ stdin への user メッセージ投入は **4 つの CLI すべてが公式に�
 | **PR-M0** ✅完了 | **PoC（使い捨てスクリプト `scripts/poc-master-headless.mjs` のみ・本体無変更）**<br/>`claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages --mcp-config <既存 master config> --strict-mcp-config --permission-mode auto --append-system-prompt <master 役割>` を spawn し、①多ターン往復 ②`--replay-user-messages` の ACK ③busy 中の追加投入がキューされるか ④`system/init` に ebi-control が載るか ⑤`result.usage` から文脈%が出せるか ⑥SIGINT 中断 ⑦`--resume` 復帰 ⑧24h 生存 を実測 | ①〜⑦が確認でき、⑧は少なくとも 6h 連続で `authentication_failed` が出ない | **1 日**（+ 放置観測） | ボス GO |
 | **PR-M1** ✅完了 | **`MasterBrain` 抽象 + `ClaudeHeadlessBrain`**（サーバ内のみ・UI 未接続）。NDJSON パーサ・イベント正規化・env deny list・`--bare` 拒否 preflight・`apiKeySource` 検証。codex は interface + stub まで（Q-1 の opt-in） | 新規 unit 50 本 green（`test/masterBrain{Args,Events,Stream}.test.ts`）。既存 unit fail 0（合計 338）。`npm run build` 成功。**外形ゼロ差分**（既存ファイルの変更 0・サーバから未参照）。実プロセス結合は opt-in の `scripts/e2e-master-brain.mjs`（既定では走らせない＝サブスク枠を食わない） | **1 日** | PR-M0 |
 | **PR-M2** ✅完了 | **`MasterSession` とサーバ配線**。feature flag `ui:"chat"`／PTY 経路の分岐／WS プロトコル拡張（`chatSend`/`chatEvent`/`chatState`/`chatSnapshot`）／会話 JSONL 永続化／mailbox → `send()` の載せ替え | `scripts/e2e-master-chat.mjs`：`chatSend` → `text`/`turnEnd`、`/control/reverse-inject` → `inbound` が**連続 10 回 100%**（2026-09-05 実測 10/10・10/10。unit +26 本 green・既存 fail 0・build 成功・`ui` 未指定で外形ゼロ差分） | **1 日** | PR-M1 |
-| **PR-M3** | **チャット UI（表示のみ）**。md レンダリング（`markdown.ts` 再利用）・ツール `<details>`・`[reply]`/`[idle]` バブル・自動追従とスクロール・再接続復元 | 手動 UI 確認 + スクショ（`tmp/master-chat-ui/`）。スマホ幅（375px）でログが指スクロールできること | **1 日** | PR-M2 |
+| **PR-M3** ✅完了 | **チャット UI**。md レンダリング（`markdown.ts` 再利用）・ツール `<details>`・`[reply]`/`[idle]` バブル・partial 逐次描画・自動追従とスクロール・再接続復元・入力欄（Enter 送信 / ⏹ 停止）・「新しい会話」 | Playwright 実画面スクショ 9 枚（`tmp/shots-m3/`）。375px でログが指スクロールできることを実測（scrollTop 0→781）。`ui:"terminal"` はピクセル比較でゼロ差分。unit +19 本 green・既存 fail 0・build 成功 | **1 日** | PR-M2 |
 | **PR-M4** | **入力系**。送信・⏹ 停止（`interrupt()`）・入力履歴（↑/↓ / localStorage）・画像添付・大きな貼り付けのファイル誘導 | 停止で `turnEnd(ok:false)` が出て会話が継続できる。履歴が再読み込み後も残る | **0.5 日** | PR-M3 |
 | **PR-M5** | **承認 / 質問 UI**。ebi-control（master ロール）に `approve` ツール新設 → `--permission-prompt-tool` 配線／`AskUserQuestion` の `tool_use` を選択肢 UI に／未応答スティッキーバー | `scripts/e2e-master-chat-approval.mjs`：承認往復でツール実行が継続する。未応答時に master が止まり、UI に待ち件数が出る | **1 日** | PR-M4 |
 | **PR-M6**（PR-M2 で前倒し済みの部分あり） | **usage / context / cost**。`turnEnd.usage` → `UsageStore` → `contextGuard` の入力載せ替えと `rate_limit_event` の枠取り込みは **PR-M2 で実装済み**。残りは UI（ヘッダのコスト・文脈%表示、算出不能 backend の「—」）と `e2e-context-guard.mjs` の改修 | `e2e-context-guard.mjs` 改修版が green。statusLine 併走比較で文脈%の誤差が許容内（**PoC ⑤ の結果次第**） | **1 日** | PR-M2 |

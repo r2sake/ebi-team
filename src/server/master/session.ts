@@ -114,7 +114,12 @@ export interface MasterSessionOptions {
   /** テスト用の差し替え口（既定は createMasterBrain）。 */
   createBrain?: (
     id: MasterBrainId,
-    opts: { costLedger: MasterCostLedger; onRawEvent: (raw: unknown) => void; ackTimeoutMs: number },
+    opts: {
+      costLedger: MasterCostLedger;
+      onRawEvent: (raw: unknown) => void;
+      ackTimeoutMs: number;
+      includePartialMessages: boolean;
+    },
   ) => MasterBrain;
 }
 
@@ -289,6 +294,10 @@ export class MasterSession {
         costLedger: this.costLedger,
         onRawEvent: (raw) => this.onRawEvent(raw),
         ackTimeoutMs: MASTER_ACK_TIMEOUT_MS,
+        // PR-M3: チャット UI の逐次描画（partial）を有効化する。
+        // 差分は `text`/`thinking` の partial:true として流れ、ブロック完了時に
+        // partial:false の全文が来て置き換わる（claudeEvents.ts の正規化）。
+        includePartialMessages: true,
       });
     } catch (err) {
       this.fail(`master 頭脳（${this.opts.brainId}）を作れませんでした: ${(err as Error).message}`);
@@ -500,6 +509,40 @@ export class MasterSession {
     });
     if (this.pending > 0) this.pending -= 1;
     this.setState(this.pending > 0 ? "waiting" : "busy");
+  }
+
+  /**
+   * 新しい会話を始める（WS `chatNew`）。
+   *
+   * ヘッドレス CLI には `/clear` が無いので、**プロセスを止めて `--resume` 無しで起動し直す**。
+   * 文脈（＝CLI 側の会話履歴）だけがリセットされ、UI のトランスクリプトと JSONL は残る
+   * （区切りは notice イベントとして 1 行入る）。設計書 §10 Q-3 の「手動ボタン先行」。
+   *
+   * 自動復帰（scheduleRestart）と競合しないよう、停止中は stopping を立てて exit を吸収する。
+   */
+  async newConversation(): Promise<void> {
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer);
+      this.restartTimer = null;
+    }
+    const wasStopping = this.stopping;
+    this.stopping = true;
+    try {
+      await this.brain?.stop();
+      await this.pump;
+    } finally {
+      this.stopping = wasStopping;
+    }
+    this.brain = null;
+    this.pid = null;
+    this.pending = 0;
+    // resume 先を捨てる＝次の起動は新しいセッション。コスト累計も会話単位でリセットする。
+    this.lastSessionId = null;
+    this.consecutiveFailures = 0;
+    this.costLedger.reset();
+    this.emit({ kind: "notice", level: "info", text: "新しい会話を開始しました（文脈をリセットしました）" });
+    if (this.stopping) return; // サーバ終了と競合したときは起動し直さない。
+    await this.launch(null);
   }
 
   /** 停止（サーバ終了時）。以降の自動復帰は行わない。 */

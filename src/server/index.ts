@@ -757,14 +757,16 @@ wss.on("connection", (ws) => {
   clients.add(ws);
   // 接続直後にサーバ能力（監督が有効か）を送る。クライアントはこれで要約 UI の出し分けをする。
   send(ws, { type: "capabilities", supervisor: supervisor.enabled });
+  // master が ui:"chat" なら、registry より**先に** state と直近の会話を送る。
+  // クライアントは「chatState を受けた id＝chat モードの master」と判定して xterm ペインを
+  // 作らない分岐に入るので、registry を先に送ると一瞬だけ PTY ペインが生えてしまう。
+  sendChatSnapshot(ws);
   // 接続直後に現在の registry を送る。
   send(ws, { type: "registry", agents: registry.list() });
   // 接続直後に現在の使用状況スナップショットも送る（ダッシュボードの初期表示用）。
   send(ws, usageStore.snapshot());
   // 接続直後に現在の viewer 一覧も送る（再接続時に開いている viewer を復元するため）。
   send(ws, { type: "viewers", viewers: viewerRegistry.list() });
-  // master が ui:"chat" なら、状態と直近の会話も送る（再接続で会話が欠けないようにする）。
-  sendChatSnapshot(ws);
   // 接続前に broadcast された notice を古い順に replay する（replay:true・当時の ts 付き）。
   // 起動直後に固定エビが crashloop 停止しても、後からブラウザを開いた人が気づけるようにする。
   for (const n of noticeBuffer.list()) {
@@ -924,6 +926,16 @@ function handleClientMessage(ws: WebSocket, msg: ClientMessage): void {
       if (!session) break;
       void session.interrupt().catch((err) => {
         send(ws, { type: "error", text: `中断に失敗しました: ${(err as Error).message}` });
+      });
+      break;
+    }
+    case "chatNew": {
+      // 「新しい会話」。ヘッドレス CLI に `/clear` が無いので、頭脳プロセスを
+      // `--resume` 無しで起動し直して文脈をリセットする（設計書 §10 Q-3）。
+      const session = chatSessionFor(ws, msg.id);
+      if (!session) break;
+      void session.newConversation().catch((err) => {
+        send(ws, { type: "error", text: `新しい会話を開始できませんでした: ${(err as Error).message}` });
       });
       break;
     }

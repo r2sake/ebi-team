@@ -34,6 +34,8 @@ class FakeBrain implements MasterBrain {
   };
   readonly unsupported = [];
   pid: number | null = 4242;
+  /** createBrain に渡ってきたオプション（PR-M3 の partial 有効化の検証用）。 */
+  createOpts: { includePartialMessages: boolean } | null = null;
   started: { resumeSessionId: string | null } | null = null;
   readonly sent: string[] = [];
   ackResult = true;
@@ -146,8 +148,9 @@ function makeSession(opts: { snapshotLimit?: number } = {}): Harness {
     handlers,
     ...(opts.snapshotLimit === undefined ? {} : { snapshotLimit: opts.snapshotLimit }),
     restartPolicy: { baseDelayMs: 5, maxDelayMs: 10, maxConsecutiveFailures: 3, minHealthyMs: 10_000 },
-    createBrain: () => {
+    createBrain: (_id, o) => {
       const b = new FakeBrain();
+      b.createOpts = { includePartialMessages: o.includePartialMessages };
       brains.push(b);
       return b;
     },
@@ -379,4 +382,54 @@ test("chatStop は brain.interrupt() を呼ぶ（SIGINT ではない）", async 
   await h.session.start();
   await h.session.interrupt();
   assert.equal(h.brains[0]!.interrupted, 1);
+});
+
+test("PR-M3: 頭脳は --include-partial-messages 相当（逐次描画）で起動する", async () => {
+  const h = makeSession();
+  await h.session.start();
+  assert.deepEqual(h.brains[0]!.createOpts, { includePartialMessages: true });
+});
+
+test("新しい会話: resume 無しで起動し直し、コスト累計と pending をリセットする", async () => {
+  const h = makeSession();
+  await h.session.start();
+  h.brains[0]!.emit({
+    kind: "session",
+    sessionId: "sess-1",
+    model: "opus",
+    apiKeySource: "none",
+    mcpServers: [{ name: "ebi-control", status: "connected" }],
+    capabilities: [],
+  });
+  h.brains[0]!.emit({
+    kind: "turnEnd",
+    ok: true,
+    aborted: false,
+    usage: null,
+    costUsd: 1.5,
+    errorText: null,
+  });
+  await waitEvents(h, 2);
+  assert.equal(h.session.totalCostUsd, 1.5);
+
+  await h.session.newConversation();
+  // 新しいプロセスが立ち、resume は付かない（＝文脈がリセットされる）。
+  assert.equal(h.brains.length, 2);
+  assert.equal(h.brains[1]!.started?.resumeSessionId, null);
+  assert.equal(h.brains[0]!.stopped, 1);
+  // 会話単位の累計コストは 0 に戻り、発話を受け付けられる状態に戻る。
+  assert.equal(h.session.totalCostUsd, 0);
+  assert.equal(h.session.state, "idle");
+  // 区切りが notice としてトランスクリプトに残る。
+  const texts = h.events.map((e) => (e.event.kind === "notice" ? e.event.text : ""));
+  assert.ok(texts.some((t) => t.includes("新しい会話")));
+});
+
+test("新しい会話の直後も送信できる（新プロセスの stdin へ載る）", async () => {
+  const h = makeSession();
+  await h.session.start();
+  await h.session.newConversation();
+  const r = await h.session.sendUserText("最初の一言");
+  assert.equal(r.accepted, true);
+  assert.deepEqual(h.brains[1]!.sent, ["最初の一言"]);
 });
