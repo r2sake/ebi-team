@@ -8,6 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   ChatTranscript,
+  firstUnsettledPending,
   InputHistory,
   INPUT_HISTORY_KEY,
   LARGE_PASTE_CHARS,
@@ -15,6 +16,7 @@ import {
   formatContextPct,
   formatCost,
   oneLine,
+  settledLabel,
   stateLabel,
   summarizeToolInput,
 } from "../src/client/chatModel.ts";
@@ -302,4 +304,82 @@ test("formatBytes: 添付チップのサイズ表示", () => {
   assert.equal(formatBytes(2048), "2.0 KB");
   assert.equal(formatBytes(3 * 1024 * 1024), "3.0 MB");
   assert.equal(formatBytes(-1), "—");
+});
+
+// ===== 承認 / 質問（PR-M5）=====
+
+test("permission バブルは未決着で始まり、permissionSettled で畳まれる", () => {
+  const t = fresh();
+  t.apply(env({ kind: "permission", id: "t1", toolName: "Bash", input: { command: "rm -f x" } }));
+  const item = t.items[0]!;
+  assert.equal(item.kind, "pending");
+  if (item.kind !== "pending") return;
+  assert.equal(item.variant, "permission");
+  assert.equal(item.settled, null, "未決着＝ UI はボタンを出す");
+  assert.match(item.detail, /rm -f x/);
+
+  const change = t.apply(env({ kind: "permissionSettled", id: "t1", outcome: "allowed", answer: "許可" }));
+  assert.deepEqual(change.touched, [0], "新しいバブルは積まず既存を更新する");
+  assert.equal((t.items[0] as { settled: string }).settled, "allowed");
+});
+
+test("question バブルは選択肢と multi を持ち、回答内容が settled に残る", () => {
+  const t = fresh();
+  t.apply(
+    env({
+      kind: "question",
+      id: "q#0",
+      header: "昼食選択",
+      question: "寿司とラーメンどちら？",
+      options: [
+        { label: "寿司", description: "新鮮" },
+        { label: "ラーメン" },
+      ],
+      multi: true,
+    }),
+  );
+  const item = t.items[0]!;
+  if (item.kind !== "pending") throw new Error("pending ではない");
+  assert.equal(item.title, "昼食選択");
+  assert.deepEqual(item.options, ["寿司", "ラーメン"]);
+  assert.deepEqual(item.optionNotes, ["新鮮", null]);
+  assert.equal(item.multi, true);
+
+  t.apply(env({ kind: "permissionSettled", id: "q#0", outcome: "allowed", answer: "ラーメン" }));
+  assert.equal((t.items[0] as { answer: string }).answer, "ラーメン");
+});
+
+test("snapshot から復元しても決着済みのバブルにボタンは戻らない", () => {
+  const t = fresh();
+  const envelopes = [
+    env({ kind: "permission", id: "t1", toolName: "Bash", input: null }),
+    env({ kind: "permissionSettled", id: "t1", outcome: "discarded", answer: null }),
+  ];
+  t.reset(envelopes);
+  assert.equal(t.items.length, 1);
+  assert.equal((t.items[0] as { settled: string }).settled, "discarded");
+  assert.equal(firstUnsettledPending(t.items), -1);
+});
+
+test("firstUnsettledPending は未応答の先頭を指す（スティッキーバーのジャンプ先）", () => {
+  const t = fresh();
+  t.apply(env({ kind: "permission", id: "a", toolName: "Bash", input: null }));
+  t.apply(env({ kind: "permissionSettled", id: "a", outcome: "allowed", answer: "許可" }));
+  t.apply(env({ kind: "text", text: "続きます", partial: false }));
+  t.apply(env({ kind: "permission", id: "b", toolName: "Edit", input: null }));
+  assert.equal(firstUnsettledPending(t.items), 2);
+});
+
+test("対応するバブルが無い permissionSettled は黙って捨てる（ring 溢れ）", () => {
+  const t = fresh();
+  const change = t.apply(env({ kind: "permissionSettled", id: "zzz", outcome: "allowed", answer: null }));
+  assert.deepEqual(change.touched, []);
+  assert.equal(t.items.length, 0);
+});
+
+test("settledLabel は承認と質問で文面を分ける", () => {
+  assert.equal(settledLabel("allowed", "permission", "許可"), "✅ 許可しました");
+  assert.match(settledLabel("allowed", "question", "ラーメン"), /ラーメン/);
+  assert.equal(settledLabel("denied", "permission", null), "⛔ 拒否しました");
+  assert.match(settledLabel("discarded", "question", null), /破棄/);
 });

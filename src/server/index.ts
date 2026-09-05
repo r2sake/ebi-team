@@ -650,6 +650,15 @@ const controlApi = createControlApi({
     return chatAttachments.save(bytes, mediaType);
   },
   readChatAttachment: async (name) => (masterSession ? chatAttachments.read(name) : null),
+  // 承認/質問（PR-M5）。claude の --permission-prompt-tool → 制御MCP → ここ。
+  // ボスが UI で答えるまで resolve しない（未応答は待ち続ける・自動拒否しない）。
+  requestChatPermission: async (req, signal) => {
+    if (!masterSession) throw new Error('承認 UI は ui:"chat" の master が居るときだけ使えます');
+    return masterSession.handlePermissionRequest(
+      { toolName: req.toolName, input: req.input, toolUseId: req.toolUseId },
+      signal,
+    );
+  },
 });
 
 /** HTML を期待するリクエスト（ブラウザ遷移）かを Accept ヘッダで大まかに判定する。 */

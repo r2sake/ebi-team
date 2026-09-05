@@ -15,8 +15,14 @@
 //  - 本文に `rate:<5h の割合>,<週次の割合>` が含まれていたら `rate_limit_event` を 1 本出す
 //    （utilization は 0〜1 の割合。src/server/master/rateLimit.ts の実測どおり）
 //  - `{"type":"control_request",...interrupt}` には control_response を返す
+//  - 本文に `perm:<ツール名>:<コマンド>` があれば、tool_use を出したうえで
+//    `POST $EBI_CONTROL_URL/control/chat-permission` を叩き、**応答が返るまでターンを止める**
+//    （実 claude の --permission-prompt-tool → 制御MCP → 制御API と同じ経路を叩く。
+//     違うのは「MCP ブリッジを挟まない」ことだけ）
+//  - 本文に `ask:<質問>|<選択肢1>,<選択肢2>` があれば AskUserQuestion の承認要求を同じ口へ出し、
+//    返ってきた `updatedInput.answers` を tool_result にして復唱する
 //
-// 実 claude を模すのはここまで（ツール実行・承認・partial は出さない）。
+// 実 claude を模すのはここまで（partial は出さない）。
 
 import { createInterface } from "node:readline";
 
@@ -43,11 +49,89 @@ function textOf(content) {
   return content.map((b) => (b && b.type === "text" && typeof b.text === "string" ? b.text : "")).join("");
 }
 
+const CONTROL_URL = (process.env.EBI_CONTROL_URL ?? "http://127.0.0.1:8787").replace(/\/$/, "");
+
+/** 承認要求を制御API へ投げ、決定（{behavior,...}）が返るまで待つ。 */
+async function askPermission(toolName, input, toolUseId) {
+  const res = await fetch(`${CONTROL_URL}/control/chat-permission`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tool_name: toolName, input, tool_use_id: toolUseId }),
+  });
+  if (!res.ok) return { behavior: "deny", message: `HTTP ${res.status}` };
+  return res.json();
+}
+
+let toolSeq = 0;
+// プロセスを跨いで id が衝突しないように pid を混ぜる（実 claude の tool_use_id も一意）。
+const nextToolId = () => `toolu_fake_${process.pid}_${++toolSeq}`;
+
+/** 承認が要るツール実行 1 回分（tool_use → 承認待ち → tool_result）。 */
+async function runPermissionedTool(toolName, command) {
+  const id = nextToolId();
+  out({
+    type: "assistant",
+    message: {
+      role: "assistant",
+      model: MODEL,
+      content: [{ type: "tool_use", id, name: toolName, input: { command } }],
+    },
+  });
+  const decision = await askPermission(toolName, { command }, id);
+  const allowed = decision?.behavior === "allow";
+  out({
+    type: "user",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: id,
+          is_error: !allowed,
+          content: allowed ? `実行しました: ${command}` : `拒否されました: ${decision?.message ?? ""}`,
+        },
+      ],
+    },
+  });
+  return allowed;
+}
+
+/** AskUserQuestion 1 回分（tool_use → 回答待ち → tool_result）。 */
+async function runAskUserQuestion(question, options) {
+  const id = nextToolId();
+  const input = {
+    questions: [
+      { question, header: "確認", multiSelect: false, options: options.map((label) => ({ label })) },
+    ],
+  };
+  out({ type: "assistant", message: { role: "assistant", model: MODEL, content: [{ type: "tool_use", id, name: "AskUserQuestion", input }] } });
+  const decision = await askPermission("AskUserQuestion", input, id);
+  const answers = decision?.behavior === "allow" ? (decision.updatedInput?.answers ?? {}) : {};
+  const answer = answers[question];
+  out({
+    type: "user",
+    message: {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: id,
+          is_error: false,
+          content: answer
+            ? `Your questions have been answered: "${question}"="${answer}".`
+            : "The user did not answer the questions.",
+        },
+      ],
+    },
+  });
+  return answer ?? null;
+}
+
 let costTotal = 0;
 // 直近の文脈% を保持する（`ctx:` の指定が無いターンは前回値を維持＝単調に見せる）。
 let lastPct = Number(process.env.FAKE_CLAUDE_INITIAL_CTX_PCT ?? 1);
 
-function turn(text) {
+async function turn(text) {
   // 1) replay ACK（--replay-user-messages 相当）。MasterSession の send() が待っている。
   out({ type: "user", isReplay: true, message: { role: "user", content: [{ type: "text", text }] } });
 
@@ -65,6 +149,19 @@ function turn(text) {
     });
   }
 
+  // 2.5) 承認が要るツール / 質問（PR-M5）。応答が返るまでここでターンが止まる。
+  const notes = [];
+  const perm = /perm:([A-Za-z_]+):([^\n]+)/.exec(text);
+  if (perm) {
+    const allowed = await runPermissionedTool(perm[1], perm[2].trim());
+    notes.push(allowed ? "TOOL_RAN" : "TOOL_BLOCKED");
+  }
+  const ask = /ask:([^|\n]+)\|([^\n]+)/.exec(text);
+  if (ask) {
+    const answer = await runAskUserQuestion(ask[1].trim(), ask[2].split(",").map((s) => s.trim()));
+    notes.push(answer ? `ANSWER=${answer}` : "NO_ANSWER");
+  }
+
   // 3) assistant 本文 + message.usage（文脈占有量の唯一の供給源）。
   const m = /ctx:([0-9.]+)/.exec(text);
   if (m) lastPct = Number(m[1]);
@@ -75,7 +172,7 @@ function turn(text) {
     message: {
       role: "assistant",
       model: MODEL,
-      content: [{ type: "text", text: `了解（ctx ${pct}%）` }],
+      content: [{ type: "text", text: `了解（ctx ${pct}%）${notes.length > 0 ? ` ${notes.join(" ")}` : ""}` }],
       usage: {
         input_tokens: contextTokens,
         output_tokens: 10,
@@ -97,6 +194,9 @@ function turn(text) {
   });
 }
 
+// ターンは 1 本ずつ直列に回す（承認待ちで await するため、後続行が割り込むと順序が壊れる）。
+let chain = Promise.resolve();
+
 const rl = createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   let raw;
@@ -110,6 +210,9 @@ rl.on("line", (line) => {
     return;
   }
   if (raw?.type !== "user") return;
-  turn(textOf(raw.message?.content));
+  const text = textOf(raw.message?.content);
+  chain = chain.then(() => turn(text)).catch((err) => {
+    process.stderr.write(`fake-claude: ターンで例外: ${err?.message ?? err}\n`);
+  });
 });
 rl.on("close", () => process.exit(0));

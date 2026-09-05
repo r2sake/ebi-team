@@ -28,6 +28,10 @@ import {
   type MasterBrainId,
   type MasterEvent,
 } from "./brain.ts";
+import type {
+  MasterPermissionDecision,
+  MasterPermissionRequest,
+} from "./permission.ts";
 import { ChatLog } from "./chatLog.ts";
 import { createMasterBrain } from "./index.ts";
 import { parseRateLimitEvent } from "./rateLimit.ts";
@@ -179,6 +183,8 @@ export function toChatEvent(ev: MasterEvent, totalCostUsd: number | null): Maste
         totalCostUsd,
         errorText: ev.errorText,
       };
+    case "permissionSettled":
+      return { kind: "permissionSettled", id: ev.id, outcome: ev.outcome, answer: ev.answer };
     case "notice":
       return { kind: "notice", level: ev.level, text: ev.text };
     case "exit":
@@ -189,6 +195,25 @@ export function toChatEvent(ev: MasterEvent, totalCostUsd: number | null): Maste
       return null;
     }
   }
+}
+
+/**
+ * 会話ログの中で**まだ決着していない**承認/質問の id を古い順に返す純関数。
+ *
+ * サーバ再起動でトランスクリプトを復元したときに使う。保留は頭脳プロセスと
+ * 運命を共にするので、復元された保留は例外なく「破棄」になる。
+ */
+export function unsettledRequestIds(envelopes: readonly MasterChatEnvelope[]): string[] {
+  // **id は会話を跨いで再利用されうる**（頭脳プロセスが入れ替わると tool_use_id の採番が
+  // 振り出しに戻る）。したがって「一度でも settled が出たか」ではなく
+  // **その id の最後のイベントがどちらか**で判定する。
+  const open = new Map<string, boolean>();
+  for (const env of envelopes) {
+    const ev = env.event;
+    if (ev.kind === "permission" || ev.kind === "question") open.set(ev.id, true);
+    else if (ev.kind === "permissionSettled") open.set(ev.id, false);
+  }
+  return [...open.entries()].filter(([, isOpen]) => isOpen).map(([id]) => id);
 }
 
 /** chat 配送（reply_to_master / reverse-inject）1 件分の入力。 */
@@ -281,6 +306,11 @@ export class MasterSession {
         // 上限ちょうど読めた＝それより前がまだファイルに残っている可能性がある。
         this.truncated = past.length >= this.snapshotLimit;
         this.seq = Math.max(...past.map((e) => e.seq));
+        // 前回のプロセスが抱えていた承認/質問は**もう答えられない**（MCP ツール呼び出しごと
+        // 消えている）。UI が永久にボタンを出したままにならないよう破棄として畳む。
+        for (const id of unsettledRequestIds(this.ring)) {
+          this.emit({ kind: "permissionSettled", id, outcome: "discarded", answer: null });
+        }
       }
     }
     await this.launch(null);
@@ -387,6 +417,13 @@ export class MasterSession {
       case "question": {
         this.pending += 1;
         this.setState("waiting");
+        break;
+      }
+      case "permissionSettled": {
+        if (this.pending > 0) this.pending -= 1;
+        // 保留が解けたらターンの実行へ戻る。**waiting のときだけ**動かす
+        //（exit → discardAll の順で来たときに stopped を busy へ上書きしないため）。
+        if (this.stateValue === "waiting") this.setState(this.pending > 0 ? "waiting" : "busy");
         break;
       }
       case "notice": {
@@ -523,8 +560,15 @@ export class MasterSession {
     await this.brain?.interrupt();
   }
 
-  /** 承認/質問への応答（PR-M5 で実装）。 */
-  async answer(requestId: string, decision: { allow?: boolean; choice?: string[]; text?: string }): Promise<void> {
+  /**
+   * 承認/質問への応答（WS `chatAnswer`）。
+   * pending の増減と状態遷移は **`permissionSettled` イベント側**で行う
+   *（破棄・中断でも同じ経路を通るので、ここで先に引くと二重に減る）。
+   */
+  async answer(
+    requestId: string,
+    decision: { allow?: boolean; choice?: string[]; text?: string },
+  ): Promise<void> {
     const brain = this.brain;
     if (!brain) throw new Error("master（chat）が起動していません");
     await brain.answer(requestId, {
@@ -532,8 +576,26 @@ export class MasterSession {
       ...(decision.choice === undefined ? {} : { choice: decision.choice }),
       ...(decision.text === undefined ? {} : { note: decision.text }),
     });
-    if (this.pending > 0) this.pending -= 1;
-    this.setState(this.pending > 0 ? "waiting" : "busy");
+  }
+
+  /**
+   * `--permission-prompt-tool`（制御MCP の permission_prompt → `POST /control/chat-permission`）
+   * から届いた承認要求。**ボスが答えるまで resolve しない**（自動拒否しない・裁定どおり）。
+   * signal は HTTP 接続の切断（claude 側がツール呼び出しを諦めた）で発火する。
+   */
+  async handlePermissionRequest(
+    req: MasterPermissionRequest,
+    signal?: AbortSignal,
+  ): Promise<MasterPermissionDecision> {
+    const brain = this.brain;
+    if (!brain) return { behavior: "deny", message: "master（chat）が起動していません" };
+    if (!brain.requestPermission) {
+      return {
+        behavior: "deny",
+        message: `頭脳（${this.opts.brainId}）は承認 UI に対応していません`,
+      };
+    }
+    return brain.requestPermission(req, signal);
   }
 
   /**

@@ -27,6 +27,13 @@ import {
   evaluateMasterPreflight,
 } from "./claudeArgs.ts";
 import { ClaudeStreamNormalizer, parseNdjsonLine } from "./claudeEvents.ts";
+import {
+  MASTER_PERMISSION_PROMPT_TOOL,
+  PermissionBroker,
+  type MasterAnswer,
+  type MasterPermissionDecision,
+  type MasterPermissionRequest,
+} from "./permission.ts";
 
 /** claude 頭脳が実装できる機能（設計書 §3.2 の射影表 claude 列）。 */
 export const CLAUDE_BRAIN_CAPABILITIES: MasterBrainCapabilities = {
@@ -62,6 +69,11 @@ export interface ClaudeHeadlessBrainOptions {
   /** `--include-partial-messages` を付けるか（既定 false・PR-M3 で true にする）。 */
   includePartialMessages?: boolean;
   ackTimeoutMs?: number;
+  /**
+   * `--permission-prompt-tool` に渡す MCP ツール名（既定 mcp__ebi-control__permission_prompt）。
+   * **`--mcp-config` を渡すときだけ**引数に載る（無いと claude が起動時に即死する）。
+   */
+  permissionPromptTool?: string | null;
   /** プロセスを跨いだコスト累計のレジャ（resume を挟む運用で共有する）。 */
   costLedger?: MasterCostLedger;
   /**
@@ -95,6 +107,32 @@ export class ClaudeHeadlessBrain implements MasterBrain {
   /** 起動ごとに変わるキー（コスト累計をプロセス単位で持つため）。 */
   private processKey = "";
   private startedArgs: readonly string[] = [];
+  /**
+   * 承認 / 質問の保留台帳（PR-M5）。
+   * **プロセスを跨いで生かさない**（プロセスが死んだら保留は破棄する）が、
+   * ブローカ自体はインスタンス寿命で持つ（stop → start の間に要求は来ない）。
+   */
+  private readonly broker = new PermissionBroker({
+    onPermission: (ev) =>
+      this.emit({ kind: "permission", id: ev.id, toolName: ev.toolName, input: ev.input }),
+    onQuestion: (ev) =>
+      this.emit({
+        kind: "question",
+        id: ev.id,
+        header: ev.header,
+        question: ev.question,
+        options: ev.options,
+        multi: ev.multi,
+      }),
+    onSettled: (ev) =>
+      this.emit({
+        kind: "permissionSettled",
+        id: ev.id,
+        outcome: ev.outcome,
+        answer: ev.answer,
+      }),
+    onNotice: (text) => this.emit({ kind: "notice", level: "warn", text }),
+  });
 
   constructor(private readonly opts: ClaudeHeadlessBrainOptions = {}) {
     this.costLedger = opts.costLedger ?? new MasterCostLedger();
@@ -119,6 +157,10 @@ export class ClaudeHeadlessBrain implements MasterBrain {
       mcpConfigPath: startOpts.mcpConfigPath,
       resumeSessionId: startOpts.resumeSessionId,
       includePartialMessages: this.opts.includePartialMessages === true,
+      // 承認ツールは MCP 経由でしか解決できないので、--mcp-config があるときだけ付ける。
+      permissionPromptTool: startOpts.mcpConfigPath
+        ? (this.opts.permissionPromptTool ?? MASTER_PERMISSION_PROMPT_TOOL)
+        : null,
       extraArgs: startOpts.extraArgs,
     });
     const parentEnv = this.opts.parentEnv ?? process.env;
@@ -212,13 +254,31 @@ export class ClaudeHeadlessBrain implements MasterBrain {
     };
   }
 
-  async answer(
-    _id: string,
-    _decision: { allow?: boolean; choice?: string[]; note?: string },
-  ): Promise<void> {
-    // 承認/質問の応答は `--permission-prompt-tool`（ebi-control の approve ツール）と
-    // AskUserQuestion の tool_result 返送が要る。配線は PR-M5。
-    throw new Error("承認/質問への応答は未配線です（PR-M5 で実装）");
+  /**
+   * `--permission-prompt-tool`（制御MCP の permission_prompt）から届いた承認要求。
+   * **ボスが答えるまで resolve しない**（未応答は待ち続ける・自動拒否しない）。
+   * signal は HTTP 接続の切断＝claude 側がツール呼び出しを諦めた合図。
+   */
+  requestPermission(
+    req: MasterPermissionRequest,
+    signal?: AbortSignal,
+  ): Promise<MasterPermissionDecision> {
+    if (this.closed) return Promise.resolve({ behavior: "deny", message: "master プロセスが停止しています" });
+    return this.broker.request(req, signal);
+  }
+
+  /** 未応答の承認/質問の件数。 */
+  get pendingPermissions(): number {
+    return this.broker.pendingCount;
+  }
+
+  /**
+   * 承認 / 質問への応答（WS `chatAnswer` → MasterSession → ここ）。
+   * 応答は stdin ではなく **保留中の MCP ツール呼び出しの戻り値**として claude へ返る
+   *（PR-M5 実測。設計書 §0.6-N）。
+   */
+  async answer(id: string, decision: MasterAnswer): Promise<void> {
+    this.broker.answer(id, decision);
   }
 
   /**
@@ -346,6 +406,9 @@ export class ClaudeHeadlessBrain implements MasterBrain {
 
   private finish(): void {
     if (this.closed) return;
+    // 保留は**プロセスと運命を共にする**（次のプロセスへ引き継がない）。
+    // closed を立てる前に畳むので、破棄イベントはまだイベント列に載る。
+    this.broker.discardAll("頭脳プロセスが終了しました");
     this.closed = true;
     this.rl?.close();
     this.rl = null;

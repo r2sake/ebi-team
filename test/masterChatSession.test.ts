@@ -75,7 +75,10 @@ class FakeBrain implements MasterBrain {
       },
     };
   }
-  answer(): Promise<void> {
+  /** answer() に渡ってきた引数（PR-M5 の応答経路の検証用）。 */
+  readonly answered: { id: string; decision: unknown }[] = [];
+  answer(id: string, decision: unknown): Promise<void> {
+    this.answered.push({ id, decision });
     return Promise.resolve();
   }
   interrupt(): Promise<void> {
@@ -536,4 +539,82 @@ test("添付なしの発話は本文をそのまま送る（既存経路をい�
   assert.equal(input.images, undefined);
   const ev = h.events[0]!.event;
   assert.equal(ev.kind === "user" && ev.attachments, undefined);
+});
+
+// ===== 承認 / 質問（PR-M5）=====
+
+test("permission が来ると waiting になり、settled で busy へ戻る（pending の増減）", async () => {
+  const h = makeSession();
+  await h.session.start();
+  const brain = h.brains[0]!;
+  await h.session.sendUserText("やって");
+  assert.equal(h.session.state, "busy");
+
+  brain.emit({ kind: "permission", id: "t1", toolName: "Bash", input: { command: "rm -f x" } });
+  await waitEvents(h, h.events.length + 1);
+  assert.equal(h.session.state, "waiting");
+  assert.equal(h.session.pendingCount, 1);
+
+  brain.emit({ kind: "permissionSettled", id: "t1", outcome: "allowed", answer: "許可" });
+  await waitEvents(h, h.events.length + 1);
+  assert.equal(h.session.pendingCount, 0);
+  assert.equal(h.session.state, "busy", "承認が済んだらターンの実行へ戻る");
+  await h.session.stop();
+});
+
+test("answer() は brain へそのまま委譲し、pending は settled イベント側でだけ減る", async () => {
+  const h = makeSession();
+  await h.session.start();
+  const brain = h.brains[0]!;
+  brain.emit({ kind: "question", id: "q#0", header: "H", question: "Q", options: [], multi: true });
+  await waitEvents(h, h.events.length + 1);
+  assert.equal(h.session.pendingCount, 1);
+
+  await h.session.answer("q#0", { choice: ["A"], text: "補足" });
+  assert.deepEqual(brain.answered, [{ id: "q#0", decision: { choice: ["A"], note: "補足" } }]);
+  // brain（＝ブローカ）が settled を出すまで pending は減らない。
+  assert.equal(h.session.pendingCount, 1);
+  brain.emit({ kind: "permissionSettled", id: "q#0", outcome: "allowed", answer: "A, 補足" });
+  await waitEvents(h, h.events.length + 1);
+  assert.equal(h.session.pendingCount, 0);
+  await h.session.stop();
+});
+
+test("exit のあとに破棄が来ても stopped を busy へ上書きしない", async () => {
+  const h = makeSession();
+  await h.session.start();
+  const brain = h.brains[0]!;
+  brain.emit({ kind: "permission", id: "t1", toolName: "Bash", input: null });
+  await waitEvents(h, h.events.length + 1);
+  brain.emit({ kind: "exit", code: 1, signal: null });
+  brain.emit({ kind: "permissionSettled", id: "t1", outcome: "discarded", answer: null });
+  await waitEvents(h, h.events.length + 2);
+  assert.equal(h.session.pendingCount, 0);
+  assert.equal(h.session.state, "stopped");
+  // 自動復帰（scheduleRestart）が走り切ってから止める（既存テストと同じ手順）。
+  await sleep(30);
+  await h.session.stop();
+});
+
+test("handlePermissionRequest は brain へ委譲し、未起動なら deny を返す", async () => {
+  const h = makeSession();
+  const before = await h.session.handlePermissionRequest({
+    toolName: "Bash",
+    input: null,
+    toolUseId: null,
+  });
+  assert.equal(before.behavior, "deny");
+  await h.session.start();
+  // FakeBrain は requestPermission を持たない＝承認 UI 非対応 backend の扱いになる。
+  const unsupported = await h.session.handlePermissionRequest({
+    toolName: "Bash",
+    input: null,
+    toolUseId: null,
+  });
+  assert.equal(unsupported.behavior, "deny");
+  assert.match(
+    (unsupported as { behavior: "deny"; message: string }).message,
+    /承認 UI に対応していません/,
+  );
+  await h.session.stop();
 });

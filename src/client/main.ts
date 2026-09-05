@@ -64,6 +64,7 @@ const chatPanel = new ChatPanel(
     sendMsg({ type: "chatSend", id, text, ...(attachments.length > 0 ? { attachments } : {}) }),
   (id) => sendMsg({ type: "chatStop", id }),
   (id) => sendMsg({ type: "chatNew", id }),
+  (id, requestId, answer) => sendMsg({ type: "chatAnswer", id, requestId, ...answer }),
 );
 
 /** chat モードの master の id（未確定なら null＝従来どおり PTY ペインを出す）。 */

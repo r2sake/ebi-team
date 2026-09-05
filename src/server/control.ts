@@ -185,6 +185,19 @@ export interface ControlDeps {
   readChatAttachment:
     | ((name: string) => Promise<{ bytes: Buffer; mediaType: string; path: string } | null>)
     | null;
+  /**
+   * 承認 / 質問の受け口（`POST /control/chat-permission` の実体・PR-M5）。
+   *
+   * claude の `--permission-prompt-tool` から制御MCP 経由で呼ばれる。**ボスが UI で答えるまで
+   * resolve しない**（未応答は待ち続ける・自動拒否しない）ので、この Promise は数分〜無限に
+   * 保留されうる。chat master が居ない構成では null にしておき、404 を返す。
+   */
+  requestChatPermission:
+    | ((
+        req: { toolName: string; input: unknown; toolUseId: string | null },
+        signal: AbortSignal,
+      ) => Promise<unknown>)
+    | null;
 }
 
 /** JSON レスポンスを返すヘルパー。 */
@@ -617,6 +630,36 @@ export function createControlApi(deps: ControlDeps) {
         const ok = registry.remove(id);
         broadcastRegistry();
         sendJson(res, ok ? 200 : 500, ok ? { id, killed: true } : { error: "kill に失敗しました" });
+        return true;
+      }
+
+      // ---- POST /control/chat-permission ----
+      // claude の承認プロンプト（--permission-prompt-tool）の受け口。制御MCP の
+      // permission_prompt ツールがこれを叩き、**ボスが答えるまで応答を返さない**。
+      // 返す JSON はそのまま claude が読む決定（{behavior:"allow"|"deny", ...}）。
+      if (pathname === "/control/chat-permission" && method === "POST") {
+        if (!deps.requestChatPermission) {
+          sendJson(res, 404, { error: '承認 UI は ui:"chat" の master が居るときだけ使えます' });
+          return true;
+        }
+        const body = await readJsonBody(req);
+        const toolName = asString(body.tool_name);
+        if (!toolName) {
+          sendJson(res, 400, { error: "tool_name は必須です" });
+          return true;
+        }
+        // 接続が切れたら（claude 側がツール呼び出しを諦めた）保留を畳む。
+        // req ではなく res の close を見る: req は body を読み切った時点でも close する。
+        const ac = new AbortController();
+        res.on("close", () => {
+          if (!res.writableEnded) ac.abort();
+        });
+        const decision = await deps.requestChatPermission(
+          { toolName, input: body.input ?? null, toolUseId: asString(body.tool_use_id) ?? null },
+          ac.signal,
+        );
+        if (res.writableEnded) return true; // 既に切断済み
+        sendJson(res, 200, decision);
         return true;
       }
 

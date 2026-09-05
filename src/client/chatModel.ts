@@ -45,6 +45,18 @@ export type ChatItem =
       title: string;
       detail: string;
       options: string[];
+      /** 選択肢の補足（質問のみ。options と同じ並び）。 */
+      optionNotes: (string | null)[];
+      /** 複数選択できる質問か（承認は常に false）。 */
+      multi: boolean;
+      /**
+       * 決着（PR-M5）。null なら**まだ答えられる**＝ UI はボタンを出す。
+       * `permissionSettled` イベントで埋まるので、再接続・サーバ再起動のあとでも
+       * snapshot から同じ状態が復元される。
+       */
+      settled: "allowed" | "denied" | "discarded" | null;
+      /** 決着したときに選んだ内容（承認は「許可」/「拒否」）。 */
+      answer: string | null;
     }
   | { kind: "notice"; seq: number; ts: number; level: "info" | "warn" | "error"; text: string }
   | {
@@ -184,6 +196,10 @@ export class ChatTranscript {
           title: `承認が必要: ${ev.toolName}`,
           detail: stringifyInput(ev.input),
           options: ev.suggestions ? [...ev.suggestions] : [],
+          optionNotes: [],
+          multi: false,
+          settled: null,
+          answer: null,
         });
       case "question":
         this.closeStream();
@@ -196,7 +212,23 @@ export class ChatTranscript {
           title: ev.header || "質問",
           detail: ev.question,
           options: ev.options.map((o) => o.label),
+          optionNotes: ev.options.map((o) => o.description ?? null),
+          multi: ev.multi,
+          settled: null,
+          answer: null,
         });
+      case "permissionSettled": {
+        // 対応する pending バブルを畳む（後ろから探す＝同じ id が再利用されても直近が勝つ）。
+        for (let i = this.items.length - 1; i >= 0; i -= 1) {
+          const item = this.items[i]!;
+          if (item.kind !== "pending" || item.requestId !== ev.id || item.settled != null) continue;
+          item.settled = ev.outcome;
+          item.answer = ev.answer;
+          return { touched: [i], appendedFrom: -1 };
+        }
+        // 対応するバブルを見失った（ring から溢れた等）ときは黙って捨てる。
+        return NO_CHANGE;
+      }
       case "notice":
         this.closeStream();
         return this.push({ kind: "notice", seq, ts, level: ev.level, text: ev.text });
@@ -328,6 +360,27 @@ export function formatCost(usd: number | null): string {
 export function formatContextPct(pct: number | null): string {
   if (pct == null || !Number.isFinite(pct)) return "—";
   return `${Math.round(pct)}%`;
+}
+
+/** 決着した pending バブルの結果ラベル。 */
+export function settledLabel(
+  outcome: "allowed" | "denied" | "discarded",
+  variant: "permission" | "question",
+  answer: string | null,
+): string {
+  switch (outcome) {
+    case "allowed":
+      return variant === "permission" ? "✅ 許可しました" : `✅ 回答しました: ${answer || "（空）"}`;
+    case "denied":
+      return "⛔ 拒否しました";
+    case "discarded":
+      return "🗑 破棄されました（頭脳プロセスが入れ替わったため応答できません）";
+  }
+}
+
+/** 未応答の pending アイテムの index（スティッキーバーのジャンプ先）。 */
+export function firstUnsettledPending(items: readonly ChatItem[]): number {
+  return items.findIndex((it) => it.kind === "pending" && it.settled == null);
 }
 
 /** チャット状態のラベル（ヘッダのバッジ）。 */

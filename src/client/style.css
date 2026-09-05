@@ -1065,16 +1065,50 @@ button:hover { filter: brightness(1.07); }
 .chat-turnend.aborted { color: var(--busy); }
 .chat-turnend.error { color: #e07a7a; }
 
-/* 承認/質問（PR-M5 までボタンは無効）。 */
+/* 承認/質問（PR-M5: 実際に応答を返せる）。 */
 .chat-pending-title { font-weight: 700; font-size: 13px; }
 .chat-pending-detail { font-size: 12px; color: var(--muted); white-space: pre-wrap; margin: 4px 0; }
 .chat-pending-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
 .chat-pending-btn {
   background: var(--panel);
-  color: var(--muted);
+  color: var(--fg);
   border: 1px solid var(--border);
-  cursor: not-allowed;
+  border-radius: 6px;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
 }
+.chat-pending-btn:hover:not(:disabled) { background: var(--panel-2); }
+.chat-pending-btn.allow { border-color: var(--idle); color: var(--idle); }
+.chat-pending-btn.deny { border-color: #e07a7a; color: #e07a7a; }
+.chat-pending-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.chat-pending-settled { font-size: 12px; margin-top: 6px; color: var(--muted); }
+.chat-bubble.pending.settled-allowed .chat-pending-settled { color: var(--idle); }
+.chat-bubble.pending.settled-denied .chat-pending-settled { color: #e07a7a; }
+.chat-bubble.pending.settled-discarded { opacity: 0.7; }
+/* 質問の選択肢フォーム。 */
+.chat-question { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.chat-question-option {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 0;
+}
+.chat-question-label { font-weight: 600; }
+.chat-question-desc { color: var(--muted); font-size: 11px; }
+.chat-question-other {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 12px;
+  margin-top: 4px;
+}
+/* スティッキーバーからジャンプしたときの一瞬のハイライト。 */
+.chat-row.flash .chat-bubble, .chat-bubble.flash { outline: 2px solid var(--busy); }
 
 /* 入力欄（下端固定）。 */
 .chat-foot {
@@ -1088,6 +1122,7 @@ button:hover { filter: brightness(1.07); }
   font-size: 12px;
   color: var(--busy);
   padding: 4px 2px 8px;
+  cursor: pointer;
 }
 .chat-pending-bar[hidden] { display: none; }
 .chat-input-row { display: flex; gap: 8px; align-items: flex-end; }

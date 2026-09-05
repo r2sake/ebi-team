@@ -94,7 +94,7 @@ test("起動前に send / interrupt しても壊れない", async () => {
   await brain.stop();
 });
 
-test("answer は PR-M5 まで明示エラー（黙って握り潰さない）", async () => {
+test("未知の id への answer は明示エラー（黙って握り潰さない）", async () => {
   const brain = new ClaudeHeadlessBrain();
-  await assert.rejects(() => brain.answer("id", { allow: true }), /PR-M5/);
+  await assert.rejects(() => brain.answer("id", { allow: true }), /見つかりません/);
 });

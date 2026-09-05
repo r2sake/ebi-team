@@ -538,6 +538,20 @@ export type MasterChatEvent =
       totalCostUsd: number | null;
       errorText: string | null;
     }
+  /**
+   * 承認/質問 1 件が決着した（PR-M5）。UI はこれを見てボタンを畳み、結果を出す。
+   * - allowed:   許可した（承認）/ 回答した（質問）。answer に選んだ内容が入る
+   * - denied:    拒否した
+   * - discarded: 破棄された（プロセス終了・新しい会話・サーバ再起動）
+   * トランスクリプトに載せているのは、**再接続や再起動のあとでも**決着済みかどうかを
+   * snapshot から復元できるようにするため（chatState.pending は件数しか持たない）。
+   */
+  | {
+      kind: "permissionSettled";
+      id: string;
+      outcome: "allowed" | "denied" | "discarded";
+      answer: string | null;
+    }
   | { kind: "notice"; level: "info" | "warn" | "error"; text: string }
   | { kind: "exit"; code: number | null; signal: string | null };
 
@@ -571,7 +585,14 @@ export interface ChatSendMessage {
   attachments?: ChatAttachment[];
 }
 
-/** 承認/質問への応答（クライアント → サーバ。実配線は PR-M5）。 */
+/**
+ * 承認/質問への応答（クライアント → サーバ）。
+ *
+ * 応答は claude の stdin ではなく、**保留中の `permission_prompt` MCP ツール呼び出しの
+ * 戻り値**として返る（PR-M5 実測・設計書 §0.6-N）。
+ * - 承認（permission）: `allow` の true/false。false のとき `text` は拒否理由になる
+ * - 質問（question）:   `choice`（選んだラベル）と `text`（「その他」の自由入力）
+ */
 export interface ChatAnswerMessage {
   type: "chatAnswer";
   id: string;
