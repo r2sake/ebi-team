@@ -25,6 +25,13 @@ import {
   type BackendId,
   type PermissionMode,
 } from "./backends/index.ts";
+// master 頭脳（MasterBrain）の値域。brain.ts は純粋な型/定数のみ（プロセスを起動しない）なので
+// config から直接 import してよい（master/index.ts 経由にすると spawn 実装まで引き込む）。
+import {
+  DEFAULT_MASTER_BRAIN_ID,
+  MASTER_BRAIN_IDS,
+  type MasterBrainId,
+} from "./master/brain.ts";
 
 // permission-mode の語彙は backends/types.ts（バックエンド非依存の抽象語彙）が SoT。
 // 既存の import 元（roles.ts / index.ts / control-server.ts 等）を壊さないよう再エクスポートする。
@@ -70,6 +77,17 @@ interface RawFixedEbi {
    * 自セッションに ebi-control channel を登録しない＝notification が黙って捨てられる場合に使う）。
    */
   notifySubscribe?: unknown;
+  /**
+   * master の UI 方式（"terminal" | "chat"。既定 "terminal" ＝現行の PTY 経路）。
+   * "chat" のとき PTY を一切起動せず MasterSession（ヘッドレス頭脳）で動かす。
+   * 設計書 docs/design/master-chat-ui-2026-09-05.md §6.1。env EBI_MASTER_UI で上書きできる。
+   */
+  ui?: unknown;
+  /**
+   * master の頭脳（MasterBrain）id。未指定は "claude"（ボス裁定 Q-1: 既定は claude）。
+   * ui:"chat" のときだけ意味を持つ。
+   */
+  brain?: unknown;
 }
 
 interface RawConfig {
@@ -224,12 +242,31 @@ export async function loadBackendSettings(configPath: string): Promise<BackendSe
   }
 }
 
+/** master の UI 方式。既定は terminal（現行の PTY 経路と完全に同一）。 */
+export type MasterUiMode = "terminal" | "chat";
+
+export const MASTER_UI_MODES: readonly MasterUiMode[] = ["terminal", "chat"];
+
 /** 正規化済みの固定エビ定義。サーバが spawn にそのまま使える形。 */
 export interface FixedEbiSpec {
   id: string;
   kind: AgentKind;
   /** 起動に使う実パラメータ（command/args/cwd/model 展開済み）。 */
   launch: LaunchParams;
+  /**
+   * UI 方式（master 専用・既定 "terminal"）。
+   * "chat" のときサーバは PTY を起動せず MasterSession を作る（設計書 §6.1）。
+   */
+  ui: MasterUiMode;
+  /** master 頭脳の id（ui:"chat" のときのみ使用。既定 "claude"）。 */
+  brain: MasterBrainId;
+  /**
+   * 抽象 permissionMode（launch.args にも焼かれているが、chat モードは args を通さず
+   * MasterBrain へ直接渡すため、正規化済みの値をここにも持つ）。
+   */
+  permissionMode: PermissionMode;
+  /** config の args（$EBI_TEAM 等を展開済み・**方言フラグを付ける前**の生の追加引数）。 */
+  extraArgs: string[];
   /**
    * notification（mailbox 購読）経路で受信するか（既定 true）。
    * false のとき送信側は購読確立を待たず PTY 注入で届ける（受信 PTY 固定）。
@@ -402,6 +439,27 @@ function normalizeOne(raw: RawFixedEbi, configDir: string, defaults: ConfigDefau
       })()
     : DEFAULT_PERMISSION_MODE;
 
+  // ui（master 専用・既定 terminal）。値域外は起動時に落として気づけるよう明示エラーにする。
+  const uiRaw = asString(raw.ui);
+  if (uiRaw !== undefined && !MASTER_UI_MODES.includes(uiRaw as MasterUiMode)) {
+    throw new Error(
+      `固定エビ "${id}" の ui が不正です: ${uiRaw}（許容: ${MASTER_UI_MODES.join(", ")}）`,
+    );
+  }
+  const ui = (uiRaw ?? "terminal") as MasterUiMode;
+  if (ui === "chat" && kind !== "master") {
+    throw new Error(`固定エビ "${id}" の ui:"chat" は kind:"master" のみで使えます`);
+  }
+
+  // brain（master 頭脳・既定 claude）。未実装 id（gemini/agy）は起動時に明示エラーになる。
+  const brainRaw = asString(raw.brain);
+  if (brainRaw !== undefined && !MASTER_BRAIN_IDS.includes(brainRaw as MasterBrainId)) {
+    throw new Error(
+      `固定エビ "${id}" の brain が不正です: ${brainRaw}（許容: ${MASTER_BRAIN_IDS.join(", ")}）`,
+    );
+  }
+  const brain = (brainRaw ?? DEFAULT_MASTER_BRAIN_ID) as MasterBrainId;
+
   const appendSystemPrompt = asString(raw.appendSystemPrompt);
   // args は $EBI_TEAM / $HOME / ~ を展開する（--mcp-config の絶対パス指定を machine 非依存に）。
   const extraArgs = asStringArray(raw.args).map((a) => expandEnv(a, configDir));
@@ -435,6 +493,10 @@ function normalizeOne(raw: RawFixedEbi, configDir: string, defaults: ConfigDefau
   return {
     id,
     kind,
+    ui,
+    brain,
+    permissionMode,
+    extraArgs,
     // 固定エビの backend は **明示指定 > command から解決**（サーバ既定を波及させない）。
     // 理由: 設計上 master は常に claude（統括系を落とさない）で、EBI_BACKEND=codex のような
     // サーバ既定をそのまま master に付けると、claude/bash のプロセスに codex の性質

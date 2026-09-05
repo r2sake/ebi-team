@@ -1,0 +1,382 @@
+// MasterSession（PR-M2）のテスト。**実プロセスは起動しない**（FakeBrain を差し替える）。
+// 実 claude を立てる結合確認は scripts/e2e-master-chat.mjs（既定では走らせない）。
+//
+// 実行: node --import tsx --test test/masterChatSession.test.ts
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+  MasterSession,
+  toChatEvent,
+  type MasterSessionHandlers,
+  type MasterUsageSnapshot,
+} from "../src/server/master/session.ts";
+import type { MasterBrain, MasterBrainInput, MasterEvent } from "../src/server/master/brain.ts";
+import type {
+  MasterChatEnvelope,
+  MasterChatState,
+  UsageRateLimits,
+} from "../src/shared/protocol.ts";
+
+/** 手で MasterEvent を流し込めるブレイン。プロセスも時計も持たない。 */
+class FakeBrain implements MasterBrain {
+  readonly id = "claude" as const;
+  readonly capabilities = {
+    partialText: true,
+    thinking: true,
+    permissionPrompt: true,
+    askUserQuestion: true,
+    interrupt: true,
+    resume: true,
+    cost: true,
+    contextPct: true,
+    images: true,
+  };
+  readonly unsupported = [];
+  pid: number | null = 4242;
+  started: { resumeSessionId: string | null } | null = null;
+  readonly sent: string[] = [];
+  ackResult = true;
+  interrupted = 0;
+  stopped = 0;
+
+  private readonly queue: MasterEvent[] = [];
+  private waiter: ((r: IteratorResult<MasterEvent>) => void) | null = null;
+  private closed = false;
+
+  start(opts: { resumeSessionId: string | null }): Promise<void> {
+    this.started = { resumeSessionId: opts.resumeSessionId };
+    this.closed = false;
+    return Promise.resolve();
+  }
+  send(input: MasterBrainInput): Promise<{ acked: boolean }> {
+    this.sent.push(input.text);
+    return Promise.resolve({ acked: this.ackResult });
+  }
+  events(): AsyncIterable<MasterEvent> {
+    const self = this;
+    return {
+      [Symbol.asyncIterator](): AsyncIterator<MasterEvent> {
+        return {
+          next(): Promise<IteratorResult<MasterEvent>> {
+            const buffered = self.queue.shift();
+            if (buffered) return Promise.resolve({ value: buffered, done: false });
+            if (self.closed) return Promise.resolve({ value: undefined, done: true });
+            return new Promise((resolve) => {
+              self.waiter = resolve;
+            });
+          },
+        };
+      },
+    };
+  }
+  answer(): Promise<void> {
+    return Promise.resolve();
+  }
+  interrupt(): Promise<void> {
+    this.interrupted += 1;
+    return Promise.resolve();
+  }
+  sessionId(): string | null {
+    return null;
+  }
+  stop(): Promise<void> {
+    this.stopped += 1;
+    this.close();
+    return Promise.resolve();
+  }
+
+  /** テストからイベントを流す。 */
+  emit(ev: MasterEvent): void {
+    if (this.waiter) {
+      const w = this.waiter;
+      this.waiter = null;
+      w({ value: ev, done: false });
+      return;
+    }
+    this.queue.push(ev);
+  }
+  close(): void {
+    this.closed = true;
+    if (this.waiter) {
+      const w = this.waiter;
+      this.waiter = null;
+      w({ value: undefined, done: true });
+    }
+  }
+}
+
+interface Harness {
+  session: MasterSession;
+  brains: FakeBrain[];
+  events: MasterChatEnvelope[];
+  states: { state: MasterChatState; pending: number }[];
+  notices: string[];
+  usages: MasterUsageSnapshot[];
+  rateLimits: Partial<UsageRateLimits>[];
+}
+
+function makeSession(opts: { snapshotLimit?: number } = {}): Harness {
+  const brains: FakeBrain[] = [];
+  const h: Omit<Harness, "session" | "brains"> = {
+    events: [],
+    states: [],
+    notices: [],
+    usages: [],
+    rateLimits: [],
+  };
+  const handlers: MasterSessionHandlers = {
+    onEvent: (_id, envelope) => h.events.push(envelope),
+    onState: (_id, state, pending) => h.states.push({ state, pending }),
+    onNotice: (_id, text) => h.notices.push(text),
+    onUsage: (_id, usage) => h.usages.push(usage),
+    onRateLimits: (_id, limits) => h.rateLimits.push(limits),
+    onRegistryChange: () => {},
+  };
+  const session = new MasterSession({
+    id: "master",
+    brainId: "claude",
+    cwd: "/tmp",
+    model: "opus",
+    permissionMode: "auto",
+    systemPrompt: "master の役割",
+    mcpConfigPath: "/tmp/master.mcp.json",
+    extraArgs: [],
+    logPath: null,
+    handlers,
+    ...(opts.snapshotLimit === undefined ? {} : { snapshotLimit: opts.snapshotLimit }),
+    restartPolicy: { baseDelayMs: 5, maxDelayMs: 10, maxConsecutiveFailures: 3, minHealthyMs: 10_000 },
+    createBrain: () => {
+      const b = new FakeBrain();
+      brains.push(b);
+      return b;
+    },
+  });
+  return { session, brains, ...h };
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+/** イベントが n 件たまるまで待つ（タイムアウトしたらそのまま返す）。 */
+async function waitEvents(h: Harness, n: number, ms = 1000): Promise<void> {
+  const until = Date.now() + ms;
+  while (h.events.length < n && Date.now() < until) await sleep(5);
+}
+
+test("toChatEvent: ack は UI へ流さず、その他の kind はワイヤ表現へ写る", () => {
+  assert.equal(toChatEvent({ kind: "ack", text: "x" }, null), null);
+  const text = toChatEvent({ kind: "text", text: "こんにちは", partial: false }, null);
+  assert.deepEqual(text, { kind: "text", text: "こんにちは", partial: false });
+  const end = toChatEvent(
+    { kind: "turnEnd", ok: true, aborted: false, usage: null, costUsd: 0.5, errorText: null },
+    1.25,
+  );
+  assert.deepEqual(end, {
+    kind: "turnEnd",
+    ok: true,
+    aborted: false,
+    usage: null,
+    costUsd: 0.5,
+    totalCostUsd: 1.25,
+    errorText: null,
+  });
+});
+
+test("chatSend → user イベント＋busy、turnEnd で idle へ戻る", async () => {
+  const h = makeSession();
+  await h.session.start();
+  assert.equal(h.session.state, "idle");
+
+  await h.session.sendUserText("こんにちは");
+  assert.equal(h.brains[0]!.sent[0], "こんにちは");
+  assert.equal(h.events[0]!.event.kind, "user");
+  assert.equal(h.session.state, "busy");
+
+  h.brains[0]!.emit({ kind: "text", text: "やあ", partial: false });
+  h.brains[0]!.emit({
+    kind: "turnEnd",
+    ok: true,
+    aborted: false,
+    usage: {
+      input: 10,
+      output: 5,
+      cacheRead: 90,
+      cacheCreation: 0,
+      contextTokens: 100,
+      contextSize: 1_000_000,
+      contextUsedPct: 0.01,
+    },
+    costUsd: 0.02,
+    errorText: null,
+  });
+  await waitEvents(h, 3);
+  assert.equal(h.events[1]!.event.kind, "text");
+  assert.equal(h.events[2]!.event.kind, "turnEnd");
+  assert.equal(h.session.state, "idle");
+  // seq は 1 から単調増加する（再接続時の欠落検出に使う）。
+  assert.deepEqual(h.events.map((e) => e.seq), [1, 2, 3]);
+});
+
+test("turnEnd の usage が UsageStore 供給用に流れ、コストはプロセスを跨いで合算される", async () => {
+  const h = makeSession();
+  await h.session.start();
+  h.brains[0]!.emit({ kind: "session", sessionId: "s1", model: "claude-opus-5", apiKeySource: "none", mcpServers: [{ name: "ebi-control", status: "connected" }], capabilities: [] });
+  h.brains[0]!.emit({
+    kind: "turnEnd",
+    ok: true,
+    aborted: false,
+    usage: {
+      input: 1000,
+      output: 20,
+      cacheRead: 5000,
+      cacheCreation: 100,
+      contextTokens: 6100,
+      contextSize: 1_000_000,
+      contextUsedPct: 0.61,
+    },
+    costUsd: 0.25,
+    errorText: null,
+  });
+  await waitEvents(h, 2);
+  assert.equal(h.usages.length, 1);
+  assert.equal(h.usages[0]!.contextUsedPct, 0.61);
+  assert.equal(h.usages[0]!.contextSize, 1_000_000);
+  assert.equal(h.usages[0]!.tokens.cacheRead, 5000);
+  assert.equal(h.usages[0]!.model, "claude-opus-5");
+  assert.equal(h.session.totalCostUsd, 0.25);
+});
+
+test("ebi-control が connected でなければ notice で知らせる（静かな故障の構造的検出）", async () => {
+  const h = makeSession();
+  await h.session.start();
+  h.brains[0]!.emit({
+    kind: "session",
+    sessionId: "s1",
+    model: "opus",
+    apiKeySource: "none",
+    mcpServers: [{ name: "ebi-control", status: "failed" }],
+    capabilities: [],
+  });
+  await waitEvents(h, 1);
+  assert.ok(h.notices.some((n) => n.includes("ebi-control")), h.notices.join("/"));
+});
+
+test("エビ返信は inbound イベントになり、タグ付き本文が stdin へ載る（PTY 注入を使わない）", async () => {
+  const h = makeSession();
+  await h.session.start();
+  const r = await h.session.deliverFromEbi({
+    from: "ebi-1",
+    message: "実装できました",
+    body: "[reply] 実装できました",
+    kind: "reply",
+  });
+  assert.deepEqual(r, { ok: true, confirmed: true });
+  assert.equal(h.brains[0]!.sent[0], "[reply] 実装できました");
+  const ev = h.events[0]!.event;
+  assert.equal(ev.kind, "inbound");
+  if (ev.kind === "inbound") {
+    // UI には生タグを出さず構造化フィールドへ移す。
+    assert.equal(ev.from, "ebi-1");
+    assert.equal(ev.tag, "reply");
+    assert.equal(ev.text, "実装できました");
+  }
+});
+
+test("ACK が取れなければ confirmed:false を正直に返す（再送はしない）", async () => {
+  const h = makeSession();
+  await h.session.start();
+  h.brains[0]!.ackResult = false;
+  const r = await h.session.deliverFromEbi({
+    from: "ebi-1",
+    message: "報告",
+    body: "[reply] 報告",
+    kind: "reply",
+  });
+  assert.deepEqual(r, { ok: true, confirmed: false });
+  assert.equal(h.brains[0]!.sent.length, 1, "再送していないこと");
+});
+
+test("プロセス死亡 → --resume <sessionId> で自動復帰する（R1）", async () => {
+  const h = makeSession();
+  await h.session.start();
+  h.brains[0]!.emit({
+    kind: "session",
+    sessionId: "sess-abc",
+    model: "opus",
+    apiKeySource: "none",
+    mcpServers: [{ name: "ebi-control", status: "connected" }],
+    capabilities: [],
+  });
+  await waitEvents(h, 1);
+  h.brains[0]!.emit({ kind: "exit", code: 1, signal: null });
+  h.brains[0]!.close();
+
+  const until = Date.now() + 1000;
+  while (h.brains.length < 2 && Date.now() < until) await sleep(5);
+  assert.equal(h.brains.length, 2, "2 本目のプロセスが起動する");
+  assert.equal(h.brains[1]!.started?.resumeSessionId, "sess-abc");
+  assert.equal(h.session.state, "idle");
+  await h.session.stop();
+});
+
+test("停止（stop）後は自動復帰しない", async () => {
+  const h = makeSession();
+  await h.session.start();
+  await h.session.stop();
+  h.brains[0]!.emit({ kind: "exit", code: 0, signal: null });
+  h.brains[0]!.close();
+  await sleep(50);
+  assert.equal(h.brains.length, 1);
+  assert.equal(h.session.state, "stopped");
+});
+
+test("承認/質問が来ると waiting になり pending が立つ", async () => {
+  const h = makeSession();
+  await h.session.start();
+  h.brains[0]!.emit({
+    kind: "question",
+    id: "q1#0",
+    header: "確認",
+    question: "進めてよいですか",
+    options: [{ label: "はい" }],
+    multi: false,
+  });
+  await waitEvents(h, 1);
+  assert.equal(h.session.state, "waiting");
+  assert.equal(h.session.pendingCount, 1);
+  // 未応答の間はボスの発話でも busy へ落とさない（スティッキーバーの前提）。
+  await h.session.sendUserText("まって");
+  assert.equal(h.session.state, "waiting");
+});
+
+test("snapshot は seq 昇順で返し、リングから溢れたら hasMore が立つ", async () => {
+  const h = makeSession({ snapshotLimit: 3 });
+  await h.session.start();
+  for (let i = 0; i < 5; i++) await h.session.sendUserText(`m${i}`);
+  const snap = h.session.snapshot();
+  assert.equal(snap.events.length, 3);
+  assert.deepEqual(snap.events.map((e) => e.seq), [3, 4, 5]);
+  assert.equal(snap.hasMore, true);
+  // before 指定でその seq より前だけを返す。
+  const older = h.session.snapshot({ before: 4 });
+  assert.deepEqual(older.events.map((e) => e.seq), [3]);
+});
+
+test("registry 用の合成レコードは master/pinned で、状態を idle/busy に写す", async () => {
+  const h = makeSession();
+  await h.session.start();
+  const rec = h.session.record();
+  assert.equal(rec.kind, "master");
+  assert.equal(rec.pinned, true);
+  assert.equal(rec.status, "idle");
+  assert.equal(rec.pid, 4242);
+  assert.equal(rec.backend, "claude");
+  await h.session.sendUserText("やあ");
+  assert.equal(h.session.record().status, "busy");
+});
+
+test("chatStop は brain.interrupt() を呼ぶ（SIGINT ではない）", async () => {
+  const h = makeSession();
+  await h.session.start();
+  await h.session.interrupt();
+  assert.equal(h.brains[0]!.interrupted, 1);
+});

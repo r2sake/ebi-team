@@ -16,6 +16,9 @@ import type { ControlMcpSpec, PermissionMode } from "../backends/types.ts";
 /** master の頭脳として使える CLI の識別子。 */
 export type MasterBrainId = "claude" | "codex" | "gemini" | "agy";
 
+/** master 頭脳として config に書ける id の全集合（値域検証の SoT）。 */
+export const MASTER_BRAIN_IDS: readonly MasterBrainId[] = ["claude", "codex", "gemini", "agy"];
+
 /**
  * 実装済みの MasterBrain（未実装 id を黙って claude に落とさないための SoT）。
  * PR-M1 時点では claude のみ。codex は interface + stub まで（ボス裁定 Q-1 の opt-in・PR-M8 で実装）。
@@ -149,6 +152,8 @@ export interface MasterBrain {
   interrupt(): Promise<void>;
   /** 再開に必要な id（プロセス死亡後の resume 用に呼び出し側が永続化する）。 */
   sessionId(): string | null;
+  /** 子プロセスの pid（未起動なら null）。registry 表示に使う。 */
+  readonly pid: number | null;
   /** 終了。 */
   stop(): Promise<void>;
   /** この backend が実装できない機能（UI が事前に灰色表示するため）。 */

@@ -270,7 +270,11 @@ export type ClientMessage =
   | SummarizeMessage
   | CloseViewerMessage
   | ListDirMessage
-  | OpenViewerMessage;
+  | OpenViewerMessage
+  | ChatSendMessage
+  | ChatAnswerMessage
+  | ChatStopMessage
+  | ChatHistoryMessage;
 
 // ===== サーバ → クライアント =====
 
@@ -439,4 +443,161 @@ export type ServerMessage =
   | CapabilitiesMessage
   | UsageMessage
   | ViewersMessage
-  | DirListingMessage;
+  | DirListingMessage
+  | ChatEventMessage
+  | ChatSnapshotMessage
+  | ChatStateMessage;
+
+// ===== master チャット UI（ui:"chat"）のプロトコル =====
+//
+// 設計書: docs/design/master-chat-ui-2026-09-05.md §5.4（r3）
+//
+// サーバ内部の MasterEvent（src/server/master/brain.ts）と 1:1 で対応する**ワイヤ表現**。
+// shared はランタイム依存も server 型依存も持たない規約なので、union をここに写像として
+// 定義し、サーバ側 `toChatEvent()` が exhaustive switch（漏れをコンパイルエラーにする）で
+// 変換する。ワイヤ側にしか無い kind が 2 つある:
+//  - `user`:    ボスがチャット欄から送った発話（再接続時の復元に必要）
+//  - `inbound`: エビからの reply_to_master / idle 通知（`deliveryTag` を剥がして構造化）
+
+/** チャット UI に出す usage（MasterUsage のワイヤ表現）。 */
+export interface MasterChatUsage {
+  input: number | null;
+  output: number | null;
+  cacheRead: number | null;
+  cacheCreation: number | null;
+  /** 文脈占有トークン（input + cacheRead + cacheCreation）。 */
+  contextTokens: number | null;
+  /** 文脈窓（分母）。 */
+  contextSize: number | null;
+  /** 文脈使用率(%)。算出できない backend は null（UI は「—（未対応）」）。 */
+  contextUsedPct: number | null;
+}
+
+/** チャット 1 イベント（サーバ内部 MasterEvent ＋ user / inbound）。 */
+export type MasterChatEvent =
+  | {
+      kind: "session";
+      sessionId: string;
+      model: string | null;
+      apiKeySource: string | null;
+      mcpServers: { name: string; status: string }[];
+      capabilities: string[];
+    }
+  | { kind: "user"; text: string }
+  | {
+      kind: "inbound";
+      /** 送信元エビ id。 */
+      from: string;
+      /** 配送種別（[reply]/[idle] タグは剥がしてここへ移す）。 */
+      tag: "reply" | "idle" | "message";
+      text: string;
+    }
+  | { kind: "text"; text: string; partial: boolean }
+  | { kind: "thinking"; text: string; partial: boolean }
+  | { kind: "toolCall"; id: string; name: string; input: unknown }
+  | { kind: "toolResult"; id: string; ok: boolean; content: string }
+  | { kind: "permission"; id: string; toolName: string; input: unknown; suggestions?: string[] }
+  | {
+      kind: "question";
+      id: string;
+      header: string;
+      question: string;
+      options: { label: string; description?: string }[];
+      multi: boolean;
+    }
+  | {
+      kind: "turnEnd";
+      ok: boolean;
+      /** ユーザー中断か（true のとき UI は「中断しました」を出しエラー扱いしない）。 */
+      aborted: boolean;
+      usage: MasterChatUsage | null;
+      /** このプロセスの累積コスト(USD)。resume で 0 に戻る。 */
+      costUsd: number | null;
+      /** プロセスを跨いだ会話としての累計コスト(USD)。 */
+      totalCostUsd: number | null;
+      errorText: string | null;
+    }
+  | { kind: "notice"; level: "info" | "warn" | "error"; text: string }
+  | { kind: "exit"; code: number | null; signal: string | null };
+
+/** seq / ts を付けた配信単位。seq は master セッション内で単調増加（欠落検出用）。 */
+export interface MasterChatEnvelope {
+  seq: number;
+  ts: number;
+  event: MasterChatEvent;
+}
+
+/**
+ * チャット master の状態。
+ * - starting: プロセス起動中（まだ 1 通目を受け付けられない）
+ * - idle:     待機中（発話を受け付けられる）
+ * - busy:     ターン実行中
+ * - waiting:  未応答の承認/質問がある（PR-M5 で実際に立つ）
+ * - stopped:  プロセスが落ちている（自動 --resume 復帰の待機中を含む）
+ */
+export type MasterChatState = "starting" | "idle" | "busy" | "waiting" | "stopped";
+
+/** master へ発話する（クライアント → サーバ）。 */
+export interface ChatSendMessage {
+  type: "chatSend";
+  /** master の agent id（既定 "master"）。 */
+  id: string;
+  text: string;
+}
+
+/** 承認/質問への応答（クライアント → サーバ。実配線は PR-M5）。 */
+export interface ChatAnswerMessage {
+  type: "chatAnswer";
+  id: string;
+  /** permission / question イベントの id。 */
+  requestId: string;
+  allow?: boolean;
+  choice?: string[];
+  text?: string;
+}
+
+/** 実行中ターンの中断（クライアント → サーバ）。 */
+export interface ChatStopMessage {
+  type: "chatStop";
+  id: string;
+}
+
+/** 過去ログのページング要求（クライアント → サーバ）。 */
+export interface ChatHistoryMessage {
+  type: "chatHistory";
+  id: string;
+  /** この seq より前を返す（未指定なら最新から）。 */
+  before?: number;
+  /** 最大件数（既定 200・上限はサーバ側で clamp）。 */
+  limit?: number;
+}
+
+/** チャットイベント 1 件の配信（サーバ → クライアント）。 */
+export interface ChatEventMessage {
+  type: "chatEvent";
+  id: string;
+  seq: number;
+  ts: number;
+  event: MasterChatEvent;
+}
+
+/**
+ * 会話の一括復元（サーバ → クライアント）。
+ * 接続直後と `chatHistory` への応答で送る。events は seq 昇順。
+ * hasMore=true なら先頭 seq より前にまだログがある（`chatHistory` の before で辿れる）。
+ */
+export interface ChatSnapshotMessage {
+  type: "chatSnapshot";
+  id: string;
+  events: MasterChatEnvelope[];
+  hasMore: boolean;
+}
+
+/** チャット master の状態通知（サーバ → クライアント）。 */
+export interface ChatStateMessage {
+  type: "chatState";
+  id: string;
+  state: MasterChatState;
+  /** 未応答の承認/質問の件数（「待機 N 件」ではない。busy 中の投入はキューされない）。 */
+  pending: number;
+}

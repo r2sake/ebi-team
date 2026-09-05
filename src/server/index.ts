@@ -43,12 +43,19 @@ import {
   DEFAULT_PERMISSION_MODE,
   EMPTY_BACKEND_SETTINGS,
   type BackendSettings,
+  type FixedEbiSpec,
 } from "./config.ts";
 import { EBI_ROLES, resolveRole, registerCustomRoles, unknownRoleError } from "./roles.ts";
 import { isRunningFromSrc, mcpConfigPathFor, type McpConfigRole } from "./mcpConfigPath.ts";
 import { needsPreflight, runPreflight } from "./backendPreflight.ts";
-import { FixedEbiManager, applyMasterBackendFailsafe, applyMasterMcpConfig } from "./fixedEbi.ts";
-import { configureFixedEbiLog, fixedEbiLogPath } from "./fixedEbiLog.ts";
+import {
+  FixedEbiManager,
+  applyMasterBackendFailsafe,
+  applyMasterMcpConfig,
+  applyMasterUiOverride,
+} from "./fixedEbi.ts";
+import { MasterSession } from "./master/session.ts";
+import { configureFixedEbiLog, fixedEbiLogPath, logFixedEbi } from "./fixedEbiLog.ts";
 import { NoticeBuffer, DEFAULT_NOTICE_BUFFER_SIZE } from "./noticeBuffer.ts";
 import { createControlApi, type GeneralizedSpawnParams } from "./control.ts";
 import { UsageStore } from "./usageStore.ts";
@@ -75,6 +82,7 @@ import {
   type SpawnMessage,
   type SubscribeMessage,
   type UnsubscribeMessage,
+  type ChatHistoryMessage,
 } from "../shared/protocol.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -133,6 +141,13 @@ const USAGE_HISTORY_PATH =
     ? null
     : (process.env.EBI_USAGE_HISTORY_PATH ?? join(process.cwd(), ".ebi-team", "usage-history.jsonl"));
 configureUsageHistory(USAGE_HISTORY_PATH);
+// master チャット（ui:"chat"）の会話 JSONL。再接続・サーバ再起動後の snapshot 復元に使う。
+// env EBI_MASTER_CHAT_LOG_PATH で変更、"off" で無効化（メモリのみ）。
+const MASTER_CHAT_LOG_PATH =
+  process.env.EBI_MASTER_CHAT_LOG_PATH === "off"
+    ? null
+    : (process.env.EBI_MASTER_CHAT_LOG_PATH ??
+      join(process.cwd(), ".ebi-team", "master-chat.jsonl"));
 // 再アタッチ用スクロールバックのリングバッファ上限（バイト相当・既定 1MB）。
 // インライン TUI 化（agent.ts の INLINE_TUI_ENV）以降、ここには代替スクリーンの再描画ノイズでは
 // なく「実ログ」が積まれるため、リロード後に十分遡れるよう既定を広げている。
@@ -360,6 +375,101 @@ function observeContextGuard(ebiId: string): void {
     // 監視の失敗で usage 取り込み自体を壊さない（best-effort）。
     console.warn("[context-guard] 判定中にエラー:", err);
   }
+}
+
+// ===== master チャット（ui:"chat"）=====
+// ui:"chat" の master は PTY を一切起動せず、MasterBrain（ヘッドレス CLI）を抱えた
+// MasterSession で動く。ui 未指定/terminal のときはこの変数が null のままで、
+// 既存の PTY 経路と**完全に同一**の外形になる（設計書 §6.1）。
+let masterSession: MasterSession | null = null;
+
+/** MasterSession を作って起動し、registry へ chat 配送先として登録する。 */
+async function startMasterChatSession(spec: FixedEbiSpec): Promise<void> {
+  // config の args に --mcp-config を手書きしている場合はそちらを尊重する
+  //（applyMasterMcpConfig と同じ方針。二重指定を作らない）。
+  const hasManualMcp = spec.extraArgs.includes("--mcp-config");
+  const session = new MasterSession({
+    id: spec.id,
+    brainId: spec.brain,
+    cwd: spec.launch.cwd,
+    model: spec.launch.model,
+    permissionMode: spec.permissionMode,
+    systemPrompt: spec.launch.systemPrompt ?? null,
+    mcpConfigPath: hasManualMcp ? null : ROLE_MCP_CONFIG.master,
+    extraArgs: spec.extraArgs,
+    logPath: MASTER_CHAT_LOG_PATH,
+    handlers: {
+      onEvent: (id, envelope) => {
+        broadcast({ type: "chatEvent", id, seq: envelope.seq, ts: envelope.ts, event: envelope.event });
+      },
+      onState: (id, state, pending) => {
+        broadcast({ type: "chatState", id, state, pending });
+        // registry の status（idle/busy）にも写るので一覧を更新する。
+        broadcastRegistry();
+      },
+      onNotice: (id, text) => broadcast({ type: "notice", id, text }),
+      onUsage: (id, usage) => {
+        // statusLine の代替。UsageStore を経由して WS usage と contextGuard に載せる。
+        usageStore.updateFromChat(id, usage);
+        broadcastUsage();
+        observeContextGuard(id);
+      },
+      onRateLimits: (id, limits) => {
+        usageStore.updateRateLimits(id, limits);
+        broadcastUsage();
+      },
+      onRegistryChange: () => broadcastRegistry(),
+    },
+  });
+  masterSession = session;
+  registry.setChatTarget(spec.id, {
+    record: () => session.record(),
+    deliver: (input) => session.deliverFromEbi(input),
+  });
+  broadcastRegistry();
+  logFixedEbi({
+    event: "master-chat-start",
+    level: "info",
+    msg:
+      `起動: ${spec.id} (master/chat) brain=${spec.brain} model=${spec.launch.model ?? "-"} ` +
+      `cwd=${spec.launch.cwd}`,
+    id: spec.id,
+    kind: spec.kind,
+    brain: spec.brain,
+    cwd: spec.launch.cwd,
+    args: spec.extraArgs,
+  });
+  await session.start();
+}
+
+/** 接続直後の chat 復元（state ＋ 直近の会話）。chat master が居ないときは何もしない。 */
+function sendChatSnapshot(ws: WebSocket): void {
+  const session = masterSession;
+  if (!session) return;
+  send(ws, { type: "chatState", id: session.id, state: session.state, pending: session.pendingCount });
+  const snap = session.snapshot();
+  send(ws, { type: "chatSnapshot", id: session.id, events: snap.events, hasMore: snap.hasMore });
+}
+
+/** chat 系 WS メッセージの宛先解決。id 違い/未起動は error を返して null。 */
+function chatSessionFor(ws: WebSocket, id: string): MasterSession | null {
+  const session = masterSession;
+  if (!session || session.id !== id) {
+    send(ws, { type: "error", text: `チャット対象の master が見つかりません: ${id}` });
+    return null;
+  }
+  return session;
+}
+
+/** `chatHistory`（過去ログのページング）。 */
+function handleChatHistory(ws: WebSocket, msg: ChatHistoryMessage): void {
+  const session = chatSessionFor(ws, msg.id);
+  if (!session) return;
+  const snap = session.snapshot({
+    ...(msg.before === undefined ? {} : { before: msg.before }),
+    ...(msg.limit === undefined ? {} : { limit: msg.limit }),
+  });
+  send(ws, { type: "chatSnapshot", id: session.id, events: snap.events, hasMore: snap.hasMore });
 }
 
 /** 現在の viewer 一覧を全クライアントへ broadcast する（open/close 時）。 */
@@ -653,6 +763,8 @@ wss.on("connection", (ws) => {
   send(ws, usageStore.snapshot());
   // 接続直後に現在の viewer 一覧も送る（再接続時に開いている viewer を復元するため）。
   send(ws, { type: "viewers", viewers: viewerRegistry.list() });
+  // master が ui:"chat" なら、状態と直近の会話も送る（再接続で会話が欠けないようにする）。
+  sendChatSnapshot(ws);
   // 接続前に broadcast された notice を古い順に replay する（replay:true・当時の ts 付き）。
   // 起動直後に固定エビが crashloop 停止しても、後からブラウザを開いた人が気づけるようにする。
   for (const n of noticeBuffer.list()) {
@@ -797,6 +909,40 @@ function handleClientMessage(ws: WebSocket, msg: ClientMessage): void {
           send(ws, { type: "notice", id: "viewer-open", text: `ファイルを開けません: ${(err as Error).message}` });
         }
       })();
+      break;
+    }
+    case "chatSend": {
+      const session = chatSessionFor(ws, msg.id);
+      if (!session) break;
+      void session.sendUserText(msg.text).then((r) => {
+        if (!r.accepted) send(ws, { type: "error", text: r.reason ?? "送信できませんでした" });
+      });
+      break;
+    }
+    case "chatStop": {
+      const session = chatSessionFor(ws, msg.id);
+      if (!session) break;
+      void session.interrupt().catch((err) => {
+        send(ws, { type: "error", text: `中断に失敗しました: ${(err as Error).message}` });
+      });
+      break;
+    }
+    case "chatAnswer": {
+      const session = chatSessionFor(ws, msg.id);
+      if (!session) break;
+      void session
+        .answer(msg.requestId, {
+          ...(msg.allow === undefined ? {} : { allow: msg.allow }),
+          ...(msg.choice === undefined ? {} : { choice: msg.choice }),
+          ...(msg.text === undefined ? {} : { text: msg.text }),
+        })
+        .catch((err) => {
+          send(ws, { type: "error", text: `応答の送信に失敗しました: ${(err as Error).message}` });
+        });
+      break;
+    }
+    case "chatHistory": {
+      handleChatHistory(ws, msg);
       break;
     }
     default: {
@@ -1249,6 +1395,15 @@ async function sendMessage(params: SendMessageParams): Promise<SendMessageResult
   let spawned = false;
   let agent = registry.get(to);
 
+  // ---- 0. 宛先が chat master（PTY 無し）ならそのまま stdin へ投入して終わる ----
+  // これが無いと spawnIfMissing 経路が「master という名前の PTY エビ」を新規 spawn してしまい、
+  // chat セッションと同名の二重エビができる。
+  if (!agent && registry.isChatTarget(to)) {
+    const outcome = await registry.deliver(to, from, message);
+    if (!outcome.ok) return { ok: false, error: "master（chat）へ投入できませんでした", spawned: false };
+    return { ok: true, id: to, spawned: false, status: "idle", via: outcome.via, queued: false };
+  }
+
   // ---- 1. 存在判定・必要なら spawn ----
   if (!agent) {
     if (!params.spawnIfMissing) {
@@ -1403,17 +1558,37 @@ async function startFixedEbi(): Promise<void> {
     // master には役割別 MCP config を spawn 直前に自動付与する（config への手書きを不要にし、
     // dev / 本番のファイル名差分をサーバ側で吸収する）。args に明示があればそちらを優先。
     // master は backend=claude に固定する（config/env で他 backend を既定にしても統括系は落とさない）。
+    // env EBI_MASTER_UI で ui を上書きできる（config を書き換えずに切り戻せる口）。
     const specs = raw.map((s) =>
-      applyMasterBackendFailsafe(applyMasterMcpConfig(s, ROLE_MCP_CONFIG.master)),
+      applyMasterUiOverride(
+        applyMasterBackendFailsafe(applyMasterMcpConfig(s, ROLE_MCP_CONFIG.master)),
+        process.env.EBI_MASTER_UI,
+      ),
     );
     if (specs.length === 0) {
       console.log(`[ebi-team] 固定エビ: なし（${CONFIG_PATH} 未配置または fixedEbi 空）`);
       return;
     }
+    // ui:"chat" の master だけ PTY 経路から外し、MasterSession（ヘッドレス頭脳）で起動する。
+    // それ以外（ui 未指定/terminal）は従来どおり FixedEbiManager が PTY で spawn する
+    // ＝ chat を使わない構成では外形ゼロ差分。
+    const chatSpecs = specs.filter((s) => s.kind === "master" && s.ui === "chat");
+    const ptySpecs = specs.filter((s) => !(s.kind === "master" && s.ui === "chat"));
     console.log(
-      `[ebi-team] 固定エビを自動起動: ${specs.map((s) => `${s.id}(${s.kind})`).join(", ")}`,
+      `[ebi-team] 固定エビを自動起動: ` +
+        specs.map((s) => `${s.id}(${s.kind}${s.ui === "chat" ? "/chat" : ""})`).join(", "),
     );
-    fixedEbi.start(specs, handlers);
+    if (ptySpecs.length > 0) fixedEbi.start(ptySpecs, handlers);
+    for (const spec of chatSpecs) {
+      await startMasterChatSession(spec).catch((err) => {
+        console.warn(`[ebi-team] master（chat）の起動に失敗:`, err);
+        broadcast({
+          type: "notice",
+          id: spec.id,
+          text: `master（chat）の起動に失敗しました: ${(err as Error).message}`,
+        });
+      });
+    }
   } catch (err) {
     console.warn(`[ebi-team] 固定エビ config の読み込みに失敗（動的エビのみで継続）:`, err);
   }
@@ -1562,6 +1737,8 @@ function shutdown(): void {
   console.log("\n[ebi-team] 終了処理: 全 agent を kill します");
   // 固定エビの監視を先に止め、kill による exit で再起動が走らないようにする。
   fixedEbi.stop();
+  // chat master（PTY を持たない）は registry.killAll() の対象外なので個別に止める。
+  void masterSession?.stop().catch(() => {});
   registry.killAll();
   for (const ws of clients) ws.close();
   httpServer.close(() => process.exit(0));
