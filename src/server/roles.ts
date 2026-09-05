@@ -147,6 +147,22 @@ export function resolveRole(role: string | undefined | null): EbiRole | undefine
   return isEbiRoleId(role) ? EBI_ROLES[role] : undefined;
 }
 
+/**
+ * 現在レジストリに載っている役割 id 一覧（登録順）。
+ * config の roles をマージした後に呼べば、カスタム役割もそのまま含まれる。
+ */
+export function availableRoleIds(): EbiRoleId[] {
+  return Object.keys(EBI_ROLES);
+}
+
+/**
+ * 未知の役割を弾くときの共通エラー。**必ず利用可能な役割名を列挙する**
+ * （master が「では何なら通るのか」を推測しなくて済むようにするため）。
+ */
+export function unknownRoleError(roleId: string): Error {
+  return new Error(`role が不正です: ${roleId}（許容: ${availableRoleIds().join(", ")}）`);
+}
+
 // ===== カスタム役割の登録（v1.1: ebi-team.config.json の top-level "roles"） =====
 
 /** カスタム役割で emoji/label が省略されたときの既定値。 */

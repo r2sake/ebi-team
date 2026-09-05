@@ -44,7 +44,7 @@ import {
   EMPTY_BACKEND_SETTINGS,
   type BackendSettings,
 } from "./config.ts";
-import { EBI_ROLES, resolveRole, registerCustomRoles } from "./roles.ts";
+import { EBI_ROLES, resolveRole, registerCustomRoles, unknownRoleError } from "./roles.ts";
 import { isRunningFromSrc, mcpConfigPathFor, type McpConfigRole } from "./mcpConfigPath.ts";
 import { needsPreflight, runPreflight } from "./backendPreflight.ts";
 import { FixedEbiManager, applyMasterBackendFailsafe, applyMasterMcpConfig } from "./fixedEbi.ts";
@@ -842,8 +842,9 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   const role = resolveRole(roleId);
   if (roleId && !role) {
     // 許容ロールは EBI_ROLES のキーから動的に生成する（カスタム役割を足せば自動で反映される）。
-    const allowed = Object.keys(EBI_ROLES).join(", ");
-    throw new Error(`role が不正です: ${roleId}（許容: ${allowed}）`);
+    // メッセージ生成は roles.ts の unknownRoleError が SoT（MCP ブリッジ側の
+    // 説明文と同じ一覧を使う＝呼び出し側が役割名を推測しなくて済む）。
+    throw unknownRoleError(roleId);
   }
 
   // 適用優先度: 明示指定 > 役割既定 > サーバ既定。
