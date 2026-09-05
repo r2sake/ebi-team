@@ -3,7 +3,8 @@
 - 作成: 2026-09-05 engineer エビ（master 委譲・**設計のみ / 実装なし**）
 - **r2: 2026-09-05 更新**（PR-M0 PoC の実測とボス裁定を反映。PR-M1 実装と同じ PR で改訂）。
   変更点の一覧は §0.1。実測の一次資料は `docs/poc/master-headless-poc-2026-09-05.md`
-- **r6: 2026-09-05 更新**（PR-M5 実装＝承認 / 質問 UI を §0.6 として追加し §9 を更新）。ブランチは `ebi/ebiteam-master-chat-m5`
+- **r6: 2026-09-05 更新**（PR-M5 実装＝承認 / 質問 UI を §0.6 として、PR-M7 実装＝移行と docs を §0.7 として追加し
+  §5.2 / §6.2 / §6.3 / §6.4 / §9 を更新）。ブランチは `ebi/ebiteam-master-chat-m5` / `ebi/ebiteam-master-chat-m7`
 - **r5: 2026-09-05 更新**（PR-M4 実装＝入力系を §0.4、PR-M6 実装＝usage / context / cost を §0.5 として追加し §5.2 / §9 を更新）。
   ブランチは `ebi/ebiteam-master-chat-m4` / `ebi/ebiteam-master-chat-m6`
 - **r4: 2026-09-05 更新**（PR-M3 実装＝チャット UI に合わせて §0.3 を追加し §9 を更新）。ブランチは `ebi/ebiteam-master-chat-m3`
@@ -207,6 +208,31 @@ unit +27 本（`test/masterPermission.test.ts` 17 / `masterChatSession.test.ts` 
 **PR-M6 / PR-M7 への持ち越し**: 承認の「以後このツールは常に許可」（suggestions / permission rules の永続化）は入れていない
 （毎回聞く。ボス裁定の permissionMode auto を弱めないため）。ツール結果の「全部見る」・`chatHistory` の
 ページング・添付の掃除は引き続き未着手。
+
+---
+
+## 0.7 r6 での変更（PR-M7 実装の確定事項）
+
+**PR-M7 で実装したもの**: 移行手順 docs `docs/ops/master-chat-ui.md`（新設）/ backend docs
+`docs/backends/claude.md`（新設）・`codex.md` §9（master 頭脳としての codex・規約原文）・
+`gemini.md` §13（対象外の理由）/ README の「master チャット UI」節・context-guard 節の追記 /
+`ebi-team.config.example.json` の master エントリに `ui` / `brain` の実例 / `.env.sample` に
+`EBI_MASTER_UI` / `EBI_MASTER_CHAT_LOG_PATH` / `EBI_CHAT_ATTACH_DIR` / npm scripts の整理
+（`test` / `e2e:fixed` / `e2e:master-brain` / `compare:contextpct` の登録と
+`e2e:all-terminal` / `e2e:all-chat` の束ね）。**コード（src/）の変更は 0**。
+
+| # | 確定した点 | 反映先 |
+|---|---|---|
+| AC | **移行は 3 段・ロールバックは 1 手**という形を docs に固定した。第 2 段（別ポート評価）では `.ebi-team/` を共有すると会話 JSONL と添付保管庫が稼働側と混ざるため、`EBI_MASTER_CHAT_LOG_PATH` / `EBI_CHAT_ATTACH_DIR` / `EBI_DUMP_PATH` を一時パスへ逃がす手順を明記した（設計 §6.2 には無かった運用上の穴） | §6.2 / `docs/ops/master-chat-ui.md` §2 |
+| AD | **「再起動で切れるもの／残るもの」を表にした**。会話 JSONL と添付は残り、**claude 側のセッション・コスト累計・ヘッダの ctx は切れる**（`start()` は `--resume` 無しで launch する＝サーバ再起動は常に新しい会話。`--resume` はプロセスだけが死んだときの復帰専用）。ここは実装を読んで確定させた点で、設計書には書かれていなかった | `docs/ops/master-chat-ui.md` §4 |
+| AE | **npm scripts を 2 束にした**。`e2e:all-terminal`（ui 未指定の一式・実 claude は末尾の `e2e:spawn-delivery` のみ）と `e2e:all-chat`（context-guard スタブ → master-chat → master-chat-image → master-chat-approval。approval は PR-M5 マージ時に束ねへ追加）。既定の `npm test` は unit だけで枠を消費しない。未登録だった `scripts/e2e-fixed-ebi.mjs` / `e2e-master-brain.mjs` / `compare-contextpct-statusline.mjs`（PR-M6 持ち越し）も登録した | §6.4 / §9 PR-M7 |
+| AF | **規約の原文と URL は 3 箇所に置いた**（`codexBrain.ts` 冒頭 = SoT / `docs/backends/codex.md` §9 / README の該当行）。claude 側のサブスク担保（`--bare` 拒否・env deny・`apiKeySource` 検査の三重）も原文引用付きで `docs/backends/claude.md` §2 に集約した | §1.1 / §1.2 |
+| AG | **ヘッダの枠（5h / 週）はアカウント単位の latest** で、PTY エビの statusLine 由来の値と混ざる旨を docs と README に注記した（PR-M6 持ち越し）。`ctx` は chat master 自身の `turnEnd.usage` だけなので混線しない | §5.2 / `docs/ops/master-chat-ui.md` §5 |
+| AH | **添付保管庫は自動削除しない**（会話 JSONL から参照され続けるため）。掃除は運用で行う前提とし、容量の目安（月あたり数百 MB）と `find -mtime +30 -delete` の例、会話 JSONL は削除ではなく退避を勧める旨を docs/ops に書いた（PR-M4 持ち越し） | `docs/ops/master-chat-ui.md` §7 |
+| AI | **e2e をエビのセッションから回すと 2 つの env が毒になる**（実測で判明）。エビの env には `EBI_IDLE_NOTIFY=off`（`npm start` の設定を継承）と `EBI_ID=<自分の id>` が入っており、e2e が立てる一時サーバまで引き継がれて `e2e:reverse-notify` の idle 自動通知チェックと `e2e:usage` の `EBI_ID` 注入チェックが**コードとは無関係に落ちる**。束ねスクリプトの先頭で `unset EBI_ID; export EBI_IDLE_NOTIFY=on` してから並べることで固定した | §6.4 / `docs/ops/master-chat-ui.md` §6 |
+
+**PR-M5 との関係**: 承認/質問の応答送信は PR-M5 の担当（本 PR ではソースに触っていない）。docs 上は
+「現状は表示のみ・応答送信は PR-M5」と明記してある。PR-M5 マージ後にその 1 行を落とす。
 
 ---
 
@@ -759,6 +785,11 @@ chat 化で以下が**構造的に**解決する:
 > **稼働サーバの反映手順は現行どおり**: `npm run build` → `node scripts/gen-master-mcp.mjs` → **ボスが再起動**。
 > エビは稼働 dist / config / master-mcp を触らない（`docs/multibackend-plan-r2.md` R8）。
 
+**r6（PR-M7）**: 実際の手順書は `docs/ops/master-chat-ui.md` に置いた（第 1〜3 段のコマンド・
+第 2 段で状態ディレクトリを分ける理由・見るポイント・よくある詰まり）。第 2 段では
+`EBI_MASTER_CHAT_LOG_PATH` / `EBI_CHAT_ATTACH_DIR` / `EBI_DUMP_PATH` を一時パスへ逃がすこと
+（同じ `.ebi-team/` を使うと稼働側の会話ログ・添付と混ざる）。
+
 ### 6.3 ロールバック
 
 | 段 | 操作 | 効果 |
@@ -766,6 +797,11 @@ chat 化で以下が**構造的に**解決する:
 | 1 | `EBI_MASTER_UI=terminal`（env） | 再起動だけで現行 PTY master に戻る |
 | 2 | config の `ui` を削除 | 恒久的に戻る |
 | 3 | chat 系 PR のみ revert | 作業エビ側は無影響（chat PR は master 経路にしか触らない） |
+
+**r6（PR-M7）**: 「再起動で切れるもの／残るもの」は `docs/ops/master-chat-ui.md` §4 の表が SoT。
+要点は **会話 JSONL と添付は残り、claude 側のセッション・コスト累計・ヘッダの ctx は切れる**
+（サーバ再起動時の `start()` は `--resume` を付けない＝常に新しい会話。`--resume` はプロセス
+だけが死んだときの復帰専用）。`ui` を terminal へ戻しても JSONL と添付は消さない。
 
 ### 6.4 e2e の再構成
 
@@ -778,6 +814,15 @@ chat 化で以下が**構造的に**解決する:
 | `e2e-context-guard.mjs` | **usage の入力元が変わるので改修必須**（statusLine POST → `turnEnd` の usage）。`/control/usage` は作業エビ用に残す |
 | `e2e-control-mcp.mjs` / `e2e-send-message.mjs` / `e2e-viewer*.mjs` / `e2e-usage.mjs` | 無変更 |
 | **新設 `e2e-master-chat-approval.mjs`** | `--permission-prompt-tool` 経由の承認往復（permission イベント → `chatAnswer` → ツール実行継続）。**要 PoC 後** |
+
+**r6（PR-M7）で束ねた npm scripts**:
+
+| script | 中身 | 実 claude |
+|---|---|---|
+| `npm test` / `test:unit` | unit のみ | 使わない |
+| `e2e:all-terminal` | control / send / reverse-notify / notify-fallback / delivery-hardening / usage / viewer / viewer-persist / supervisor / fixed / minaebi / context-guard / spawn-delivery | 末尾の spawn-delivery のみ |
+| `e2e:all-chat` | context-guard（偽 claude スタブ）→ master-chat → master-chat-image → master-chat-approval | master-chat / master-chat-image / master-chat-approval の実配線チェック |
+| 新規登録 | `e2e:fixed`（未登録だった `e2e-fixed-ebi.mjs`）/ `e2e:master-brain` / `compare:contextpct`（PR-M6 持ち越し） | 後 2 つは opt-in |
 
 ---
 
@@ -827,7 +872,7 @@ stdin への user メッセージ投入は **4 つの CLI すべてが公式に�
 | **PR-M4** ✅完了 | **入力系**。送信・⏹ 停止（`interrupt()`）・入力履歴（↑/↓ / localStorage）・画像添付・大きな貼り付けのファイル誘導 | 停止 → 続行を unit と `e2e-master-chat.mjs` で確認（10/10 継続）。履歴は再読み込み後も残る（Playwright 実測）。画像添付は `e2e-master-chat-image.mjs` が実 claude(haiku) で 7/7（ツール不使用のまま色を回答＝image ブロックが読まれている）。unit +16 本・既存 fail 0・build 成功。スクショは `tmp/shots-m4/` | **0.5 日** | PR-M3 |
 | **PR-M5** ✅完了 | **承認 / 質問 UI**。ebi-control（master ロール）に `permission_prompt` ツール新設 → `--permission-prompt-tool` 配線／`POST /control/chat-permission`（ボスが答えるまで応答を返さない long-poll）／`PermissionBroker` と `brain.answer()` の実装／`AskUserQuestion` を選択肢 UI（複数選択・その他自由入力）に／未応答スティッキーバーの実配線／保留の破棄（プロセス終了・新しい会話・サーバ再起動） | `scripts/e2e-master-chat-approval.mjs` **17/17 green**（偽 claude 12 ＋ 実 claude(haiku) 5）。承認往復でツール実行が継続・拒否でツールが実行されず会話は続く・未応答時は master が止まり `pending=1`/waiting が出る・AskUserQuestion の選択肢応答が届く。unit +27 本 green・既存 fail 0（443 本）・`npm run build` 成功・`e2e:master-chat` 7/7 継続・`e2e-context-guard` 18/18 継続。スクショ 4 枚 `tmp/shots-m5/` | **1 日** | PR-M4 |
 | **PR-M6** ✅完了 | **usage / context / cost**。ヘッダに コスト / 文脈% / 5h・週次の枠を表示（65/70/85% で色分け・算出不能は「—」）。`MasterSession` の turnEnd 順序修正（idle → usage）で chat でも `/clear` 促しが発火する。`e2e-context-guard.mjs` に chat 経路（偽 claude・枠なし課金なし）を追加 | `e2e-context-guard.mjs` 改修版 **18/18 green**（terminal C1〜C5 ＋ chat D1〜D6）。unit +9 本 green・既存 fail 0（400 本）・`npm run build` 成功・`e2e:master-chat` 7/7（往復 10/10）。**statusLine 併走比較の誤差は最大 0.5pt**（3 ターン・haiku・statusLine の整数丸めぶんのみ）。スクショ 3 枚 `tmp/shots-m6/` | **1 日** | PR-M2 |
-| **PR-M7** | **移行と docs**。`EBI_MASTER_UI` env・ロールバック手順・e2e 再構成・README / `docs/backends/*.md` 追記・OSS 向け構成例 | 第 1 段（`ui` 未指定）で既存 e2e が全部 green。docs に規約の原文と URL が載っている | **0.5 日** | PR-M5 / PR-M6 |
+| **PR-M7** ✅完了 | **移行と docs**。`docs/ops/master-chat-ui.md`（3 段移行・ロールバック・再起動で切れる/残る表・添付の掃除）／`docs/backends/claude.md` 新設（ヘッドレス master とサブスク担保の三重の歯止め）／`codex.md` §9・`gemini.md` §13（規約原文と対象外の理由）／README の「master チャット UI」節／config 例の `ui`/`brain`／`.env.sample` の 3 キー／npm scripts の整理（`test`・`e2e:fixed`・`e2e:master-brain`・`compare:contextpct` 登録と `e2e:all-terminal` / `e2e:all-chat` の束ね）。**src/ の変更 0** | `npm run e2e:all-terminal` **全 green**（control 12/12・send 9/9・reverse-notify 14/14・notify-fallback 10/10・delivery-hardening 10/10・usage 14/14・viewer 40/40・viewer-persist 16/16・supervisor 7/7・fixed 7/7・minaebi 4/4・context-guard 18/18・spawn-delivery 5/5）／`npm run e2e:all-chat` は context-guard 18/18 ＋ master-chat・master-chat-image を実 claude で 1 回ずつ／unit 415 pass 0 fail・`npm run build` 成功／規約の原文と URL は codex.md §9・claude.md §2 に記載 | **0.5 日** | PR-M5 / PR-M6 |
 | **必須合計** | | | **6.0〜7.5 日** | |
 | **PR-M8**（Q-1 裁定済み・opt-in） | **`CodexAppServerBrain`**（`thread/*` `turn/*` `item/*` の射影・承認往復） | `brain:"codex"` で master が起動し、`e2e-master-chat.mjs` が 10/10 | 1.5 日 | **Q-1 裁定** |
 | ~~**PR-M9**（任意）~~ | ~~**`GeminiAcpBrain`**（ACP JSON-RPC）~~ | **Q-2 裁定により切らない（対象外）** | — | — |

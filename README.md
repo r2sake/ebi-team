@@ -56,8 +56,13 @@ npm start      # http://localhost:8787 で配信（WebSocket も同一ポート�
 ### その他の主なコマンド
 
 ```bash
-npm run typecheck   # サーバ/フロント双方の型チェック
+npm run typecheck        # サーバ/フロント双方の型チェック
+npm test                 # ユニットテスト（サブスク枠を消費しない）
+npm run e2e:all-terminal # 既定構成（master は PTY）の e2e 一式
+npm run e2e:all-chat     # master チャット UI の e2e 一式（一部は実 claude を使う）
 ```
+
+個別の e2e スクリプトは `package.json` の `e2e:*` を参照してください。いずれも**専用ポート＋使い捨ての状態ディレクトリ**で完結し、稼働中のサーバ（既定 8787）には触りません。
 
 ---
 
@@ -181,7 +186,7 @@ ops/clean-generated-images.sh --dry-run                            # ~/.codex/ge
 }
 ```
 
-バックエンドの解決順は **spawn 引数 `backend` > 役割の `backend` > `defaultBackend` > env `EBI_BACKEND` > `claude`**。未実装・未知の id は黙って claude に落とさず明示エラーになります。**master（統括役）は何を設定しても常に claude 固定**です（統括系を落とさないための fail-safe）。
+バックエンドの解決順は **spawn 引数 `backend` > 役割の `backend` > `defaultBackend` > env `EBI_BACKEND` > `claude`**。未実装・未知の id は黙って claude に落とさず明示エラーになります。**master（統括役）は何を設定しても常に claude 固定**です（統括系を落とさないための fail-safe）。後述の「master チャット UI」で `brain` を明示したときだけ、master の頭脳を別 CLI にできます（既定は claude）。
 
 spawn 時の明示指定は master の MCP ツール（`spawn_ebi` / `spawn_engineer` / `send_message` の `backend` 引数）、制御API（`POST /control/spawn` の `backend`）、UI ヘッダの backend セレクトから行えます。
 
@@ -198,7 +203,33 @@ spawn 時の明示指定は master の MCP ツール（`spawn_ebi` / `spawn_engi
 
 UI では各エビに backend バッジ（🟣 claude / 🟢 codex / 🔵 gemini）が付きます。**codex / gemini は Claude の statusLine 相当の usage 報告経路を持たない**ため、ダッシュボードの cost / context は空欄ではなく **「—（未対応）」** と明示表示されます（欠測であって異常ではありません）。
 
-詳細は `docs/backends/codex.md` / `docs/backends/gemini.md` を参照してください。
+詳細は `docs/backends/claude.md` / `docs/backends/codex.md` / `docs/backends/gemini.md` を参照してください。
+
+### master チャット UI (master chat)
+
+統括役（master）だけは、ターミナル表示（xterm）ではなく **ChatGPT のような専用チャット画面**で動かせます。既定は従来どおりのターミナルで、`ui` を書かない限りこの機能は一度も動きません。
+
+```jsonc
+{
+  "fixedEbi": [
+    {
+      "id": "master", "kind": "master",
+      "ui": "chat",        // "terminal"（既定・現行の PTY 表示）| "chat"
+      "brain": "claude",   // 省略可（既定 claude）。master の頭脳 CLI
+      "model": "fable",
+      "permissionMode": "auto"
+    }
+  ]
+}
+```
+
+- **仕組み**: `ui:"chat"` のとき master の PTY を一切起動せず、`claude -p --input-format stream-json --output-format stream-json` のプロセスを 1 本常駐させて多ターン会話します（公式サポートのヘッドレス経路）。配下エビからの `reply_to_master` は **PTY 注入ではなく stdin への user メッセージ投入**になり、harness 固有の裏口（PTY 注入 / notification channel）に依存しなくなります。
+- **サブスク枠の担保**: `--bare` を付けない（付いていたら起動拒否）／`ANTHROPIC_API_KEY` 等を master プロセスの env から削除（残っていたら起動拒否）／`system/init` の `apiKeySource` が `"none"` 以外なら起動拒否、の**三重の歯止め**で従量課金経路への転落を機械的に止めます。根拠となる公式 docs の原文と URL は `docs/backends/claude.md` §2。
+- **スマホ**: ログが通常の DOM スクロールになるため、ターミナル表示で起きていた「スマホでログを遡れない」問題が構造的に消えます。
+- **ヘッダの表示**: 累計コスト / 文脈使用率 / 5h・週次の枠を表示します（65 / 70 / 85% で色分け・算出できない値は `—`）。**枠（5h / 週）はアカウント単位の最新値**で、PTY で動いている作業エビの statusLine 由来の値と混ざります（chat master 単独の消費量ではありません）。文脈使用率は chat master 自身のターン結果だけを使うのでこの混線はありません。
+- **頭脳（`brain`）**: 既定 `claude`。`codex` は **OpenAI 公式が「programmatic な Codex CLI ワークフローには API キーを使え」と明記しており規約グレー**のため、明示指定したときだけの opt-in です（原文と URL は `docs/backends/codex.md` §9）。`gemini` は現行 CLI に `--input-format` が無いため対象外（`docs/backends/gemini.md` §13）。未実装 id は黙って claude に落とさず明示エラーになります。
+- **会話ログ / 添付**: 会話は `.ebi-team/master-chat.jsonl` に残り、サーバ再起動後もチャット画面に復元されます（ターミナル時代は再起動で消えていました）。画像などの添付は `.ebi-team/chat-attachments/` に保存され、**自動削除はありません**（運用で消す。目安と手順は `docs/ops/master-chat-ui.md` §7）。
+- **切り替えとロールバック**: env `EBI_MASTER_UI=terminal|chat` が config より優先します。まず別ポートで `EBI_MASTER_UI=chat` を試し、問題なければ config に `"ui": "chat"` を入れる、という 3 段移行を推奨します。戻すのは env か config を戻して再起動するだけ（1 手）。手順と「再起動で切れるもの／残るもの」の表は **[docs/ops/master-chat-ui.md](docs/ops/master-chat-ui.md)**。
 
 ### 外部チャンネル待機セッションを固定エビにする (external channel relay)
 
@@ -252,6 +283,10 @@ Slack / Discord などの外部チャンネルに常駐する「待機・秘書�
 
 観測値は各エビの statusLine が `/control/usage` へ POST してくる JSON（`context_window.used_percentage` / `context_window_size`）で、使用状況ダッシュボードと同じ供給元です。モデル別の上限テーブルは持ちません（JSON に上限が入っているため）。
 
+master をチャット UI（`ui:"chat"`）で動かしている場合は statusLine が存在しないため、**ヘッドレス頭脳のターン結果から算出した使用率**（ターン最後の assistant の usage ÷ そのモデルの文脈窓）が同じ供給元に流れ込みます。判定・閾値・通知は terminal のときと同一です（statusLine との誤差は実測で最大 0.5pt）。
+
+> **閾値の注意**: 65 / 70 / 85% は**割合**です。文脈窓 1,000,000 のモデル（opus-5 等）では 65% = 650k トークンとなり、200k 窓のモデルを使っていた頃と比べて**発火する場面がかなり後ろにずれます**（実運用の中央値では発火しないこともあります）。窓の大きさに応じて `.env` の `EBI_CTX_GUARD_*` を調整してください。
+
 | 段階 | 既定 | 挙動 |
 | --- | --- | --- |
 | 予告 (soft) | 65% | **キリの良し悪しに関係なく**その場で 1 回通知。本文には「そのままユーザーへ転記できる定型文」（現在の使用率・上限・走行中のエビ数入り）が含まれ、master はこれを伝えて走行中タスクの区切りと報告集約を進めます |
@@ -263,7 +298,7 @@ Slack / Discord などの外部チャンネルに常駐する「待機・秘書�
 - **連打防止**: 各段階は使用率が下がらない限り 1 回（critical のみ再通知間隔あり）。整数刻みの 69↔70 往復は下げ幅マージン（既定 5pt）で吸収し、`/clear` や compact で使用率が落ちれば状態がリセットされて再武装します。
 - **安全側の既定**: 使用率が空（セッション開始直後）や、statusLine が長時間走っておらず値が古い場合は判定をスキップします。空のまま連続で受け続けた場合は「無言の機能停止」を 1 回だけ通知します。
 - 閾値・監視対象・無効化はすべて環境変数で上書きできます（`.env.sample` の `EBI_CTX_GUARD*` を参照）。
-- 検証: `node --import tsx --test test/contextGuard.test.ts`（ユニット）/ `npm run e2e:context-guard`（実サーバ疎通・実課金なし）。
+- 検証: `node --import tsx --test test/contextGuard.test.ts`（ユニット）/ `npm run e2e:context-guard`（実サーバ疎通・実課金なし。terminal 経路と chat 経路の両方を通します）。
 
 ### spawn 後の表示切り替え
 
