@@ -8,6 +8,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   ChatTranscript,
+  InputHistory,
+  INPUT_HISTORY_KEY,
+  LARGE_PASTE_CHARS,
+  formatBytes,
   formatContextPct,
   formatCost,
   oneLine,
@@ -190,4 +194,112 @@ test("状態ラベルは日本語（未知の値はそのまま）", () => {
   assert.equal(stateLabel("busy"), "実行中…");
   assert.equal(stateLabel("waiting"), "応答待ち");
   assert.equal(stateLabel("zzz"), "zzz");
+});
+
+// ===== PR-M4（入力系）=====
+
+/** localStorage の代わり（unit から挙動を覗くための最小実装）。 */
+function memStorage(initial: Record<string, string> = {}) {
+  const map = new Map(Object.entries(initial));
+  return {
+    getItem: (k: string) => map.get(k) ?? null,
+    setItem: (k: string, v: string) => void map.set(k, v),
+    raw: map,
+  };
+}
+
+test("入力履歴: ↑ で古い方へ、↓ で新しい方へ辿り、末端で編集中テキストに戻る", () => {
+  const h = new InputHistory(null);
+  h.push("1つ目");
+  h.push("2つ目");
+  h.push("3つ目");
+
+  assert.equal(h.prev("書きかけ"), "3つ目");
+  assert.equal(h.prev("書きかけ"), "2つ目");
+  assert.equal(h.prev("書きかけ"), "1つ目");
+  // 最古まで来たらそれ以上動かさない（null を返して入力欄を書き換えない）。
+  assert.equal(h.prev("書きかけ"), null);
+
+  assert.equal(h.next(), "2つ目");
+  assert.equal(h.next(), "3つ目");
+  // 末端まで戻ると、辿り始めたときの編集中テキストが復元される。
+  assert.equal(h.next(), "書きかけ");
+  assert.equal(h.next(), null);
+  assert.equal(h.navigating, false);
+});
+
+test("入力履歴: 空文字は積まず、同じ本文は重複させない（直近へ寄せる）", () => {
+  const h = new InputHistory(null);
+  h.push("");
+  h.push("   ");
+  assert.equal(h.size, 0);
+  h.push("A");
+  h.push("B");
+  h.push("A");
+  assert.deepEqual(h.list(), ["B", "A"]);
+});
+
+test("入力履歴: 上限（既定 50 件）を超えたら古いものから捨てる", () => {
+  const h = new InputHistory(null, INPUT_HISTORY_KEY, 3);
+  for (const t of ["a", "b", "c", "d"]) h.push(t);
+  assert.deepEqual(h.list(), ["b", "c", "d"]);
+});
+
+test("入力履歴: localStorage に永続化され、読み込み直しても残る（再読み込み相当）", () => {
+  const store = memStorage();
+  const h1 = new InputHistory(store);
+  h1.load();
+  h1.push("再読み込み後も残る発話");
+  assert.equal(store.raw.get(INPUT_HISTORY_KEY), JSON.stringify(["再読み込み後も残る発話"]));
+
+  // ページを開き直した想定で作り直す。
+  const h2 = new InputHistory(store);
+  h2.load();
+  assert.equal(h2.prev(""), "再読み込み後も残る発話");
+});
+
+test("入力履歴: 壊れた localStorage の値は捨てる（チャットを壊さない）", () => {
+  const h = new InputHistory(memStorage({ [INPUT_HISTORY_KEY]: "{壊れた" }));
+  h.load();
+  assert.equal(h.size, 0);
+  h.push("新規");
+  assert.equal(h.size, 1);
+});
+
+test("入力履歴: 送信すると辿り位置がリセットされる", () => {
+  const h = new InputHistory(null);
+  h.push("A");
+  h.push("B");
+  assert.equal(h.prev(""), "B");
+  assert.equal(h.navigating, true);
+  h.push("C");
+  assert.equal(h.navigating, false);
+  assert.equal(h.prev(""), "C");
+});
+
+test("user イベントの添付はトランスクリプトに構造化されて載る（無ければ空配列）", () => {
+  const t = fresh();
+  const attachment = {
+    name: "chat-20260905-101112-0a1b2c3d.png",
+    path: "/tmp/x/chat-20260905-101112-0a1b2c3d.png",
+    mediaType: "image/png",
+    url: "/control/chat-attachment?name=chat-20260905-101112-0a1b2c3d.png",
+    bytes: 2048,
+  };
+  t.apply(env({ kind: "user", text: "これ見て", attachments: [attachment] }));
+  t.apply(env({ kind: "user", text: "添付なし" }));
+  const [first, second] = t.items;
+  assert.deepEqual(first!.kind === "user" ? first.attachments : null, [attachment]);
+  assert.deepEqual(second!.kind === "user" ? second.attachments : null, []);
+});
+
+test("大きな貼り付けの閾値は定数化されている（8,000 文字）", () => {
+  assert.equal(LARGE_PASTE_CHARS, 8_000);
+});
+
+test("formatBytes: 添付チップのサイズ表示", () => {
+  assert.equal(formatBytes(512), "512 B");
+  assert.equal(formatBytes(2048), "2.0 KB");
+  assert.equal(formatBytes(3 * 1024 * 1024), "3.0 MB");
+  assert.equal(formatBytes(-1), "—");
 });

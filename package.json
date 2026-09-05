@@ -24,6 +24,7 @@
     "e2e:notify-fallback": "node scripts/e2e-notify-fallback.mjs",
     "e2e:master-channel": "node scripts/e2e-master-channel.mjs",
     "e2e:master-chat": "node scripts/e2e-master-chat.mjs",
+    "e2e:master-chat-image": "node scripts/e2e-master-chat-image.mjs",
     "e2e:delivery-hardening": "node scripts/e2e-delivery-hardening.mjs",
     "e2e:spawn-delivery": "node scripts/e2e-spawn-delivery.mjs",
     "e2e:usage": "node scripts/e2e-usage.mjs",

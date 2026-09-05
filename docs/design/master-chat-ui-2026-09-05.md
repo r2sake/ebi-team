@@ -3,6 +3,7 @@
 - 作成: 2026-09-05 engineer エビ（master 委譲・**設計のみ / 実装なし**）
 - **r2: 2026-09-05 更新**（PR-M0 PoC の実測とボス裁定を反映。PR-M1 実装と同じ PR で改訂）。
   変更点の一覧は §0.1。実測の一次資料は `docs/poc/master-headless-poc-2026-09-05.md`
+- **r5: 2026-09-05 更新**（PR-M4 実装＝入力系に合わせて §0.4 を追加し §9 を更新）。ブランチは `ebi/ebiteam-master-chat-m4`
 - **r4: 2026-09-05 更新**（PR-M3 実装＝チャット UI に合わせて §0.3 を追加し §9 を更新）。ブランチは `ebi/ebiteam-master-chat-m3`
 - **r3: 2026-09-05 更新**（PR-M2 実装＝`MasterSession` とサーバ配線に合わせて §3.4 / §4.4 / §5.4 / §6.1 を確定）。
   変更点は §0.2。PR-M2 で実測した点（`rate_limit_event` の `utilization` スケール）も反映済み
@@ -130,6 +131,26 @@ unit 26 本追加（`test/masterChatSession.test.ts` / `test/masterChatWiring.te
 
 **PR-M4 以降への持ち越し**: 入力履歴（↑/↓・localStorage）/ ツール結果の「全部見る」/ `chatHistory` による過去ログのページング
 （いまは `hasMore` を 1 行で示すだけ）/ 画像添付・`open_viewer` カードの chat 内表示 / 承認・質問の応答送信（PR-M5）。
+
+## 0.4 r5 での変更（PR-M4 実装の確定事項）
+
+**PR-M4 で実装したもの**: `src/server/chatAttachments.ts`（添付の保管庫）＋ `control.ts` の
+`POST /control/chat-attach` / `GET /control/chat-attachment` ＋ `MasterSession.sendUserText()` の
+画像対応 ＋ `chatModel.ts` の `InputHistory` / `LARGE_PASTE_CHARS` ＋ `chat.ts`（↑/↓ 履歴・
+ペースト/ドロップ添付・大きな貼り付け誘導）＋ `protocol.ts` の `ChatAttachment`。
+unit +16 本（`chatAttachments.test.ts` 4 / `masterChatUi.test.ts` 9 / `masterChatSession.test.ts` 3）、
+受け入れ e2e は `scripts/e2e-master-chat-image.mjs`（`npm run e2e:master-chat-image`）。
+
+| # | 確定した点 | 反映先 |
+|---|---|---|
+| X | **claude の stream-json は image content block をそのまま受ける**（実測。§9 の「受けない実測ならパス添付に倒す」は不要だった）。`{"type":"user","message":{"role":"user","content":[{"type":"text"...},{"type":"image","source":{"type":"base64",...}}]}}` を stdin に 1 行書くだけで、haiku が **ツールを 1 度も使わずに**画像の色を答えた（`e2e-master-chat-image.mjs` の 7/7）。合わせて**保存先の絶対パスも本文に添える**（master が Read/Bash で同じファイルを扱えるように。画像内容そのものは image ブロック側から伝わる） | §3.1 / §5.2 |
+| Y | **添付はクライアントからパスを指定できない**。`POST /control/chat-attach`（Content-Type が MIME・ボディが生バイト列）で**サーバが保存先を決め**、以降は保存庫の basename（`chat-<ts>-<rand>.<ext>`）だけで参照する。保存先は `<cwd>/.ebi-team/chat-attachments/`（env `EBI_CHAT_ATTACH_DIR`）。`GET /control/chat-attachment?name=` も同じ basename しか受けず、viewer-file と同じ「生パスを受けない」方針でパストラバーサル入口を作らない。受理する MIME は png/jpeg/gif/webp/text-plain のみ、画像 12MB / テキスト 4MB 上限、1 発話 4 枚まで。**chat master が居ない構成では両エンドポイントとも塞がる**（`ui:"terminal"` に新しい書き込み口を作らない） | §5.4 / §6.1 |
+| Z | **入力履歴は localStorage（`ebi-team.chat.inputHistory.v1`・直近 50 件）**。畳み込みと同じく DOM 非依存の純クラス `InputHistory` に閉じて unit で検証する。↑ はキャレットが先頭、↓ は末尾のときだけ履歴として振る舞う（複数行編集の行移動を奪わない）。ストレージが使えない/壊れている環境ではメモリのみで動く | §5.3 |
+| AA | **大きな貼り付け（8,000 文字超・`LARGE_PASTE_CHARS`）はファイルへ落とす**。貼り付けを入力欄に展開せず `text/plain` として保存し、**絶対パスだけを入力欄に残して**誘導メッセージを出す（保存に失敗したときはそのまま貼り付けて入力を失わせない） | §5.3 |
+| AB | **中断（⏹）→ 続行は PR-M3 時点で成立していた**（修正不要）。`turnEnd{ok:false, aborted:true, errorText:null}` の後もプロセスは生きたままで、次の発話が同じ stdin に載る。回帰として unit（FakeBrain で中断 → 再送信）を追加し、`e2e-master-chat.mjs` の中断チェックでも 10/10 と同時に確認した | §8-R8 |
+
+**PR-M5 以降への持ち越し**: 承認/質問の応答送信（PR-M5）/ ツール結果の「全部見る」/ `chatHistory` による
+過去ログのページング / 添付の掃除（保管庫は溜まりっぱなし。運用で消す）/ 画像以外のファイル添付。
 
 ---
 
@@ -746,7 +767,7 @@ stdin への user メッセージ投入は **4 つの CLI すべてが公式に�
 | **PR-M1** ✅完了 | **`MasterBrain` 抽象 + `ClaudeHeadlessBrain`**（サーバ内のみ・UI 未接続）。NDJSON パーサ・イベント正規化・env deny list・`--bare` 拒否 preflight・`apiKeySource` 検証。codex は interface + stub まで（Q-1 の opt-in） | 新規 unit 50 本 green（`test/masterBrain{Args,Events,Stream}.test.ts`）。既存 unit fail 0（合計 338）。`npm run build` 成功。**外形ゼロ差分**（既存ファイルの変更 0・サーバから未参照）。実プロセス結合は opt-in の `scripts/e2e-master-brain.mjs`（既定では走らせない＝サブスク枠を食わない） | **1 日** | PR-M0 |
 | **PR-M2** ✅完了 | **`MasterSession` とサーバ配線**。feature flag `ui:"chat"`／PTY 経路の分岐／WS プロトコル拡張（`chatSend`/`chatEvent`/`chatState`/`chatSnapshot`）／会話 JSONL 永続化／mailbox → `send()` の載せ替え | `scripts/e2e-master-chat.mjs`：`chatSend` → `text`/`turnEnd`、`/control/reverse-inject` → `inbound` が**連続 10 回 100%**（2026-09-05 実測 10/10・10/10。unit +26 本 green・既存 fail 0・build 成功・`ui` 未指定で外形ゼロ差分） | **1 日** | PR-M1 |
 | **PR-M3** ✅完了 | **チャット UI**。md レンダリング（`markdown.ts` 再利用）・ツール `<details>`・`[reply]`/`[idle]` バブル・partial 逐次描画・自動追従とスクロール・再接続復元・入力欄（Enter 送信 / ⏹ 停止）・「新しい会話」 | Playwright 実画面スクショ 9 枚（`tmp/shots-m3/`）。375px でログが指スクロールできることを実測（scrollTop 0→781）。`ui:"terminal"` はピクセル比較でゼロ差分。unit +19 本 green・既存 fail 0・build 成功 | **1 日** | PR-M2 |
-| **PR-M4** | **入力系**。送信・⏹ 停止（`interrupt()`）・入力履歴（↑/↓ / localStorage）・画像添付・大きな貼り付けのファイル誘導 | 停止で `turnEnd(ok:false)` が出て会話が継続できる。履歴が再読み込み後も残る | **0.5 日** | PR-M3 |
+| **PR-M4** ✅完了 | **入力系**。送信・⏹ 停止（`interrupt()`）・入力履歴（↑/↓ / localStorage）・画像添付・大きな貼り付けのファイル誘導 | 停止 → 続行を unit と `e2e-master-chat.mjs` で確認（10/10 継続）。履歴は再読み込み後も残る（Playwright 実測）。画像添付は `e2e-master-chat-image.mjs` が実 claude(haiku) で 7/7（ツール不使用のまま色を回答＝image ブロックが読まれている）。unit +16 本・既存 fail 0・build 成功。スクショは `tmp/shots-m4/` | **0.5 日** | PR-M3 |
 | **PR-M5** | **承認 / 質問 UI**。ebi-control（master ロール）に `approve` ツール新設 → `--permission-prompt-tool` 配線／`AskUserQuestion` の `tool_use` を選択肢 UI に／未応答スティッキーバー | `scripts/e2e-master-chat-approval.mjs`：承認往復でツール実行が継続する。未応答時に master が止まり、UI に待ち件数が出る | **1 日** | PR-M4 |
 | **PR-M6**（PR-M2 で前倒し済みの部分あり） | **usage / context / cost**。`turnEnd.usage` → `UsageStore` → `contextGuard` の入力載せ替えと `rate_limit_event` の枠取り込みは **PR-M2 で実装済み**。残りは UI（ヘッダのコスト・文脈%表示、算出不能 backend の「—」）と `e2e-context-guard.mjs` の改修 | `e2e-context-guard.mjs` 改修版が green。statusLine 併走比較で文脈%の誤差が許容内（**PoC ⑤ の結果次第**） | **1 日** | PR-M2 |
 | **PR-M7** | **移行と docs**。`EBI_MASTER_UI` env・ロールバック手順・e2e 再構成・README / `docs/backends/*.md` 追記・OSS 向け構成例 | 第 1 段（`ui` 未指定）で既存 e2e が全部 green。docs に規約の原文と URL が載っている | **0.5 日** | PR-M5 / PR-M6 |

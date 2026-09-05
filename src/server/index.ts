@@ -55,6 +55,7 @@ import {
   applyMasterUiOverride,
 } from "./fixedEbi.ts";
 import { MasterSession } from "./master/session.ts";
+import { ChatAttachmentStore, MAX_ATTACHMENTS_PER_TURN } from "./chatAttachments.ts";
 import { configureFixedEbiLog, fixedEbiLogPath, logFixedEbi } from "./fixedEbiLog.ts";
 import { NoticeBuffer, DEFAULT_NOTICE_BUFFER_SIZE } from "./noticeBuffer.ts";
 import { createControlApi, type GeneralizedSpawnParams } from "./control.ts";
@@ -148,6 +149,12 @@ const MASTER_CHAT_LOG_PATH =
     ? null
     : (process.env.EBI_MASTER_CHAT_LOG_PATH ??
       join(process.cwd(), ".ebi-team", "master-chat.jsonl"));
+// チャット添付（ペースト/ドロップ画像・大きな貼り付け）の保存先。
+// 既定は `<cwd>/.ebi-team/chat-attachments/`。env EBI_CHAT_ATTACH_DIR で変更できる
+//（e2e / スクショ取得では mkdtemp 配下を指してリポジトリを汚さない）。
+const CHAT_ATTACH_DIR =
+  process.env.EBI_CHAT_ATTACH_DIR ?? join(process.cwd(), ".ebi-team", "chat-attachments");
+const chatAttachments = new ChatAttachmentStore(CHAT_ATTACH_DIR);
 // 再アタッチ用スクロールバックのリングバッファ上限（バイト相当・既定 1MB）。
 // インライン TUI 化（agent.ts の INLINE_TUI_ENV）以降、ここには代替スクリーンの再描画ノイズでは
 // なく「実ログ」が積まれるため、リロード後に十分遡れるよう既定を広げている。
@@ -636,6 +643,13 @@ const controlApi = createControlApi({
   },
   // 画像 viewer のバイナリ配信（クライアントの <img src="/control/viewer-file?id=..."> が叩く）。
   readViewerFile: (id) => viewerRegistry.readImage(id),
+  // チャット添付（PR-M4）。chat モードの master が居ないときは受け付けない
+  //（ui:"terminal" 構成に新しい書き込み口を作らない）。
+  saveChatAttachment: async (bytes, mediaType) => {
+    if (!masterSession) throw new Error('チャット添付は ui:"chat" の master が居るときだけ使えます');
+    return chatAttachments.save(bytes, mediaType);
+  },
+  readChatAttachment: async (name) => (masterSession ? chatAttachments.read(name) : null),
 });
 
 /** HTML を期待するリクエスト（ブラウザ遷移）かを Accept ヘッダで大まかに判定する。 */
@@ -916,8 +930,27 @@ function handleClientMessage(ws: WebSocket, msg: ClientMessage): void {
     case "chatSend": {
       const session = chatSessionFor(ws, msg.id);
       if (!session) break;
-      void session.sendUserText(msg.text).then((r) => {
+      void (async () => {
+        // 添付は「保存済み basename」でしか参照できない（クライアントは任意パスを送れない）。
+        // ここで実体を読み直して base64 化し、stream-json の image ブロックに載せる。
+        const attachments = (msg.attachments ?? []).slice(0, MAX_ATTACHMENTS_PER_TURN);
+        const images: { mediaType: string; base64: string }[] = [];
+        const resolved: typeof attachments = [];
+        for (const a of attachments) {
+          const file = await chatAttachments.read(a.name);
+          if (!file) {
+            send(ws, { type: "error", text: `添付が見つかりません: ${a.name}` });
+            continue;
+          }
+          resolved.push({ ...a, path: file.path, mediaType: file.mediaType });
+          if (file.mediaType.startsWith("image/")) {
+            images.push({ mediaType: file.mediaType, base64: file.bytes.toString("base64") });
+          }
+        }
+        const r = await session.sendUserText(msg.text, { images, attachments: resolved });
         if (!r.accepted) send(ws, { type: "error", text: r.reason ?? "送信できませんでした" });
+      })().catch((err) => {
+        send(ws, { type: "error", text: `送信に失敗しました: ${(err as Error).message}` });
       });
       break;
     }

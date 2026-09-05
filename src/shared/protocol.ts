@@ -460,6 +460,26 @@ export type ServerMessage =
 //  - `user`:    ボスがチャット欄から送った発話（再接続時の復元に必要）
 //  - `inbound`: エビからの reply_to_master / idle 通知（`deliveryTag` を剥がして構造化）
 
+/**
+ * チャットに添付したファイル 1 件（PR-M4）。
+ *
+ * 実体は **サーバが保存した絶対パス**で、クライアントは `POST /control/chat-attach` の
+ * 応答として受け取ったものをそのまま送り返す（クライアントから任意パスは指定できない＝
+ * サーバ側は保存ディレクトリ配下の basename だけを受け付ける）。
+ */
+export interface ChatAttachment {
+  /** 保存先の basename（`chat-<ts>-<rand>.png` 形式）。サーバの検証キー。 */
+  name: string;
+  /** 保存先の絶対パス（表示・master への提示用）。 */
+  path: string;
+  /** MIME（`image/png` 等。image/* だけが image ブロックとして投入される）。 */
+  mediaType: string;
+  /** サムネイル取得用の URL（`/control/chat-attachment?name=...`）。 */
+  url: string;
+  /** バイト数（UI 表示用）。 */
+  bytes: number;
+}
+
 /** チャット UI に出す usage（MasterUsage のワイヤ表現）。 */
 export interface MasterChatUsage {
   input: number | null;
@@ -484,7 +504,7 @@ export type MasterChatEvent =
       mcpServers: { name: string; status: string }[];
       capabilities: string[];
     }
-  | { kind: "user"; text: string }
+  | { kind: "user"; text: string; attachments?: ChatAttachment[] }
   | {
       kind: "inbound";
       /** 送信元エビ id。 */
@@ -544,6 +564,11 @@ export interface ChatSendMessage {
   /** master の agent id（既定 "master"）。 */
   id: string;
   text: string;
+  /**
+   * 添付画像（PR-M4）。`POST /control/chat-attach` で保存済みのものだけを参照する。
+   * サーバは image/* のものを stream-json の image content block として投入する。
+   */
+  attachments?: ChatAttachment[];
 }
 
 /** 承認/質問への応答（クライアント → サーバ。実配線は PR-M5）。 */

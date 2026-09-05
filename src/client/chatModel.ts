@@ -12,11 +12,16 @@
 //  - tool: `toolCall` と `toolResult` は同じ `id` を持つ 1 つのアイテム（UI では `<details>` 1 個）。
 //  - turnEnd: 開いたままの streaming があれば閉じる。usage からコストと文脈% を拾う。
 
-import type { MasterChatEnvelope, MasterChatEvent, MasterChatUsage } from "../shared/protocol.ts";
+import type {
+  ChatAttachment,
+  MasterChatEnvelope,
+  MasterChatEvent,
+  MasterChatUsage,
+} from "../shared/protocol.ts";
 
 /** 画面に並べる 1 アイテム。 */
 export type ChatItem =
-  | { kind: "user"; seq: number; ts: number; text: string }
+  | { kind: "user"; seq: number; ts: number; text: string; attachments: ChatAttachment[] }
   | { kind: "assistant"; seq: number; ts: number; text: string; streaming: boolean }
   | { kind: "thinking"; seq: number; ts: number; text: string; streaming: boolean }
   | { kind: "inbound"; seq: number; ts: number; from: string; tag: "reply" | "idle" | "message"; text: string }
@@ -126,7 +131,7 @@ export class ChatTranscript {
     switch (ev.kind) {
       case "user":
         this.closeStream();
-        return this.push({ kind: "user", seq, ts, text: ev.text });
+        return this.push({ kind: "user", seq, ts, text: ev.text, attachments: ev.attachments ?? [] });
       case "inbound":
         this.closeStream();
         return this.push({ kind: "inbound", seq, ts, from: ev.from, tag: ev.tag, text: ev.text });
@@ -341,4 +346,139 @@ export function stateLabel(state: string): string {
     default:
       return state;
   }
+}
+
+// ===== 入力系（PR-M4）=====
+
+/**
+ * 貼り付けをファイルへ落とす閾値（文字数）。
+ * これを超える貼り付けは入力欄へ展開せず、サーバへ保存してパスを添える誘導に切り替える
+ * （設計書 §9 PR-M4「大きな貼り付けはファイルに落として『パスを添えて送る』誘導」）。
+ */
+export const LARGE_PASTE_CHARS = 8_000;
+
+/** 入力履歴の保持件数（直近 N 件）。 */
+export const INPUT_HISTORY_LIMIT = 50;
+
+/** localStorage のキー（v1: 文字列配列の JSON・古い→新しい順）。 */
+export const INPUT_HISTORY_KEY = "ebi-team.chat.inputHistory.v1";
+
+/** localStorage の必要な部分だけを写した最小インターフェース（unit から差し替えるため）。 */
+export interface HistoryStorage {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+}
+
+/**
+ * 入力履歴（↑/↓ で過去の送信文を辿る）。
+ *
+ * DOM に依存しない純クラス。localStorage は `HistoryStorage` として外から渡す
+ * （渡さなければメモリのみ＝プライベートモードや localStorage 例外でも壊れない）。
+ *
+ * 辿り方はシェルと同じ:
+ *  - `prev()` で 1 つ古い方へ。最古まで行ったら null（それ以上動かさない）
+ *  - `next()` で 1 つ新しい方へ。末端まで戻ると「辿り始めたときの編集中テキスト」を返す
+ *  - `push()`（送信時）で履歴に積み、辿り位置をリセットする
+ */
+export class InputHistory {
+  /** 古い → 新しい順。 */
+  private entries: string[] = [];
+  /** 0 = 最新、1 = その 1 つ前…。-1 は「辿っていない（編集中）」。 */
+  private cursor = -1;
+  /** 辿り始める直前に入力欄にあったテキスト（末端まで戻ったときに復元する）。 */
+  private draft = "";
+
+  constructor(
+    private readonly storage: HistoryStorage | null = null,
+    private readonly key: string = INPUT_HISTORY_KEY,
+    private readonly limit: number = INPUT_HISTORY_LIMIT,
+  ) {}
+
+  /** 保存済み履歴を読み込む（壊れた JSON は黙って捨てる）。 */
+  load(): void {
+    if (!this.storage) return;
+    let raw: string | null = null;
+    try {
+      raw = this.storage.getItem(this.key);
+    } catch {
+      return; // ストレージ自体が使えない環境（プライベートモード等）
+    }
+    if (!raw) return;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return;
+      this.entries = parsed.filter((v): v is string => typeof v === "string").slice(-this.limit);
+    } catch {
+      this.entries = [];
+    }
+  }
+
+  /** 送信した本文を積む（空文字は無視・直前と同じ本文は重複させない）。 */
+  push(text: string): void {
+    const value = text.trim();
+    this.reset();
+    if (!value) return;
+    if (this.entries[this.entries.length - 1] === value) return;
+    // 同じ本文が過去にあれば消してから末尾へ（履歴が同じ文で埋まらないように）。
+    const dup = this.entries.indexOf(value);
+    if (dup >= 0) this.entries.splice(dup, 1);
+    this.entries.push(value);
+    if (this.entries.length > this.limit) this.entries.splice(0, this.entries.length - this.limit);
+    this.persist();
+  }
+
+  /** ↑（1 つ古い方へ）。これ以上遡れなければ null。 */
+  prev(current: string): string | null {
+    if (this.entries.length === 0) return null;
+    if (this.cursor < 0) this.draft = current;
+    if (this.cursor + 1 >= this.entries.length) return null;
+    this.cursor += 1;
+    return this.entries[this.entries.length - 1 - this.cursor] ?? null;
+  }
+
+  /** ↓（1 つ新しい方へ）。末端では編集中テキストへ戻る。辿っていなければ null。 */
+  next(): string | null {
+    if (this.cursor < 0) return null;
+    this.cursor -= 1;
+    if (this.cursor < 0) return this.draft;
+    return this.entries[this.entries.length - 1 - this.cursor] ?? null;
+  }
+
+  /** 辿り位置を初期化する（送信時・自分で編集し始めたとき）。 */
+  reset(): void {
+    this.cursor = -1;
+    this.draft = "";
+  }
+
+  /** いま履歴を辿っている最中か。 */
+  get navigating(): boolean {
+    return this.cursor >= 0;
+  }
+
+  /** 保持件数（テスト・デバッグ用）。 */
+  get size(): number {
+    return this.entries.length;
+  }
+
+  /** 保持している履歴（古い→新しい）のコピー。 */
+  list(): string[] {
+    return [...this.entries];
+  }
+
+  private persist(): void {
+    if (!this.storage) return;
+    try {
+      this.storage.setItem(this.key, JSON.stringify(this.entries));
+    } catch {
+      // 容量超過などで書けなくてもチャットは壊さない（メモリ内の履歴は生きている）。
+    }
+  }
+}
+
+/** バイト数の短い表示（添付チップ用）。 */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return "—";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
