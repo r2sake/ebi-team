@@ -16,8 +16,10 @@ import {
   LARGE_PASTE_CHARS,
   NO_RATE_LIMITS,
   oneLine,
+  sendEnabled,
   settledLabel,
   stateLabel,
+  stopEnabled,
   lightboxCounter,
   LightboxState,
   stringifyInput,
@@ -57,6 +59,8 @@ export class ChatPanel {
   private readonly pendingBar: HTMLElement;
   private readonly input: HTMLTextAreaElement;
   private readonly sendBtn: HTMLButtonElement;
+  /** 中断ボタン（PR-M11 で送信から分離。実行中だけ押せる）。 */
+  private readonly stopBtn: HTMLButtonElement;
   /** 添付トレイ（送信前の画像サムネイル）。 */
   private readonly trayEl: HTMLElement;
   /** 大きな貼り付け・添付エラーの一時メッセージ。 */
@@ -153,11 +157,20 @@ export class ChatPanel {
     });
     this.el.addEventListener("dragleave", () => this.el.classList.remove("dragover"));
     this.el.addEventListener("drop", (e) => this.onDrop(e));
+    // 停止は送信とは別のボタンにする（PR-M11）。同じボタンが状態で意味を変えると、
+    // 走行中の master へ話しかけたつもりが中断になる（2026-09-05 の事故）。
+    this.stopBtn = document.createElement("button");
+    this.stopBtn.className = "chat-stop";
+    this.stopBtn.textContent = "\u23f9";
+    this.stopBtn.title = "実行中のターンを中断します（会話は消えません）";
+    this.stopBtn.setAttribute("aria-label", "停止");
+    this.stopBtn.addEventListener("click", () => this.onStopClick());
     this.sendBtn = document.createElement("button");
     this.sendBtn.className = "chat-send";
+    this.sendBtn.textContent = "送信";
     this.sendBtn.addEventListener("click", () => this.onSendClick());
     const row = div("chat-input-row");
-    row.append(this.input, this.sendBtn);
+    row.append(this.input, this.stopBtn, this.sendBtn);
     this.trayEl = div("chat-tray");
     this.trayEl.hidden = true;
     this.hintEl = div("chat-hint");
@@ -278,12 +291,8 @@ export class ChatPanel {
 
   private onSendClick(): void {
     if (!this.masterId) return;
-    // 実行中は ⏹（中断）として振る舞う。
-    if (this.state === "busy") {
-      this.onStop(this.masterId);
-      return;
-    }
-    if (this.state === "starting" || this.state === "stopped") return;
+    // busy 中も送れる（走行中ターンに合流する）。送れないのは頭脳が居ないときだけ。
+    if (!sendEnabled(this.state)) return;
     const text = this.input.value.trim();
     // 添付だけで送るケース（画像を貼って Enter）も許す。
     if (!text && this.attachments.length === 0) return;
@@ -294,6 +303,13 @@ export class ChatPanel {
     this.input.value = "";
     this.autoGrow();
     this.scrollToBottom(true);
+  }
+
+  /** ⏹ の押下。実行中ターンだけを中断する（会話は殺さない）。 */
+  private onStopClick(): void {
+    if (!this.masterId) return;
+    if (!stopEnabled(this.state)) return;
+    this.onStop(this.masterId);
   }
 
   // ---- 添付（ペースト / ドロップ）----
@@ -420,15 +436,15 @@ export class ChatPanel {
 
   /** 状態に応じて送信ボタン・入力欄・pending バーを更新する。 */
   private syncControls(): void {
-    const busy = this.state === "busy";
-    this.sendBtn.textContent = busy ? "⏹ 停止" : "送信";
-    this.sendBtn.classList.toggle("stop", busy);
-    const blocked = this.state === "starting" || this.state === "stopped";
+    const blocked = !sendEnabled(this.state);
     this.sendBtn.disabled = blocked;
+    this.stopBtn.disabled = !stopEnabled(this.state);
     this.input.disabled = blocked;
     this.input.placeholder = blocked
       ? "master（chat）が起動していません…"
-      : "master に話しかける（Enter で送信 / Shift+Enter で改行）";
+      : this.state === "busy"
+        ? "実行中でも送れます（Enter で送信 / 中断は ⏹）"
+        : "master に話しかける（Enter で送信 / Shift+Enter で改行）";
     this.newBtn.disabled = this.state === "starting";
     if (this.pending > 0) {
       this.pendingBar.hidden = false;
