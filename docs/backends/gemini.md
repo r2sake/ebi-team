@@ -359,3 +359,26 @@ N ラウンド成功し日本語 3〜5 行で返る (5) 撤収後にプロセス
 
 **実測（2026-09-05・gemini-cli 0.58.0 / `gemini-3.5-flash`）**: 6/6 OK。
 `ask_supervisor` 5/5 成功・3〜5 行の日本語 5/5・**平均 21.0 秒/回**（claude/Haiku よりは遅い）。
+
+---
+
+## 13. master 頭脳としては**対象外**（`brain:"gemini"` は実装しない）
+
+> ここは**作業エビの backend**（§1〜§12）ではなく、master をチャット UI（`ui:"chat"`）で動かすときの
+> 頭脳の話。関連: [`claude.md`](claude.md) / [`../ops/master-chat-ui.md`](../ops/master-chat-ui.md) /
+> 設計 [`../design/master-chat-ui-2026-09-05.md`](../design/master-chat-ui-2026-09-05.md) §1.3・裁定 Q-2
+
+`fixedEbi[].brain` の値域には `gemini` も含まれるが、**実装しない**（ボス裁定 Q-2 = 対象外）。
+指定すると起動時に `MasterBrainNotImplementedError` で止まる（黙って claude に落とさない）。
+
+理由は 2 つ。
+
+1. **多ターンを 1 プロセスで回す入り口が無い。** 実測（0.58.0）で **`--input-format` フラグが存在しない**。
+   `-o/--output-format` に `stream-json` はあるが**出力側だけ**で、公式 headless ドキュメントにも入力側の記述は無い
+   （https://github.com/google-gemini/gemini-cli/blob/main/docs/cli/headless.md — イベントは `init`/`message`/`tool_use`/`tool_result`/`error`/`result`）。
+   残る手段は `--acp`（Agent Client Protocol・stdio JSON-RPC）だけで、別実装が要る。
+   代替の「毎ターン `-p` + `-r latest` で再起動」は、master の中央値 313k という文脈を**毎ターン読み直す**ことになり、
+   レイテンシとレート枠の両面で非現実的。
+2. **投資対効果**。Gemini CLI は Antigravity CLI へのリタイア移行中で、いま ACP 実装に工数を割く価値が薄い。
+
+**作業エビ（`researcher` 等）としての gemini は従来どおり使える**（§1〜§12）。変わったのは「master の頭脳には使わない」ことだけ。

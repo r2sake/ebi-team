@@ -14,6 +14,8 @@
     "start": "EBI_IDLE_NOTIFY=off node dist/server/server/index.js",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.server.json",
     "test:unit": "node --import tsx --test test/*.test.ts",
+    "test": "npm run test:unit",
+    "e2e:fixed": "node scripts/e2e-fixed-ebi.mjs",
     "e2e:minaebi": "node scripts/e2e-fixed-minaebi.mjs",
     "gen:master-mcp": "node scripts/gen-master-mcp.mjs",
     "gen:master-mcp:dev": "node scripts/gen-master-mcp.mjs --dev",
@@ -37,6 +39,10 @@
     "e2e:viewer-persist": "node scripts/e2e-viewer-persist.mjs",
     "e2e:imagegen": "node --import tsx scripts/e2e-imagegen.mjs",
     "imagegen:check": "node --import tsx scripts/imagegen-check.mjs",
+    "e2e:master-brain": "node --import tsx scripts/e2e-master-brain.mjs",
+    "compare:contextpct": "node --import tsx scripts/compare-contextpct-statusline.mjs",
+    "e2e:all-terminal": "unset EBI_ID; export EBI_IDLE_NOTIFY=on; npm run e2e:control && npm run e2e:send && npm run e2e:reverse-notify && npm run e2e:notify-fallback && npm run e2e:delivery-hardening && npm run e2e:usage && npm run e2e:viewer && npm run e2e:viewer-persist && npm run e2e:supervisor && npm run e2e:fixed && npm run e2e:minaebi && npm run e2e:context-guard && npm run e2e:spawn-delivery",
+    "e2e:all-chat": "unset EBI_ID; export EBI_IDLE_NOTIFY=on; npm run e2e:context-guard && npm run e2e:master-chat && npm run e2e:master-chat-image",
     "postinstall": "node scripts/fix-pty-helper.mjs"
   },
   "dependencies": {
