@@ -1,6 +1,16 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
+import {
+  DEFAULT_BACKEND_ID,
+  GEMINI_TRAITS,
+  applyEnvDenyList,
+  getBackend,
+  resolveGeminiModel,
+  toGeminiApprovalMode,
+  writeGeminiRuntime,
+  type BackendId,
+} from "./backends/index.ts";
 
 /**
  * 監督・要約エンジン（サブスク課金・API キー不要）。
@@ -21,8 +31,24 @@ import { join } from "node:path";
  *   本番では未設定＝`claude --print --model haiku` 既定。
  */
 
-// 要約に使うモデル alias（サブスク・最安の Haiku）。
-const SUMMARY_MODEL = "haiku";
+// claude エンジンで要約に使うモデル alias（サブスク・最安の Haiku）。
+const CLAUDE_SUMMARY_MODEL = "haiku";
+
+/**
+ * gemini エンジンで要約に使う既定モデル（明示 ID）。
+ *
+ * 実測（2026-09-05・gemini-cli 0.58.0 / Code Assist 経路）:
+ * - `gemini-3.8-flash`（ボス言うところの「Flash 3.8」）は Gemini API / AI Studio には実在するが、
+ *   **Code Assist 経路では未提供**。指定しても 404 にはならず、存在しない `gemini-9.9-flash` と
+ *   同じく**黙って `gemini-3.5-flash` にフォールバック**して応答が返る（-o json の
+ *   stats.models キーが `gemini-3.5-flash` になることで判別できる）。
+ * - `gemini-flash-latest` / `*-preview` / `*-lite` 等の alias は従来どおり 404。
+ * したがって「実際に使える Flash 系最新」＝ `gemini-3.5-flash` を明示指定する。
+ */
+const GEMINI_SUMMARY_MODEL = "gemini-3.5-flash";
+
+/** 要約エンジン用の per-エビ runtime（役割 GEMINI.md / settings.json）の agentId。 */
+const GEMINI_SUMMARY_AGENT_ID = "_supervisor-summary";
 // ワンショット要約のタイムアウト（ms）。固まり防止。
 const TIMEOUT_MS = 60_000;
 // claude へ渡すスクロールバックの上限（文字）。長すぎる入力を末尾優先で切り詰める。
@@ -46,61 +72,167 @@ export type SummarizeResult =
   | { ok: true; text: string }
   | { ok: false; reason: string };
 
+/** 要約エンジン 1 回分の起動形（純関数で決める＝単体テスト対象）。 */
+export interface SummaryEngine {
+  /** 起動バイナリ。 */
+  cmd: string;
+  /** プロンプト本文より前に置く固定引数。 */
+  baseArgs: string[];
+  /**
+   * プロンプト本文の直前に置くフラグ（gemini は `-p`、claude は位置引数なので null）。
+   */
+  promptFlag: string | null;
+  /**
+   * 役割 system prompt を引数で渡す場合の引数列（claude の `--append-system-prompt`）。
+   * gemini は per-エビ GEMINI.md（env 経由）で渡すので空。
+   */
+  systemPromptArgs: string[];
+  /** subprocess に足す env（gemini の system settings パス等）。 */
+  env: Record<string, string>;
+  /** どのバックエンドで要約するか（表示・ログ用）。スタブは null。 */
+  backend: BackendId | null;
+  /** 実際に使うモデル（表示・ログ用）。スタブは null。 */
+  model: string | null;
+  /** EBI_SUMMARY_CMD で差し替えたスタブか。 */
+  isStub: boolean;
+}
+
+/** 要約エンジンの設定（常駐 supervisor 固定エビの backend / model を流用する）。 */
+export interface SupervisorOptions {
+  /** 要約に使うバックエンド。未指定は claude（従来どおり）。 */
+  backend?: BackendId | null;
+  /** 要約に使うモデル。未指定は各バックエンドの既定要約モデル。 */
+  model?: string | null;
+  /** gemini runtime（GEMINI.md / settings.json）の出力先ベース（テスト用）。 */
+  geminiRuntimeBaseDir?: string;
+}
+
 /**
- * 要約エンジンの起動コマンドを決める。
- * 既定: `claude --print --model haiku --strict-mcp-config`。
- * `EBI_SUMMARY_CMD`（スペース区切り）があればそれを使う（テスト用スタブ）。
- * 返すのは「コマンド + 固定引数」。要約指示・ログ本文は呼び出し側で末尾に積む。
+ * 要約エンジンの起動形を決める。
+ *
+ * 優先順:
+ *   1. `EBI_SUMMARY_CMD`（スペース区切り・テスト用スタブ）— backend 指定より強い
+ *   2. opts.backend（＝ config の supervisor 固定エビの backend）
+ *   3. claude（既定・従来どおり `claude --print --model haiku --strict-mcp-config`）
+ *
+ * gemini は `--append-system-prompt` 相当を持たないため、役割プロンプトは
+ * **per-エビ GEMINI.md**（`writeGeminiRuntime`・既存の役割プロンプト機構）で渡す。
+ * また承認ダイアログが出ると `-p` のワンショットが応答を返さないため **yolo 固定**にする
+ * （`acceptEdits`（auto_edit）は MCP 呼び出し・workspace 外読み取りで止まる）。
+ *
+ * codex は要約エンジンとしては未対応（`--print` 相当のワンショット非対話が別方言）。
+ * 指定されたら claude へフォールバックする（黙って落とさず describeStartup で明示する）。
  */
-function summaryCommand(): { cmd: string; baseArgs: string[]; isStub: boolean } {
+export function resolveSummaryEngine(opts?: SupervisorOptions): SummaryEngine {
   const override = (process.env.EBI_SUMMARY_CMD ?? "").trim();
   if (override) {
     const parts = override.split(/\s+/);
-    return { cmd: parts[0], baseArgs: parts.slice(1), isStub: true };
+    return {
+      cmd: parts[0],
+      baseArgs: parts.slice(1),
+      promptFlag: null,
+      systemPromptArgs: [],
+      env: {},
+      backend: null,
+      model: null,
+      isStub: true,
+    };
   }
+
+  if (opts?.backend === "gemini") {
+    const model = resolveGeminiModel(opts.model ?? null, GEMINI_SUMMARY_MODEL);
+    return {
+      cmd: getBackend("gemini").defaultCommand,
+      // -p: 非対話（headless）。承認ダイアログで固まらないよう yolo 固定。
+      baseArgs: ["-m", model, "--approval-mode", toGeminiApprovalMode("bypassPermissions")],
+      promptFlag: "-p",
+      systemPromptArgs: [],
+      env: geminiSummaryEnv(opts.geminiRuntimeBaseDir),
+      backend: "gemini",
+      model,
+      isStub: false,
+    };
+  }
+
+  const model = opts?.model ?? CLAUDE_SUMMARY_MODEL;
   return {
-    cmd: "claude",
+    cmd: getBackend(DEFAULT_BACKEND_ID).defaultCommand,
     // --print: ワンショット非対話。--strict-mcp-config: 余計な MCP を読み込ませない。
-    baseArgs: ["--print", "--model", SUMMARY_MODEL, "--strict-mcp-config"],
+    baseArgs: ["--print", "--model", model, "--strict-mcp-config"],
+    promptFlag: null,
+    systemPromptArgs: ["--append-system-prompt", SYSTEM_PROMPT],
+    env: {},
+    backend: "claude",
+    model,
     isStub: false,
   };
 }
 
-export class Supervisor {
-  /** 要約機能が有効か（claude バイナリ or スタブが使えるか）。 */
-  readonly enabled: boolean;
-  private readonly cmd: string;
-  private readonly baseArgs: string[];
-  private readonly isStub: boolean;
+/**
+ * gemini ワンショット要約用の env を作る。
+ * 役割プロンプト（SYSTEM_PROMPT）を per-エビ GEMINI.md として書き出し、その置き場を
+ * `context.includeDirectories` に入れた system settings のパスを返す（制御MCP は載せない）。
+ */
+function geminiSummaryEnv(baseDir?: string): Record<string, string> {
+  return writeGeminiRuntime({
+    agentId: GEMINI_SUMMARY_AGENT_ID,
+    mcpConfigPath: null,
+    systemPrompt: SYSTEM_PROMPT,
+    baseDir,
+  });
+}
 
-  constructor() {
-    const { cmd, baseArgs, isStub } = summaryCommand();
-    this.cmd = cmd;
-    this.baseArgs = baseArgs;
-    this.isStub = isStub;
-    // スタブ時は常に有効。既定（claude）時は PATH 上に claude があるかで判定する。
-    this.enabled = isStub || hasBinaryOnPath(cmd);
+/** 要約 1 回分の実引数を組み立てる純関数（プロンプト本文は常に最後）。 */
+export function buildSummaryArgs(engine: SummaryEngine, prompt: string): string[] {
+  const args = [...engine.baseArgs, ...engine.systemPromptArgs];
+  if (engine.promptFlag) args.push(engine.promptFlag);
+  args.push(prompt);
+  return args;
+}
+
+export class Supervisor {
+  /** 要約機能が有効か（要約エンジンのバイナリ or スタブが使えるか）。 */
+  readonly enabled: boolean;
+  private readonly engine: SummaryEngine;
+  /** codex を指定されて claude へフォールバックしたか（起動ログで明示する）。 */
+  private readonly fellBackFromBackend: BackendId | null;
+
+  constructor(opts?: SupervisorOptions) {
+    // codex はワンショット要約エンジン未対応。claude へ落として起動ログで明示する。
+    const requested = opts?.backend ?? null;
+    const usable = requested === "codex" ? null : requested;
+    this.fellBackFromBackend = requested === "codex" ? requested : null;
+    this.engine = resolveSummaryEngine({ ...opts, backend: usable });
+    // スタブ時は常に有効。既定時は PATH 上にバイナリがあるかで判定する。
+    this.enabled = this.engine.isStub || hasBinaryOnPath(this.engine.cmd);
   }
 
   /**
    * 起動時ログ。キー等の機密は出さない。有効/無効と要約エンジンのみ。
    */
   describeStartup(): string {
-    if (this.enabled) {
-      return this.isStub
-        ? `監督・要約: 有効（スタブ: ${this.cmd}）`
-        : "監督・要約: 有効（サブスク claude CLI / Haiku ワンショット要約）";
+    const note =
+      this.fellBackFromBackend === null
+        ? ""
+        : `（supervisor の backend=${this.fellBackFromBackend} は要約エンジン未対応のため claude で代替）`;
+    if (!this.enabled) {
+      return `監督・要約: 無効（${this.engine.cmd} が PATH に見つかりません）${note}`;
     }
-    return "監督・要約: 無効（claude が PATH に見つかりません）";
+    if (this.engine.isStub) return `監督・要約: 有効（スタブ: ${this.engine.cmd}）`;
+    const label =
+      this.engine.backend === "gemini"
+        ? `サブスク gemini CLI / ${this.engine.model} ワンショット要約`
+        : `サブスク claude CLI / ${this.engine.model} ワンショット要約`;
+    return `監督・要約: 有効（${label}）${note}`;
   }
 
   /**
-   * 対象 agent のスクロールバックを Haiku で 1 回だけ要約する。
-   * claude が無い（enabled=false）ときは notice を返す。
+   * 対象 agent のスクロールバックを要約エンジンで 1 回だけ要約する。
+   * エンジンのバイナリが無い（enabled=false）ときは notice を返す。
    */
   async summarize(scrollback: string): Promise<SummarizeResult> {
     if (!this.enabled) {
-      return { ok: false, reason: "監督・要約は無効です（claude が見つかりません）" };
+      return { ok: false, reason: `監督・要約は無効です（${this.engine.cmd} が見つかりません）` };
     }
 
     const trimmed = scrollback.trim();
@@ -112,21 +244,15 @@ export class Supervisor {
     const input =
       trimmed.length > MAX_INPUT_CHARS ? trimmed.slice(-MAX_INPUT_CHARS) : trimmed;
 
-    // 要約指示 + ログ本文を 1 つのプロンプト引数にまとめる（--print の位置引数）。
+    // 要約指示 + ログ本文を 1 つのプロンプト引数にまとめる。
     const prompt =
       "以下はあるセッションの直近ターミナル出力です。指示どおり日本語で要約してください。\n\n" +
       "```\n" +
       input +
       "\n```";
 
-    // 役割 system prompt は --append-system-prompt で注入する。
-    // スタブ（echo 等）では claude 固有フラグを解釈できないので付けない。
-    const args = this.isStub
-      ? [...this.baseArgs, prompt]
-      : [...this.baseArgs, "--append-system-prompt", SYSTEM_PROMPT, prompt];
-
     try {
-      const text = await runOnce(this.cmd, args);
+      const text = await runOnce(this.engine.cmd, buildSummaryArgs(this.engine, prompt), this.engine);
       const cleaned = text.trim();
       if (!cleaned) return { ok: false, reason: "要約が空でした" };
       return { ok: true, text: cleaned };
@@ -141,7 +267,13 @@ export class Supervisor {
  * subprocess を 1 回だけ実行し、stdout を文字列で返す（引数配列・シェル非経由）。
  * タイムアウト・非0終了・stdout 上限超過は reject する。
  */
-function runOnce(cmd: string, args: string[]): Promise<string> {
+function runOnce(cmd: string, args: string[], engine: SummaryEngine): Promise<string> {
+  // gemini エンジンは API キー課金・別認証経路の env を親から落としてから起動する
+  //（PTY 経路の envDenyList と同じ扱い。サブスク枠以外に載せない）。
+  const parentEnv =
+    engine.backend === "gemini"
+      ? applyEnvDenyList(process.env, GEMINI_TRAITS.envDenyList)
+      : process.env;
   return new Promise((resolve, reject) => {
     execFile(
       cmd,
@@ -151,7 +283,8 @@ function runOnce(cmd: string, args: string[]): Promise<string> {
         maxBuffer: MAX_STDOUT_BYTES,
         // 標準出力を文字列で受ける。
         encoding: "utf8",
-        // PTY は使わない。stdin は閉じる（--print は stdin を待たない）。
+        env: { ...parentEnv, ...engine.env },
+        // PTY は使わない。stdin は閉じる（--print / -p は stdin を待たない）。
       },
       (error, stdout, stderr) => {
         if (error) {
