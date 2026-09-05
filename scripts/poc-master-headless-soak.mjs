@@ -15,7 +15,14 @@ const OUT = process.env.POC_OUT ?? join(ROOT, "tmp", "poc-m0-soak");
 const TOTAL_MIN = Number(process.env.POC_SOAK_MINUTES ?? 15);
 const INTERVAL_MIN = Number(process.env.POC_SOAK_INTERVAL_MIN ?? 5);
 mkdirSync(OUT, { recursive: true });
-const log = (m) => { const l = `[${new Date().toISOString()}] ${m}`; console.log(l); appendFileSync(join(OUT, "soak.log"), l + "\n"); };
+// 出力名はリポジトリの .gitignore（*.log）に掛からないよう .log.txt にする（証跡を残すため）
+const LOG = join(OUT, "soak.log.txt");
+const STDERR_LOG = join(OUT, "soak.stderr.log.txt");
+const FINDINGS = join(OUT, "soak-findings.json");
+const log = (m) => { const l = `[${new Date().toISOString()}] ${m}`; console.log(l); appendFileSync(LOG, l + "\n"); };
+
+// 親（起動シェル）が死んでも観測を続ける。nohup / setsid 起動と併用する。
+process.on("SIGHUP", () => log("SIGHUP 受信（無視して観測を継続）"));
 
 const env = { ...process.env };
 for (const k of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"]) delete env[k];
@@ -23,7 +30,8 @@ for (const k of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_UR
 const args = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
   "--replay-user-messages", "--permission-mode", "auto", "--model", "opus",
   "--append-system-prompt", "あなたは ebi-team の master です。1 行で簡潔に答えてください。"];
-const p = spawn("claude", args, { cwd: ROOT, env, stdio: ["pipe", "pipe", "pipe"] });
+// detached: 端末のプロセスグループ宛シグナルで claude が巻き添えで死なないよう分離する
+const p = spawn("claude", args, { cwd: ROOT, env, stdio: ["pipe", "pipe", "pipe"], detached: true });
 log(`spawn pid=${p.pid} total=${TOTAL_MIN}min interval=${INTERVAL_MIN}min`);
 
 const events = [];
@@ -39,11 +47,20 @@ createInterface({ input: p.stdout }).on("line", (line) => {
     lastCtx = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
   }
 });
-p.stderr.on("data", (d) => appendFileSync(join(OUT, "soak.stderr.log"), String(d)));
+p.stderr.on("data", (d) => appendFileSync(STDERR_LOG, String(d)));
 p.on("exit", (c, s) => log(`EXIT code=${c} sig=${s}`));
 
 const start = Date.now();
 let n = 0;
+
+// 中断されても直前までのサンプルが残るよう、ping ごとに上書き保存する
+function saveFindings(status) {
+  writeFileSync(FINDINGS, JSON.stringify({
+    status, totalMin: TOTAL_MIN, intervalMin: INTERVAL_MIN,
+    startedAt: new Date(start).toISOString(), updatedAt: new Date().toISOString(),
+    pid: process.pid, claudePid: p.pid, samples,
+  }, null, 2) + "\n");
+}
 async function ping() {
   n++;
   const before = events.length;
@@ -60,6 +77,7 @@ async function ping() {
         apiErrorStatus: r.api_error_status ?? null, text: String(r.result ?? "").slice(0, 80),
       };
       samples.push(s);
+      saveFindings("running");
       log(`ping#${n}: ${JSON.stringify(s)}`);
       // 認証系エラーの検出（サブスク OAuth 失効の一次シグナル）
       const errs = events.slice(before).filter((e) => JSON.stringify(e).includes("authentication_failed"));
@@ -69,15 +87,27 @@ async function ping() {
     await new Promise((r) => setTimeout(r, 500));
   }
   samples.push({ n, timeout: true, atMin: Math.round((Date.now() - start) / 6000) / 10 });
+  saveFindings("running");
   log(`ping#${n}: TIMEOUT`);
 }
 
+// 停止要求（kill $(cat soak.pid)）でも findings を残してから claude を落とす
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => {
+    log(`${sig} 受信: findings を保存して終了する`);
+    saveFindings("stopped");
+    try { p.kill("SIGKILL"); } catch {}
+    process.exit(0);
+  });
+}
+
+saveFindings("starting");
 await ping();
 const timer = setInterval(async () => {
   if ((Date.now() - start) / 60000 >= TOTAL_MIN) {
     clearInterval(timer);
-    writeFileSync(join(OUT, "soak-findings.json"), JSON.stringify({ totalMin: TOTAL_MIN, intervalMin: INTERVAL_MIN, samples }, null, 2) + "\n");
-    log(`done -> ${join(OUT, "soak-findings.json")}`);
+    saveFindings("completed");
+    log(`done -> ${FINDINGS}`);
     p.kill("SIGKILL");
     process.exit(0);
   }
