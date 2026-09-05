@@ -19,8 +19,10 @@ import {
   formatContextPct,
   formatCost,
   oneLine,
+  sendEnabled,
   settledLabel,
   stateLabel,
+  stopEnabled,
   summarizeToolInput,
 } from "../src/client/chatModel.ts";
 import type {
@@ -204,6 +206,27 @@ test("状態ラベルは日本語（未知の値はそのまま）", () => {
   assert.equal(stateLabel("busy"), "実行中…");
   assert.equal(stateLabel("waiting"), "応答待ち");
   assert.equal(stateLabel("zzz"), "zzz");
+});
+
+// ===== PR-M11（送信 / 停止の分離）=====
+
+test("busy 中でも送信できる（走行中ターンに合流する・送信が停止に化けない）", () => {
+  assert.equal(sendEnabled("busy"), true);
+  assert.equal(sendEnabled("idle"), true);
+  assert.equal(sendEnabled("waiting"), true);
+});
+
+test("頭脳が居ない状態（starting / stopped）では送信も停止もできない", () => {
+  for (const state of ["starting", "stopped"]) {
+    assert.equal(sendEnabled(state), false, state);
+    assert.equal(stopEnabled(state), false, state);
+  }
+});
+
+test("停止が押せるのはターン実行中（busy）だけ", () => {
+  assert.equal(stopEnabled("busy"), true);
+  assert.equal(stopEnabled("idle"), false);
+  assert.equal(stopEnabled("waiting"), false);
 });
 
 // ===== PR-M4（入力系）=====

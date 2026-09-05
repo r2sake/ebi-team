@@ -389,6 +389,23 @@ export function firstUnsettledPending(items: readonly ChatItem[]): number {
   return items.findIndex((it) => it.kind === "pending" && it.settled == null);
 }
 
+/**
+ * その状態で「送信」が押せるか（PR-M11）。
+ *
+ * busy でも **送れる**（＝走行中ターンに合流する。設計書 §2.3 修正点 F の実測）。
+ * 送れないのは頭脳プロセスが居ない starting / stopped だけ。
+ * 以前は busy のとき送信ボタンが「停止」に化けており、走行中の master へ話しかけようとすると
+ * 意図せず中断が飛んでいた（2026-09-05 の事故）ので、送信と停止は別のボタンに分けてある。
+ */
+export function sendEnabled(state: string): boolean {
+  return state !== "starting" && state !== "stopped";
+}
+
+/** その状態で「停止」が押せるか（PR-M11）。中断できるのはターン実行中だけ。 */
+export function stopEnabled(state: string): boolean {
+  return state === "busy";
+}
+
 /** チャット状態のラベル（ヘッダのバッジ）。 */
 export function stateLabel(state: string): string {
   switch (state) {

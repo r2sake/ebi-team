@@ -1142,7 +1142,9 @@ button:hover { filter: brightness(1.07); }
 }
 .chat-input:disabled { opacity: 0.6; }
 .chat-send { flex: 0 0 auto; min-height: 38px; }
-.chat-send.stop { background: var(--busy); }
+/* 中断ボタン（PR-M11・送信とは別のボタン）。押せるのは実行中だけ。 */
+.chat-stop { flex: 0 0 auto; min-height: 38px; font-size: 15px; background: var(--busy); }
+.chat-stop:disabled { opacity: 0.35; cursor: default; }
 
 /* 添付トレイ（送信前）と一時ヒント（PR-M4）。 */
 .chat-hint {
@@ -1320,6 +1322,7 @@ button:hover { filter: brightness(1.07); }
   /* iOS の自動ズーム抑止（16px 未満だと拡大される）。 */
   .chat-input { font-size: 16px; }
   .chat-send { min-height: 44px; padding: 6px 14px; }
+  .chat-stop { min-height: 44px; padding: 6px 12px; }
   /* 画像カードは吹き出し幅に従う（横はみ出しを作らない）。 */
   .chat-image-thumb { max-width: 100%; max-height: 200px; }
   .chat-lightbox { padding: 8px; }
