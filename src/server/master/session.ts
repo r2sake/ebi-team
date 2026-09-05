@@ -14,6 +14,7 @@
 
 import type {
   AgentRecord,
+  ChatAttachment,
   MasterChatEnvelope,
   MasterChatEvent,
   MasterChatState,
@@ -466,12 +467,33 @@ export class MasterSession {
    * ボスの発話（WS `chatSend`）。
    * ACK（`--replay-user-messages`）は 3〜5 秒かかるので**待たずに返す**（呼び出し側は投げっぱなし）。
    */
-  async sendUserText(text: string): Promise<{ accepted: boolean; reason?: string }> {
+  async sendUserText(
+    text: string,
+    opts: {
+      /** stream-json の image content block として載せる実体（サーバが読み出したもの）。 */
+      images?: { mediaType: string; base64: string }[];
+      /** UI 表示・master への提示用のメタ（保存先の絶対パスを含む）。 */
+      attachments?: ChatAttachment[];
+    } = {},
+  ): Promise<{ accepted: boolean; reason?: string }> {
     const brain = this.brain;
     if (!brain) return { accepted: false, reason: "master（chat）が起動していません" };
-    this.emitChat({ kind: "user", text });
+    const attachments = opts.attachments ?? [];
+    this.emitChat({
+      kind: "user",
+      text,
+      ...(attachments.length > 0 ? { attachments } : {}),
+    });
     this.markBusy();
-    void brain.send({ text }).catch((err) => {
+    // 画像は image ブロックとして載せるが、**絶対パスも本文に添える**。
+    // master がツール（Read/Bash）で同じファイルを扱えるようにするためで、
+    // 画像そのものの内容は image ブロック側から伝わる。
+    const body =
+      attachments.length > 0
+        ? `${text}\n\n[添付ファイル]\n${attachments.map((a) => a.path).join("\n")}`
+        : text;
+    const images = opts.images ?? [];
+    void brain.send({ text: body, ...(images.length > 0 ? { images } : {}) }).catch((err) => {
       this.emit({ kind: "notice", level: "error", text: `送信に失敗しました: ${(err as Error).message}` });
     });
     return { accepted: true };

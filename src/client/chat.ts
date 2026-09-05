@@ -1,13 +1,17 @@
 import type {
+  ChatAttachment,
   MasterChatEnvelope,
   MasterChatState,
   UsageMessage,
 } from "../shared/protocol.ts";
 import {
   ChatTranscript,
+  formatBytes,
   formatContextPct,
   formatCost,
   headerMetrics,
+  InputHistory,
+  LARGE_PASTE_CHARS,
   NO_RATE_LIMITS,
   oneLine,
   stateLabel,
@@ -30,6 +34,9 @@ import { renderMarkdownInto } from "./viewer.ts";
  * XSS 安全: assistant 本文は markdown.ts の自前パーサ経由（`textContent` 描画）で、
  * それ以外のテキストもすべて textContent。innerHTML には生コンテンツを入れない。
  *
+ * 入力系（PR-M4）: ↑/↓ の入力履歴（localStorage 永続・直近 50 件）、画像のペースト/ドロップ添付
+ * （サーバへ保存してから image ブロックとして送る）、大きな貼り付けのファイル誘導。
+ *
  * 表示のみで完結しない部分（承認/質問への応答＝chatAnswer）は **PR-M5**。
  * ここでは pending バブルを出すが送信ボタンは無効（灰色 + tooltip）にしてある。
  */
@@ -43,6 +50,15 @@ export class ChatPanel {
   private readonly pendingBar: HTMLElement;
   private readonly input: HTMLTextAreaElement;
   private readonly sendBtn: HTMLButtonElement;
+  /** 添付トレイ（送信前の画像サムネイル）。 */
+  private readonly trayEl: HTMLElement;
+  /** 大きな貼り付け・添付エラーの一時メッセージ。 */
+  private readonly hintEl: HTMLElement;
+  /** 送信待ちの添付（送信時にクリアする）。 */
+  private readonly attachments: ChatAttachment[] = [];
+  /** ↑/↓ の入力履歴（localStorage 永続）。 */
+  private readonly history: InputHistory;
+  private hintTimer: number | null = null;
 
   private readonly transcript = new ChatTranscript();
   /** items と 1:1 で並ぶ描画済み要素（増分更新のため index で引く）。 */
@@ -61,7 +77,7 @@ export class ChatPanel {
 
   constructor(
     private readonly el: HTMLElement,
-    private readonly onSend: (id: string, text: string) => void,
+    private readonly onSend: (id: string, text: string, attachments: ChatAttachment[]) => void,
     private readonly onStop: (id: string) => void,
     private readonly onNew: (id: string) => void,
   ) {
@@ -107,16 +123,31 @@ export class ChatPanel {
     this.input.placeholder = "master に話しかける（Enter で送信 / Shift+Enter で改行）";
     this.input.addEventListener("keydown", (e) => this.onKeyDown(e));
     this.input.addEventListener("input", () => this.autoGrow());
+    this.input.addEventListener("paste", (e) => this.onPaste(e));
+    // ドロップは入力欄だけでなくパネル全体で受ける（ログ側に落としても添付できる）。
+    this.el.addEventListener("dragover", (e) => {
+      if (!this.hasFiles(e.dataTransfer)) return;
+      e.preventDefault();
+      this.el.classList.add("dragover");
+    });
+    this.el.addEventListener("dragleave", () => this.el.classList.remove("dragover"));
+    this.el.addEventListener("drop", (e) => this.onDrop(e));
     this.sendBtn = document.createElement("button");
     this.sendBtn.className = "chat-send";
     this.sendBtn.addEventListener("click", () => this.onSendClick());
     const row = div("chat-input-row");
     row.append(this.input, this.sendBtn);
-    foot.append(this.pendingBar, row);
+    this.trayEl = div("chat-tray");
+    this.trayEl.hidden = true;
+    this.hintEl = div("chat-hint");
+    this.hintEl.hidden = true;
+    foot.append(this.pendingBar, this.hintEl, this.trayEl, row);
 
     const body = div("chat-body");
     body.append(this.logEl, this.newPill);
     this.el.append(this.head, body, foot);
+    this.history = new InputHistory(safeLocalStorage());
+    this.history.load();
     this.syncControls();
   }
 
@@ -180,10 +211,44 @@ export class ChatPanel {
   // ===== 内部 =====
 
   private onKeyDown(e: KeyboardEvent): void {
-    // Enter 送信 / Shift+Enter 改行。IME 変換中（isComposing）の Enter は確定なので送らない。
-    if (e.key !== "Enter" || e.shiftKey || e.isComposing) return;
+    if (e.isComposing) return; // IME 変換中のキーはすべて変換操作（履歴も送信も動かさない）。
+    // ↑/↓ の入力履歴。複数行を編集しているときの行移動を邪魔しないよう、
+    // ↑ は「キャレットが先頭」、↓ は「キャレットが末尾」のときだけ履歴として振る舞う。
+    if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.shiftKey && !e.altKey && !e.metaKey) {
+      const atStart = this.input.selectionStart === 0 && this.input.selectionEnd === 0;
+      const atEnd =
+        this.input.selectionStart === this.input.value.length &&
+        this.input.selectionEnd === this.input.value.length;
+      if (e.key === "ArrowUp" && (atStart || this.history.navigating)) {
+        const text = this.history.prev(this.input.value);
+        if (text !== null) {
+          e.preventDefault();
+          this.setInputValue(text);
+        }
+        return;
+      }
+      if (e.key === "ArrowDown" && (atEnd || this.history.navigating)) {
+        const text = this.history.next();
+        if (text !== null) {
+          e.preventDefault();
+          this.setInputValue(text);
+        }
+        return;
+      }
+      return;
+    }
+    // Enter 送信 / Shift+Enter 改行。
+    if (e.key !== "Enter" || e.shiftKey) return;
     e.preventDefault();
     this.onSendClick();
+  }
+
+  /** 履歴から取り出した本文を入力欄へ入れ、キャレットを末尾に置く。 */
+  private setInputValue(text: string): void {
+    this.input.value = text;
+    this.autoGrow();
+    const end = text.length;
+    this.input.setSelectionRange(end, end);
   }
 
   private onSendClick(): void {
@@ -195,11 +260,126 @@ export class ChatPanel {
     }
     if (this.state === "starting" || this.state === "stopped") return;
     const text = this.input.value.trim();
-    if (!text) return;
-    this.onSend(this.masterId, text);
+    // 添付だけで送るケース（画像を貼って Enter）も許す。
+    if (!text && this.attachments.length === 0) return;
+    this.onSend(this.masterId, text, [...this.attachments]);
+    this.history.push(text);
+    this.attachments.length = 0;
+    this.renderTray();
     this.input.value = "";
     this.autoGrow();
     this.scrollToBottom(true);
+  }
+
+  // ---- 添付（ペースト / ドロップ）----
+
+  /** DataTransfer にファイルが含まれるか（ドラッグ中はまだ items しか見えない）。 */
+  private hasFiles(dt: DataTransfer | null): boolean {
+    if (!dt) return false;
+    if (dt.files?.length) return true;
+    return Array.from(dt.items ?? []).some((i) => i.kind === "file");
+  }
+
+  /**
+   * 貼り付け。
+   *  - 画像が含まれていれば添付として取り込む（既定のテキスト貼り付けは行わない）
+   *  - テキストが LARGE_PASTE_CHARS を超えていたらファイルに落とし、**パスを入力欄へ添える**
+   *    （長文をそのまま送ると 1 ターンの入力が跳ね上がるため。設計書 §9 PR-M4）
+   */
+  private onPaste(e: ClipboardEvent): void {
+    const dt = e.clipboardData;
+    if (!dt) return;
+    const images = Array.from(dt.files ?? []).filter((f) => f.type.startsWith("image/"));
+    if (images.length > 0) {
+      e.preventDefault();
+      void this.attachFiles(images);
+      return;
+    }
+    const text = dt.getData("text/plain");
+    if (text.length > LARGE_PASTE_CHARS) {
+      e.preventDefault();
+      void this.spillLargePaste(text);
+    }
+  }
+
+  private onDrop(e: DragEvent): void {
+    this.el.classList.remove("dragover");
+    const files = Array.from(e.dataTransfer?.files ?? []).filter((f) => f.type.startsWith("image/"));
+    if (files.length === 0) return;
+    e.preventDefault();
+    void this.attachFiles(files);
+  }
+
+  /** 画像をサーバへ保存し、添付トレイへ積む。 */
+  private async attachFiles(files: readonly File[]): Promise<void> {
+    for (const file of files) {
+      try {
+        const saved = await uploadAttachment(file, file.type);
+        this.attachments.push(saved);
+        this.renderTray();
+      } catch (err) {
+        this.showHint(`添付に失敗しました: ${(err as Error).message}`, "error");
+      }
+    }
+  }
+
+  /**
+   * 大きな貼り付けをファイルへ落として、入力欄にはパスだけを残す。
+   * 保存に失敗したときは**そのまま貼り付ける**（入力を失わせない）。
+   */
+  private async spillLargePaste(text: string): Promise<void> {
+    try {
+      const saved = await uploadAttachment(new Blob([text], { type: "text/plain" }), "text/plain");
+      const note = `${saved.path}`;
+      const cur = this.input.value;
+      const sep = cur.length > 0 && !cur.endsWith("\n") ? "\n" : "";
+      this.setInputValue(`${cur}${sep}${note}\n`);
+      this.showHint(
+        `貼り付けが長い（${text.length.toLocaleString("ja-JP")} 文字）ためファイルに保存しました。` +
+          `パスを入力欄に添えたので、そのまま送ると master がファイルとして読みます（${formatBytes(saved.bytes)}）`,
+        "info",
+      );
+    } catch (err) {
+      this.setInputValue(this.input.value + text);
+      this.showHint(`長文の保存に失敗したのでそのまま貼り付けました: ${(err as Error).message}`, "error");
+    }
+  }
+
+  /** 添付トレイ（送信前のサムネイル）を描き直す。 */
+  private renderTray(): void {
+    this.trayEl.innerHTML = "";
+    this.trayEl.hidden = this.attachments.length === 0;
+    for (const [i, a] of this.attachments.entries()) {
+      const chip = div("chat-chip");
+      const img = document.createElement("img");
+      img.className = "chat-chip-thumb";
+      img.src = a.url;
+      img.alt = a.name;
+      const label = span("chat-chip-name", `${a.name}（${formatBytes(a.bytes)}）`);
+      label.title = a.path;
+      const del = document.createElement("button");
+      del.className = "chat-chip-del";
+      del.textContent = "✕";
+      del.title = "この添付を外す";
+      del.addEventListener("click", () => {
+        this.attachments.splice(i, 1);
+        this.renderTray();
+      });
+      chip.append(img, label, del);
+      this.trayEl.appendChild(chip);
+    }
+  }
+
+  /** 入力欄の上に一時メッセージを出す（大きな貼り付けの誘導・添付エラー）。 */
+  private showHint(text: string, level: "info" | "error"): void {
+    this.hintEl.textContent = text;
+    this.hintEl.className = `chat-hint level-${level}`;
+    this.hintEl.hidden = false;
+    if (this.hintTimer !== null) window.clearTimeout(this.hintTimer);
+    this.hintTimer = window.setTimeout(() => {
+      this.hintEl.hidden = true;
+      this.hintTimer = null;
+    }, 15_000);
   }
 
   /** 入力欄の高さを内容に合わせる（最大 6 行程度）。 */
@@ -327,7 +507,9 @@ function buildItem(item: ChatItem): HTMLElement {
     case "user": {
       const row = bubbleRow("user");
       const bubble = div("chat-bubble user");
-      bubble.append(meta("ボス", item.ts), plain(item.text));
+      bubble.append(meta("ボス", item.ts));
+      if (item.text) bubble.appendChild(plain(item.text));
+      if (item.attachments.length > 0) bubble.appendChild(attachmentStrip(item.attachments));
       row.appendChild(bubble);
       return row;
     }
@@ -476,4 +658,56 @@ function span(cls: string, text: string): HTMLSpanElement {
   el.className = cls;
   el.textContent = text;
   return el;
+}
+
+/** 送信済みメッセージに付いた添付のサムネイル列。 */
+function attachmentStrip(attachments: readonly ChatAttachment[]): HTMLElement {
+  const strip = div("chat-attachments");
+  for (const a of attachments) {
+    const cell = div("chat-attachment");
+    if (a.mediaType.startsWith("image/")) {
+      const img = document.createElement("img");
+      img.className = "chat-attachment-thumb";
+      img.src = a.url;
+      img.alt = a.name;
+      img.title = a.path;
+      cell.appendChild(img);
+    }
+    const name = span("chat-attachment-name", a.name);
+    name.title = a.path;
+    cell.appendChild(name);
+    strip.appendChild(cell);
+  }
+  return strip;
+}
+
+/**
+ * チャット添付を保存する（`POST /control/chat-attach`）。
+ * Content-Type が MIME、ボディが生バイト列。保存先はサーバが決める（クライアントは
+ * パスを指定できない）ので、返ってきた絶対パスをそのまま master への提示に使う。
+ */
+async function uploadAttachment(
+  body: Blob,
+  mediaType: string,
+): Promise<ChatAttachment> {
+  const res = await fetch("/control/chat-attach", {
+    method: "POST",
+    headers: { "Content-Type": mediaType },
+    body,
+    credentials: "same-origin",
+  });
+  const json = (await res.json().catch(() => null)) as (ChatAttachment & { error?: string }) | null;
+  if (!res.ok || !json || typeof json.name !== "string") {
+    throw new Error(json?.error ?? `HTTP ${res.status}`);
+  }
+  return json;
+}
+
+/** localStorage（使えない環境では null）。プライベートモードで例外を投げる実装がある。 */
+function safeLocalStorage(): Storage | null {
+  try {
+    return window.localStorage ?? null;
+  } catch {
+    return null;
+  }
 }

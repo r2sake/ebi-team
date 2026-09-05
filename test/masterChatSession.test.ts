@@ -38,6 +38,8 @@ class FakeBrain implements MasterBrain {
   createOpts: { includePartialMessages: boolean } | null = null;
   started: { resumeSessionId: string | null } | null = null;
   readonly sent: string[] = [];
+  /** send() に渡った入力そのもの（PR-M4 の画像添付検証用）。 */
+  readonly inputs: MasterBrainInput[] = [];
   ackResult = true;
   interrupted = 0;
   stopped = 0;
@@ -53,6 +55,7 @@ class FakeBrain implements MasterBrain {
   }
   send(input: MasterBrainInput): Promise<{ acked: boolean }> {
     this.sent.push(input.text);
+    this.inputs.push(input);
     return Promise.resolve({ acked: this.ackResult });
   }
   events(): AsyncIterable<MasterEvent> {
@@ -463,4 +466,74 @@ test("新しい会話の直後も送信できる（新プロセスの stdin へ�
   const r = await h.session.sendUserText("最初の一言");
   assert.equal(r.accepted, true);
   assert.deepEqual(h.brains[1]!.sent, ["最初の一言"]);
+});
+
+// ===== PR-M4（入力系）=====
+
+test("中断（chatStop）で turnEnd{aborted} が出た後も会話を続けられる", async () => {
+  const h = makeSession();
+  await h.session.start();
+  await h.session.sendUserText("長い作業をして");
+  assert.equal(h.session.state, "busy");
+
+  await h.session.interrupt();
+  assert.equal(h.brains[0]!.interrupted, 1);
+  // 中断後の result は is_error:true で来るが、aborted:true として正規化されている
+  //（claudeEvents.ts）。UI がエラーに化けさせないための分岐。
+  h.brains[0]!.emit({
+    kind: "turnEnd",
+    ok: false,
+    aborted: true,
+    usage: null,
+    costUsd: 0.01,
+    errorText: null,
+  });
+  await waitEvents(h, 2);
+  const end = h.events[h.events.length - 1]!.event;
+  assert.equal(end.kind === "turnEnd" && end.aborted, true);
+  assert.equal(end.kind === "turnEnd" && end.errorText, null);
+  // 会話は生きたまま idle に戻り、次の発話がそのまま同じプロセスへ載る。
+  assert.equal(h.session.state, "idle");
+  assert.equal(h.brains.length, 1);
+
+  const r = await h.session.sendUserText("では次のお願い");
+  assert.equal(r.accepted, true);
+  assert.equal(h.brains[0]!.sent[1], "では次のお願い");
+  assert.equal(h.session.state, "busy");
+});
+
+test("画像添付: image ブロックとして投入され、本文には絶対パスが添えられる", async () => {
+  const h = makeSession();
+  await h.session.start();
+  const attachment = {
+    name: "chat-20260905-101112-0a1b2c3d.png",
+    path: "/tmp/ebi/chat-attachments/chat-20260905-101112-0a1b2c3d.png",
+    mediaType: "image/png",
+    url: "/control/chat-attachment?name=chat-20260905-101112-0a1b2c3d.png",
+    bytes: 1234,
+  };
+  await h.session.sendUserText("これ見て", {
+    images: [{ mediaType: "image/png", base64: "AAAA" }],
+    attachments: [attachment],
+  });
+
+  const input = h.brains[0]!.inputs[0]!;
+  assert.deepEqual(input.images, [{ mediaType: "image/png", base64: "AAAA" }]);
+  assert.match(input.text, /^これ見て\n\n\[添付ファイル\]\n\/tmp\/ebi/);
+  // UI 側（トランスクリプト）には本文と添付メタが構造化されて載る。
+  const ev = h.events[0]!.event;
+  assert.equal(ev.kind, "user");
+  assert.equal(ev.kind === "user" && ev.text, "これ見て");
+  assert.deepEqual(ev.kind === "user" ? ev.attachments : null, [attachment]);
+});
+
+test("添付なしの発話は本文をそのまま送る（既存経路をいじらない）", async () => {
+  const h = makeSession();
+  await h.session.start();
+  await h.session.sendUserText("ふつうの発話");
+  const input = h.brains[0]!.inputs[0]!;
+  assert.equal(input.text, "ふつうの発話");
+  assert.equal(input.images, undefined);
+  const ev = h.events[0]!.event;
+  assert.equal(ev.kind === "user" && ev.attachments, undefined);
 });

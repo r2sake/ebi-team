@@ -12,6 +12,11 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Registry } from "./registry.ts";
 import type { MailboxMessage } from "./mailbox.ts";
 import { BROADCAST_TARGET, type AgentMode, type AgentKind, type ViewerRecord } from "../shared/protocol.ts";
+import {
+  ALLOWED_ATTACH_TYPES,
+  maxBytesFor,
+  type StoredAttachment,
+} from "./chatAttachments.ts";
 
 /**
  * spawn の一般化パラメータ（WS / 制御API 共通）。
@@ -167,6 +172,19 @@ export interface ControlDeps {
    * 未登録 id・画像以外は null（404）。許可ルート外/サイズ超過などの検証失敗は throw（400）。
    */
   readViewerFile: (id: string) => Promise<{ bytes: Buffer; mime: string; path: string } | null>;
+  /**
+   * チャット添付の保存（`POST /control/chat-attach` の実体・PR-M4）。
+   * 保存先はサーバが決める（クライアントはパスを指定できない）。検証失敗は throw（400）。
+   * chat master が居ない構成では null にしておき、エンドポイントは 404 を返す。
+   */
+  saveChatAttachment: ((bytes: Buffer, mediaType: string) => Promise<StoredAttachment>) | null;
+  /**
+   * チャット添付の読み出し（`GET /control/chat-attachment?name=` の実体・PR-M4）。
+   * 受けるのは**保存済み basename だけ**（生パスは受けない）。未登録は null（404）。
+   */
+  readChatAttachment:
+    | ((name: string) => Promise<{ bytes: Buffer; mediaType: string; path: string } | null>)
+    | null;
 }
 
 /** JSON レスポンスを返すヘルパー。 */
@@ -198,6 +216,23 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
   } catch (err) {
     throw new Error(`JSON パース失敗: ${(err as Error).message}`);
   }
+}
+
+/**
+ * リクエストボディを生バイト列で読み取る（チャット添付のアップロード用）。
+ * 上限を超えたら即 throw（400 に化ける）。JSON base64 にしないのは、
+ * base64 で 1.33 倍に膨らんだ本文をメモリに二重で持たないため。
+ */
+async function readRawBody(req: IncomingMessage, limit: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buf = chunk as Buffer;
+    size += buf.length;
+    if (size > limit) throw new Error(`リクエストボディが大きすぎます（上限 ${limit} バイト）`);
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks);
 }
 
 function asString(v: unknown): string | undefined {
@@ -582,6 +617,55 @@ export function createControlApi(deps: ControlDeps) {
         const ok = registry.remove(id);
         broadcastRegistry();
         sendJson(res, ok ? 200 : 500, ok ? { id, killed: true } : { error: "kill に失敗しました" });
+        return true;
+      }
+
+      // ---- POST /control/chat-attach ----
+      // チャット入力欄へのペースト/ドロップで来た画像（と、長すぎる貼り付けのテキスト）を
+      // サーバ側の保管庫へ保存する。Content-Type が MIME、ボディが生バイト列。
+      // 応答の path は**絶対パス**で、これがそのまま master への提示値になる。
+      if (pathname === "/control/chat-attach" && method === "POST") {
+        if (!deps.saveChatAttachment) {
+          sendJson(res, 404, { error: 'チャット添付は ui:"chat" の master が居るときだけ使えます' });
+          return true;
+        }
+        const mediaType = String(req.headers["content-type"] ?? "").split(";")[0]!.trim();
+        if (!ALLOWED_ATTACH_TYPES[mediaType]) {
+          sendJson(res, 400, { error: `対応していない Content-Type です: ${mediaType || "(未指定)"}` });
+          return true;
+        }
+        const bytes = await readRawBody(req, maxBytesFor(mediaType));
+        const saved = await deps.saveChatAttachment(bytes, mediaType);
+        sendJson(res, 200, saved);
+        return true;
+      }
+
+      // ---- GET /control/chat-attachment?name=chat-...png ----
+      // 保存済み添付の配信（チャット内サムネイル用）。viewer-file と同じく **basename だけ**を受ける。
+      if (pathname === "/control/chat-attachment" && method === "GET") {
+        if (!deps.readChatAttachment) {
+          sendJson(res, 404, { error: "チャット添付は無効です" });
+          return true;
+        }
+        const name = query.get("name");
+        if (!name) {
+          sendJson(res, 400, { error: "name（クエリ）は必須です" });
+          return true;
+        }
+        const file = await deps.readChatAttachment(name);
+        if (!file) {
+          sendJson(res, 404, { error: `添付が見つかりません: ${name}` });
+          return true;
+        }
+        res.writeHead(200, {
+          "Content-Type": file.mediaType,
+          "Content-Length": String(file.bytes.length),
+          // 拡張子由来の Content-Type を強制する（viewer-file と同じ方針）。
+          "X-Content-Type-Options": "nosniff",
+          "Content-Disposition": "inline",
+          "Cache-Control": "no-store",
+        });
+        res.end(file.bytes);
         return true;
       }
 
