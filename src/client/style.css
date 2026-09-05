@@ -997,6 +997,74 @@ button:hover { filter: brightness(1.07); }
 .chat-bubble.pending { border-color: var(--busy); background: #241f14; }
 
 .chat-meta { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+
+/* 返信（引用）— PR-M11。 */
+/* バブル右上の ↩︎（hover / フォーカスで濃くする。タッチ端末では常時薄く出す）。 */
+.chat-bubble { position: relative; }
+.chat-reply-btn {
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  padding: 0 6px;
+  min-height: 22px;
+  font-size: 12px;
+  line-height: 1;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--muted);
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.chat-bubble:hover .chat-reply-btn,
+.chat-bubble:focus-within .chat-reply-btn { opacity: 1; }
+.chat-reply-btn:hover { color: var(--fg); border-color: var(--accent); }
+@media (hover: none) {
+  .chat-reply-btn { opacity: 0.5; }
+}
+/* ボスの発話に付く引用チップ（押すと引用元へジャンプ）。 */
+.chat-quote {
+  display: block;
+  width: 100%;
+  text-align: left;
+  margin-bottom: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  overflow-wrap: anywhere;
+}
+.chat-quote:hover:not(:disabled) { color: var(--fg); }
+.chat-quote:disabled { cursor: default; opacity: 0.6; }
+/* 入力欄の上に出す引用プレビュー。 */
+.chat-reply {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 2px 8px;
+}
+.chat-reply[hidden] { display: none; }
+.chat-reply-jump {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  padding: 4px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-reply-jump:hover { color: var(--fg); }
+.chat-reply-clear { flex: 0 0 auto; padding: 2px 8px; min-height: 26px; }
 .chat-plain { white-space: pre-wrap; }
 .chat-idle-note { font-size: 12px; color: var(--muted); }
 .chat-caret { color: var(--accent); animation: chat-blink 1s step-end infinite; }

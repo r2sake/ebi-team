@@ -7,6 +7,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   MasterSession,
+  replyQuoteLine,
+  sanitizeReplyRef,
   toChatEvent,
   type MasterSessionHandlers,
   type MasterUsageSnapshot,
@@ -663,4 +665,76 @@ test("shareImage: 空配列では何も流さない", async () => {
   h.session.shareImage([]);
   assert.equal(h.events.length, before);
   await h.session.stop();
+});
+
+// ===== PR-M11（返信 / 引用）=====
+
+test("返信つき送信: CLI へは `> [reply to master#<seq>] <抜粋>` を前置した本文が渡る", async () => {
+  const h = makeSession();
+  await h.session.start();
+  await h.session.sendUserText("その方針で進めて", {
+    replyTo: { seq: 42, excerpt: "PR-A から着手します" },
+  });
+  assert.equal(h.brains[0]!.sent[0], "> [reply to master#42] PR-A から着手します\nその方針で進めて");
+});
+
+test("返信つき送信: 引用ヘッダ → 本文 → 添付フッタ の順に並ぶ", async () => {
+  const h = makeSession();
+  await h.session.start();
+  await h.session.sendUserText("この画像を見て", {
+    replyTo: { seq: 7, excerpt: "共有します" },
+    attachments: [
+      {
+        name: "chat-1.png",
+        path: "/tmp/chat-1.png",
+        mediaType: "image/png",
+        url: "/control/chat-attachment?name=chat-1.png",
+        bytes: 10,
+      },
+    ],
+  });
+  assert.equal(
+    h.brains[0]!.sent[0],
+    "> [reply to master#7] 共有します\nこの画像を見て\n\n[添付ファイル]\n/tmp/chat-1.png",
+  );
+});
+
+test("返信なしの送信は本文そのまま（既存の形を変えない）", async () => {
+  const h = makeSession();
+  await h.session.start();
+  await h.session.sendUserText("ふつうの発話");
+  assert.equal(h.brains[0]!.sent[0], "ふつうの発話");
+});
+
+test("返信つき送信: user イベントに replyTo が載り、会話ログから復元できる", async () => {
+  const h = makeSession();
+  await h.session.start();
+  await h.session.sendUserText("了解", { replyTo: { seq: 3, excerpt: "確認をお願いします" } });
+  const user = h.events.find((e) => e.event.kind === "user");
+  assert.ok(user);
+  assert.deepEqual(
+    user.event.kind === "user" ? user.event.replyTo : null,
+    { seq: 3, excerpt: "確認をお願いします" },
+  );
+});
+
+test("sanitizeReplyRef: 抜粋は 1 行に潰して 200 文字で切る（制御文字も落とす）", () => {
+  const ref = sanitizeReplyRef({ seq: 5, excerpt: `改行\nと\tタブ\u0007ベル ${"あ".repeat(300)}` });
+  assert.equal(ref?.seq, 5);
+  assert.equal(ref?.excerpt.length, 200);
+  assert.match(ref!.excerpt, /^改行 と タブ ベル あ+$/);
+});
+
+test("sanitizeReplyRef: seq が正整数でなければ引用を落とす（送信自体は通す）", () => {
+  assert.equal(sanitizeReplyRef(undefined), undefined);
+  assert.equal(sanitizeReplyRef({ seq: 0, excerpt: "x" }), undefined);
+  assert.equal(sanitizeReplyRef({ seq: -1, excerpt: "x" }), undefined);
+  assert.equal(sanitizeReplyRef({ seq: 1.5, excerpt: "x" }), undefined);
+  assert.equal(sanitizeReplyRef({ seq: "3", excerpt: "x" }), undefined);
+  // excerpt が無い / 文字列でないときは空の抜粋で通す（seq だけでも参照は成立する）。
+  assert.deepEqual(sanitizeReplyRef({ seq: 3 }), { seq: 3, excerpt: "" });
+});
+
+test("replyQuoteLine: CLI に届く 1 行の形", () => {
+  assert.equal(replyQuoteLine({ seq: 12, excerpt: "抜粋" }), "> [reply to master#12] 抜粋");
 });

@@ -1,5 +1,6 @@
 import type {
   ChatAttachment,
+  ChatReplyRef,
   MasterChatEnvelope,
   MasterChatState,
   UsageMessage,
@@ -16,6 +17,8 @@ import {
   LARGE_PASTE_CHARS,
   NO_RATE_LIMITS,
   oneLine,
+  replyable,
+  replyExcerpt,
   sendEnabled,
   settledLabel,
   stateLabel,
@@ -67,6 +70,10 @@ export class ChatPanel {
   private readonly hintEl: HTMLElement;
   /** 送信待ちの添付（送信時にクリアする）。 */
   private readonly attachments: ChatAttachment[] = [];
+  /** 引用プレビュー（返信先が選ばれている間だけ出す・PR-M11）。 */
+  private readonly replyEl: HTMLElement;
+  /** 選択中の返信先（送信でクリアする）。 */
+  private replyTo: ChatReplyRef | null = null;
   /** ↑/↓ の入力履歴（localStorage 永続）。 */
   private readonly history: InputHistory;
   private hintTimer: number | null = null;
@@ -94,7 +101,12 @@ export class ChatPanel {
 
   constructor(
     private readonly el: HTMLElement,
-    private readonly onSend: (id: string, text: string, attachments: ChatAttachment[]) => void,
+    private readonly onSend: (
+      id: string,
+      text: string,
+      attachments: ChatAttachment[],
+      replyTo: ChatReplyRef | null,
+    ) => void,
     private readonly onStop: (id: string) => void,
     private readonly onNew: (id: string) => void,
     /** 承認/質問への応答（PR-M5）。WS `chatAnswer` を送る。 */
@@ -171,11 +183,13 @@ export class ChatPanel {
     this.sendBtn.addEventListener("click", () => this.onSendClick());
     const row = div("chat-input-row");
     row.append(this.input, this.stopBtn, this.sendBtn);
+    this.replyEl = div("chat-reply");
+    this.replyEl.hidden = true;
     this.trayEl = div("chat-tray");
     this.trayEl.hidden = true;
     this.hintEl = div("chat-hint");
     this.hintEl.hidden = true;
-    foot.append(this.pendingBar, this.hintEl, this.trayEl, row);
+    foot.append(this.pendingBar, this.hintEl, this.replyEl, this.trayEl, row);
 
     const body = div("chat-body");
     body.append(this.logEl, this.newPill);
@@ -296,9 +310,10 @@ export class ChatPanel {
     const text = this.input.value.trim();
     // 添付だけで送るケース（画像を貼って Enter）も許す。
     if (!text && this.attachments.length === 0) return;
-    this.onSend(this.masterId, text, [...this.attachments]);
+    this.onSend(this.masterId, text, [...this.attachments], this.replyTo);
     this.history.push(text);
     this.attachments.length = 0;
+    this.setReplyTo(null);
     this.renderTray();
     this.input.value = "";
     this.autoGrow();
@@ -463,6 +478,56 @@ export class ChatPanel {
     el.scrollIntoView({ block: "center" });
     el.classList.add("flash");
     window.setTimeout(() => el.classList.remove("flash"), 1200);
+  }
+
+  // ===== 返信（引用）=====
+
+  /** 返信先を選ぶ / 解除する（null で解除）。入力欄へフォーカスを戻す。 */
+  private setReplyTo(ref: ChatReplyRef | null): void {
+    this.replyTo = ref;
+    this.renderReplyPreview();
+    if (ref) this.input.focus();
+  }
+
+  /** 入力欄の上に出す引用プレビュー（抜粋クリックで引用元へジャンプ・✕ で解除）。 */
+  private renderReplyPreview(): void {
+    this.replyEl.replaceChildren();
+    const ref = this.replyTo;
+    if (!ref) {
+      this.replyEl.hidden = true;
+      return;
+    }
+    this.replyEl.hidden = false;
+    const jump = document.createElement("button");
+    jump.className = "chat-reply-jump";
+    jump.textContent = `↩︎ master#${ref.seq} に返信: ${ref.excerpt}`;
+    jump.title = "引用元へスクロールします";
+    jump.addEventListener("click", () => this.jumpToSeq(ref.seq));
+    const clear = document.createElement("button");
+    clear.className = "chat-reply-clear";
+    clear.textContent = "✕";
+    clear.title = "返信をやめる";
+    clear.setAttribute("aria-label", "返信を解除");
+    clear.addEventListener("click", () => this.setReplyTo(null));
+    this.replyEl.append(jump, clear);
+  }
+
+  /**
+   * seq で示された発言までスクロールする（引用チップ / 引用プレビューのクリック）。
+   * 表示中のトランスクリプトに無い（＝ログにしか残っていない）ときは何もしない。
+   */
+  private jumpToSeq(seq: number): void {
+    const index = this.transcript.items.findIndex((it) => it.seq === seq);
+    const el = index >= 0 ? this.rendered[index] : null;
+    if (!el) return;
+    el.scrollIntoView({ block: "center" });
+    el.classList.add("flash");
+    window.setTimeout(() => el.classList.remove("flash"), 1200);
+  }
+
+  /** 返信ボタン / 引用チップから引ける「その seq が今の画面に居るか」。 */
+  private hasSeq(seq: number): boolean {
+    return this.transcript.items.some((it) => it.seq === seq);
   }
 
   private onScroll(): void {
@@ -664,6 +729,11 @@ export class ChatPanel {
         this.onAnswer(this.masterId, requestId, answer);
       },
       (key, opener) => this.openLightbox(key, opener),
+      {
+        onReply: (target) => this.setReplyTo({ seq: target.seq, excerpt: replyExcerpt(target) }),
+        onJump: (seq) => this.jumpToSeq(seq),
+        hasSeq: (seq) => this.hasSeq(seq),
+      },
     );
     const prev = this.rendered[index];
     if (prev) {
@@ -696,17 +766,32 @@ interface LightboxUi {
 /** サムネイルを押したときの通知（key = collectImages() のキー・opener = 復帰先のフォーカス）。 */
 type OpenImage = (key: string, opener: HTMLElement) => void;
 
+/** 返信（引用）まわりのフック（PR-M11）。 */
+interface ReplyHooks {
+  /** 「返信」ボタンの押下。ChatPanel が引用プレビューを出す。 */
+  onReply: (item: ChatItem) => void;
+  /** 引用チップの押下。引用元へスクロールする。 */
+  onJump: (seq: number) => void;
+  /** その seq が今のトランスクリプトに居るか（居なければチップは押せない）。 */
+  hasSeq: (seq: number) => boolean;
+}
+
+const NO_REPLY_HOOKS: ReplyHooks = { onReply: () => {}, onJump: () => {}, hasSeq: () => false };
+
 /** 1 アイテムを表す要素を作る（テキストはすべて textContent 経由＝XSS 安全）。 */
 function buildItem(
   item: ChatItem,
   onAnswer: (requestId: string, answer: { allow?: boolean; choice?: string[]; text?: string }) => void,
   onOpenImage: OpenImage = () => {},
+  reply: ReplyHooks = NO_REPLY_HOOKS,
 ): HTMLElement {
   switch (item.kind) {
     case "user": {
       const row = bubbleRow("user");
       const bubble = div("chat-bubble user");
       bubble.append(meta("ボス", item.ts));
+      // どの発言への返答かを本文の上に出す（PR-M11）。
+      if (item.replyTo) bubble.appendChild(quoteChip(item.replyTo, reply));
       if (item.text) bubble.appendChild(plain(item.text));
       if (item.attachments.length > 0) {
         bubble.appendChild(attachmentStrip(item.attachments, item.seq, onOpenImage));
@@ -721,6 +806,7 @@ function buildItem(
       renderMarkdownInto(body, item.text);
       bubble.append(meta("master", item.ts), body);
       if (item.streaming) bubble.appendChild(span("chat-caret", "▍"));
+      if (replyable(item)) bubble.appendChild(replyButton(item, reply));
       row.appendChild(bubble);
       return row;
     }
@@ -732,6 +818,7 @@ function buildItem(
       item.images.forEach((img, i) => {
         bubble.appendChild(imageCard(img, `${item.seq}:${i}`, onOpenImage));
       });
+      if (replyable(item)) bubble.appendChild(replyButton(item, reply));
       row.appendChild(bubble);
       return row;
     }
@@ -760,6 +847,7 @@ function buildItem(
         renderMarkdownInto(body, item.text);
         bubble.appendChild(body);
       }
+      if (replyable(item)) bubble.appendChild(replyButton(item, reply));
       row.appendChild(bubble);
       return row;
     }
@@ -918,6 +1006,38 @@ function questionForm(
 
 function clip(text: string, max = 2000): string {
   return text.length > max ? `${text.slice(0, max)}\n…（${text.length - max} 文字省略）` : text;
+}
+
+/**
+ * バブル右上の「返信」ボタン（PR-M11）。
+ * hover / フォーカスで濃くなるだけで、タッチ端末では常時薄く出る（長押しは使わない＝
+ * iOS のテキスト選択と衝突するため）。
+ */
+function replyButton(item: ChatItem, reply: ReplyHooks): HTMLElement {
+  const btn = document.createElement("button");
+  btn.className = "chat-reply-btn";
+  btn.textContent = "↩︎";
+  btn.title = "このメッセージに返信する";
+  btn.setAttribute("aria-label", "このメッセージに返信");
+  btn.addEventListener("click", () => reply.onReply(item));
+  return btn;
+}
+
+/**
+ * ボスの発話に付く引用チップ（PR-M11）。押すと引用元へスクロールする。
+ * 引用元が画面に残っていない（ログにしか無い）ときは押せないようにして理由を出す。
+ */
+function quoteChip(ref: ChatReplyRef, reply: ReplyHooks): HTMLElement {
+  const btn = document.createElement("button");
+  btn.className = "chat-quote";
+  btn.textContent = `↩︎ master#${ref.seq}: ${ref.excerpt}`;
+  const known = reply.hasSeq(ref.seq);
+  btn.disabled = !known;
+  btn.title = known
+    ? "引用元へスクロールします"
+    : "引用元はこれより前の会話（ログファイルにのみ残っています）";
+  if (known) btn.addEventListener("click", () => reply.onJump(ref.seq));
+  return btn;
 }
 
 function bubbleRow(variant: string): HTMLElement {

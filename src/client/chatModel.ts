@@ -15,6 +15,7 @@
 import type {
   ChatAttachment,
   ChatImage,
+  ChatReplyRef,
   MasterChatEnvelope,
   MasterChatEvent,
   MasterChatUsage,
@@ -22,7 +23,15 @@ import type {
 
 /** 画面に並べる 1 アイテム。 */
 export type ChatItem =
-  | { kind: "user"; seq: number; ts: number; text: string; attachments: ChatAttachment[] }
+  | {
+      kind: "user";
+      seq: number;
+      ts: number;
+      text: string;
+      attachments: ChatAttachment[];
+      /** 返信の引用元（PR-M11）。無ければ普通の発話。 */
+      replyTo?: ChatReplyRef;
+    }
   | { kind: "assistant"; seq: number; ts: number; text: string; streaming: boolean }
   /** master がチャットへ共有した画像（PR-M10・`chat_image`）。assistant 側に出る。 */
   | { kind: "image"; seq: number; ts: number; images: ChatImage[] }
@@ -146,7 +155,14 @@ export class ChatTranscript {
     switch (ev.kind) {
       case "user":
         this.closeStream();
-        return this.push({ kind: "user", seq, ts, text: ev.text, attachments: ev.attachments ?? [] });
+        return this.push({
+          kind: "user",
+          seq,
+          ts,
+          text: ev.text,
+          attachments: ev.attachments ?? [],
+          ...(ev.replyTo ? { replyTo: ev.replyTo } : {}),
+        });
       case "inbound":
         this.closeStream();
         return this.push({ kind: "inbound", seq, ts, from: ev.from, tag: ev.tag, text: ev.text });
@@ -404,6 +420,36 @@ export function sendEnabled(state: string): boolean {
 /** その状態で「停止」が押せるか（PR-M11）。中断できるのはターン実行中だけ。 */
 export function stopEnabled(state: string): boolean {
   return state === "busy";
+}
+
+/**
+ * そのアイテムに「返信」ボタンを出すか（PR-M11）。
+ *
+ * 返信できるのは **master 側の発言**（assistant / 共有画像 / エビからの配送）だけ。
+ * 自分の発話・承認バブル・システム行・ツール（数が多く邪魔になる）には出さない。
+ */
+export function replyable(item: ChatItem): boolean {
+  return item.kind === "assistant" || item.kind === "image" || item.kind === "inbound";
+}
+
+/** 引用プレビュー / 引用チップに出す抜粋の長さ。 */
+export const REPLY_EXCERPT_CHARS = 60;
+
+/**
+ * アイテムから引用の抜粋を作る（1 行・末尾は …）。
+ * 画像は本文が無いのでタイトル（無ければ枚数）を使う。
+ */
+export function replyExcerpt(item: ChatItem): string {
+  const source =
+    item.kind === "image"
+      ? (item.images.map((im) => im.title ?? im.caption ?? "").find((t) => t !== "") ??
+        `画像 ${item.images.length} 枚`)
+      : item.kind === "inbound"
+        ? `${item.from}: ${item.text}`
+        : item.kind === "assistant" || item.kind === "thinking"
+          ? item.text
+          : "";
+  return oneLine(source, REPLY_EXCERPT_CHARS);
 }
 
 /** チャット状態のラベル（ヘッダのバッジ）。 */
