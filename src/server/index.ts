@@ -35,6 +35,7 @@ import { addWorktree, removeWorktree } from "./git.ts";
 import { Supervisor } from "./supervisor.ts";
 import {
   loadFixedEbi,
+  supervisorEngineFrom,
   loadRawCustomRoles,
   loadDevChannelsAllowlist,
   loadBackendSettings,
@@ -227,7 +228,10 @@ const registry = new Registry(spawnConfig, DUMP_PATH, mailbox);
 const fixedEbi = new FixedEbiManager(registry);
 
 // 監督・要約（既定 OFF）。OFF / キー無しなら enabled=false で API は一切呼ばない。
-const supervisor = new Supervisor();
+// 監督・要約エンジン（ワンショット）。既定は claude/haiku。
+// config の supervisor 固定エビが backend=gemini なら、起動直前に同じ backend/model へ差し替える
+// （loadAndApplySupervisorEngine）。let なのはその 1 点のためだけ。
+let supervisor = new Supervisor();
 
 // 使用状況（usage）ストア。各エビの statusLine が /control/usage に POST してくる
 // cost/context/model と、アカウント単位の rate_limits を最新値で保持する。
@@ -1469,11 +1473,31 @@ async function loadAndApplyBackendSettings(): Promise<void> {
   }
 }
 
+/**
+ * ワンショット要約エンジン（ask_supervisor / WS summarize）の backend / model を
+ * config の supervisor 固定エビから引き継ぐ。
+ *
+ * 常駐 supervisor セッションと要約エンジンで別々に backend を書かせない（config 1 箇所で揃う）。
+ * supervisor 固定エビが無い / config が無い / 読み込みに失敗した場合は既定（claude/haiku）のまま。
+ * EBI_SUMMARY_CMD（テスト用スタブ）が優先されるのは resolveSummaryEngine 側で担保している。
+ */
+async function loadAndApplySupervisorEngine(): Promise<void> {
+  try {
+    const specs = await loadFixedEbi(CONFIG_PATH, { command: COMMAND, backend: BACKEND_ID });
+    const engine = supervisorEngineFrom(specs);
+    if (!engine || engine.backend === DEFAULT_BACKEND_ID) return;
+    supervisor = new Supervisor({ backend: engine.backend, model: engine.model });
+  } catch (err) {
+    console.warn(`[ebi-team] 監督・要約エンジン設定の読み込みに失敗（既定 claude で継続）:`, err);
+  }
+}
+
 // spawn 要求（WS / 制御API いずれも）を受け付ける前にカスタム役割・許可リスト・
 // バックエンド既定を確定させる。
 await loadAndApplyBackendSettings();
 await loadAndRegisterCustomRoles();
 await loadAndApplyDevChannelsAllowlist();
+await loadAndApplySupervisorEngine();
 
 // 前回終了時に開いていた viewer を復元する（fail-soft: 個別エントリの失敗は warn して掃除）。
 const viewerRestore = await viewerRegistry.restore();

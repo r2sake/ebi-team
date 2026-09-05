@@ -100,9 +100,9 @@ export function toGeminiApprovalMode(mode: PermissionMode | null): GeminiApprova
  * 404 で即死するため、**gemini 系でないモデル名は既定モデルへ落とす**。
  * 役割ごとの backend 別モデル既定は PR-E（EbiRole.backend / config.backends）で入る。
  */
-export function resolveGeminiModel(model: string | null): string {
+export function resolveGeminiModel(model: string | null, fallback?: string): string {
   if (model && /^gemini[-.]/i.test(model)) return model;
-  return GEMINI_DEFAULT_MODEL;
+  return fallback ?? GEMINI_DEFAULT_MODEL;
 }
 
 /**

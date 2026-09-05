@@ -26,7 +26,7 @@ gemini -m gemini-2.5-flash --approval-mode yolo --allowed-mcp-server-names ebi-c
 
 | 項目 | 値 | 理由 |
 |---|---|---|
-| モデル | `gemini-2.5-flash`（既定）／重い読解のみ `gemini-2.5-pro` | **alias は 404**（`gemini-flash-latest` / `gemini-2.0-flash` / `gemini-3-*-preview` はいずれも Code Assist 経路で NOT_FOUND）。明示 ID 必須 |
+| モデル | `gemini-2.5-flash`（既定）／重い読解のみ `gemini-2.5-pro`／supervisor 要約は `gemini-3.5-flash`（§12） | **alias は 404**（`gemini-flash-latest` / `gemini-2.0-flash` / `gemini-3-*-preview` はいずれも Code Assist 経路で NOT_FOUND）。明示 ID 必須 |
 | モデルの解決 | `gemini-` で始まらない指定は既定モデルへ落とす | 役割既定モデル（engineer = `claude-opus-5`）がそのまま `-m` に流れると即 404。役割ごとの backend 別モデルは PR-E |
 | 承認モード | permissionMode から写像（既定 `yolo`） | §4 参照 |
 | `--allowed-mcp-server-names` | 制御MCP を持たせるときだけ付与 | settings の `trust: true` と二重の保険 |
@@ -250,3 +250,112 @@ kill 後にプロセスグループ残存 0** を検査し、最後に `pgrep -f
 
 per-エビ runtime（`.ebi-team/gemini/<agentId>/`）は残っても無害（次回 spawn で上書き）。
 消したい場合はディレクトリごと削除してよい。
+
+
+---
+
+## 12. 固定エビ supervisor を gemini に差し替える（2026-09-05）
+
+固定エビ `supervisor` は「渡されたターミナルログを日本語 3〜5 行で要約する」だけの役割で、
+claude/Haiku を使う理由が特に無い。config の 2 行（`backend` / `model`）で gemini に寄せられる。
+
+### 12.1 何が切り替わるか（2 つある）
+
+`supervisor` には**別々の実体が 2 つ**ある。config の 1 エントリで両方が揃って切り替わる。
+
+| 実体 | 何者か | 切り替わり方 |
+|---|---|---|
+| 常駐 supervisor セッション | config の固定エビ（PTY・対話用） | `fixedEbi[].backend` / `model` をそのまま使う |
+| ワンショット要約エンジン | `ask_supervisor` / WS `summarize` が叩く `--print` 相当の subprocess（`src/server/supervisor.ts`） | 起動時に config の supervisor 固定エビから `backend` / `model` を引き継ぐ（`supervisorEngineFrom`） |
+
+master の `ask_supervisor` は**常駐セッションへ注入するのではなく**、後者のワンショットを呼ぶ。
+config を書き換えると両方が同時に gemini になるので、二重管理は生じない。
+
+### 12.2 設定例（`ebi-team.config.json`）
+
+```jsonc
+{
+  "fixedEbi": [
+    {
+      "id": "supervisor",
+      "kind": "supervisor",
+      "cwd": ".",
+      "backend": "gemini",             // ← 追加。command を書かなくても gemini バイナリになる
+      "model": "gemini-3.5-flash",     // ← claude の "haiku" から差し替え
+      // "args": ["--strict-mcp-config"],  ← claude 方言なので削る（gemini には無いフラグ）
+      // "permissionMode" は書かない＝既定 auto → --approval-mode yolo（§12.4）
+      "appendSystemPrompt": "あなたはエビチーム(ebi-team)の監督エビ。渡されたターミナルログを読み、今何が起きているか/詰まっていないか/次アクションを日本語3〜5行で簡潔に要約する。それ以外の作業はしない。"
+    }
+  ]
+}
+```
+
+戻すときは `backend` を消して `model` を `"haiku"` に戻し、`args` を復活させるだけ
+（コード側の既定は claude/Haiku のままなので、config だけでロールバックできる）。
+
+### 12.3 モデル id: 「Flash 3.8」は Code Assist 経路では使えない（実測）
+
+2026-09-05 に gemini-cli 0.58.0 で実測した結果:
+
+| 指定した id | 結果 | `-o json` の `stats.models` キー（実際に課金された枠） |
+|---|---|---|
+| `gemini-3.5-flash` | ○ | `gemini-3.5-flash` |
+| `gemini-3-flash` / `gemini-2.5-flash` | ○ | `gemini-3.5-flash` |
+| `gemini-3.8-flash` | ○（応答は返る） | **`gemini-3.5-flash`** |
+| `gemini-9.9-flash`（存在しない対照） | ○（応答は返る） | **`gemini-3.5-flash`** |
+| `gemini-flash-latest` / `gemini-3.8-flash-preview` / `gemini-3.8-flash-lite` / `gemini-3.8-pro` | ✗ 404 | — |
+
+- **Gemini 3.8 Flash 自体は実在する**（2026-09-02 GA・Gemini API / AI Studio・model id は `gemini-3.8-flash`）。
+- だが **Gemini Code Assist 経路では未提供**。Code Assist のリリースノートに載っている最新 Flash は
+  **3.5 Flash（2026-06-08 GA）**で、3.6 / 3.7 / 3.8 は記載が無い。
+- `-m gemini-3.8-flash` は 404 にならないが、**存在しない `gemini-9.9-flash` と全く同じ挙動**で
+  `gemini-3.5-flash` に黙って落ちる。つまり「3.8 を指定できたように見えて 3.5 が動く」。
+- したがって ebi-team は **`gemini-3.5-flash` を明示指定**する（`src/server/supervisor.ts` の
+  `GEMINI_SUMMARY_MODEL`）。CLI が 3.8 を知る（バンドルのモデル表に載る）まで待つ。
+- 判別方法: `gemini -m <id> -o json -p "say PONG"` の `stats.models` のキーを見る。
+  要求した id と違えばフォールバックされている。
+
+### 12.4 yolo が要る理由（要約エンジンでも同じ）
+
+PTY 経路と同じ理屈で、**ワンショット `-p` でも承認ダイアログが出た回は応答が返らない**。
+`acceptEdits`（`auto_edit`）だと MCP 呼び出し・workspace 外読み取りで止まるため、
+要約エンジンは `--approval-mode yolo` 固定にしてある（permissionMode からは写像しない）。
+要約は「stdout を 1 回読むだけ・制御MCP を持たせない・書き込みを指示しない」ので、
+yolo でも実害が出る面が無い。
+
+### 12.5 役割プロンプトの渡し方
+
+gemini には `--append-system-prompt` 相当が無いので、要約エンジンも §6 と同じ仕組みを使う:
+
+- `writeGeminiRuntime()` が `<runtimeDir>/_supervisor-summary/GEMINI.md` に監督役割を書き、
+  同ディレクトリを `context.includeDirectories` に入れた settings.json のパスを
+  `GEMINI_CLI_SYSTEM_SETTINGS_PATH` で渡す（制御MCP は載せない＝`mcpServers: {}`）。
+- 常駐セッション側も同じ。固定エビの `appendSystemPrompt` は `launch.systemPrompt` に載って
+  `backend.buildEnv()` → `<runtimeDir>/supervisor/GEMINI.md` になる
+  （claude / codex の `buildEnv` はこの値を見ないので従来経路は挙動不変）。
+- API キー課金経路の env（`GEMINI_API_KEY` 等 5 キー）はワンショットでも `envDenyList` で落とす。
+
+### 12.6 未対応 / 制限
+
+- **codex は要約エンジン未対応**。`supervisor` の backend に codex を書くと claude へフォールバックし、
+  起動ログに「backend=codex は要約エンジン未対応のため claude で代替」と出る。
+- 固定エビ config の `args` は **backend の方言のまま**渡る（`--strict-mcp-config` のような
+  claude 専用フラグを残すと gemini が起動に失敗する）。backend を変えたら args も見直すこと。
+- 固定エビへの制御MCP 付与（`--mcp-config`）は claude 方言のままなので、gemini 固定エビに
+  制御MCP を持たせる経路は未整備（supervisor は制御MCP を必要としないため今回は対象外）。
+
+### 12.7 live e2e
+
+```bash
+node scripts/e2e-supervisor-gemini.mjs          # 5 ラウンド（既定）
+EBI_E2E_ROUNDS=3 node scripts/e2e-supervisor-gemini.mjs
+npm run e2e:supervisor-gemini
+```
+
+稼働サーバ(8787)には触らない（専用ポート 8805 ＋ mkdtemp の使い捨て状態ディレクトリ）。
+検査するのは (1) 起動ログの要約エンジンが gemini になる (2) 常駐 supervisor が backend=gemini で
+ready（入力欄描画）に到達する (3) 役割 GEMINI.md が書かれる (4) `ask_supervisor` の往復が
+N ラウンド成功し日本語 3〜5 行で返る (5) 撤収後にプロセスグループ残存 0。
+
+**実測（2026-09-05・gemini-cli 0.58.0 / `gemini-3.5-flash`）**: 6/6 OK。
+`ask_supervisor` 5/5 成功・3〜5 行の日本語 5/5・**平均 21.0 秒/回**（claude/Haiku よりは遅い）。
