@@ -10,7 +10,9 @@
 //     scrollback に現れるので、実 claude を 1 匹も起動せずに着弾を判定できる。
 //   - per-エビ gemini settings は EBI_GEMINI_RUNTIME_DIR で tmp 配下へ隔離する
 //     （`~/.gemini/settings.json` / `trustedFolders.json` には一切触らない）。
-//   - 終了時に spawn した全エビを kill し、`pgrep -f "npm-global.*gemini"` が 0 件であることを検査する。
+//   - 終了時に spawn した全エビを kill し、**テスト自身が起こした** gemini（各ラウンドの pid を
+//     リーダとするプロセスグループ）の残存が 0 件であることを検査する。稼働サーバの常駐 gemini を
+//     巻き込まないよう、環境全体の pgrep では判定しない。
 //
 // 使い方:
 //   node scripts/e2e-gemini-engineer.mjs                 # 10 ラウンド（直列）
@@ -186,16 +188,22 @@ function groupAlive(pid) {
   }
 }
 
-/** 環境全体に残っている gemini プロセス数（PoC と同じ検査）。 */
-function geminiProcessCount() {
-  try {
-    const out = execFileSync("bash", ["-lc", 'pgrep -f "npm-global.*gemini" | wc -l'], {
-      encoding: "utf8",
-    });
-    return Number(out.trim());
-  } catch {
-    return -1;
+/**
+ * テスト自身が起こした gemini の残存 pid（各ラウンドの pid を pgid とみなして数える）。
+ * 環境全体の pgrep だと、稼働サーバの常駐 supervisor(gemini) まで数えて偽陽性になる。
+ */
+function ownGeminiSurvivors(rounds) {
+  const left = [];
+  for (const r of rounds) {
+    if (!r.pid) continue;
+    try {
+      const out = execFileSync("pgrep", ["-g", String(r.pid)], { encoding: "utf8" }).trim();
+      for (const pid of out.split("\n").filter(Boolean)) left.push(pid);
+    } catch {
+      // pgrep はマッチ 0 件で exit 1
+    }
   }
+  return left;
 }
 
 /** 1 ラウンド: gemini エビを spawn → 極小タスク注入 → reply 着弾 → idle → kill → 残存検査。 */
@@ -320,8 +328,6 @@ async function main() {
   console.log(`tmpDir: ${tmpDir}  rounds=${ROUNDS}  port=${PORT}`);
   console.log(`gemini: ${execFileSync("gemini", ["--version"], { encoding: "utf8" }).trim()}`);
   console.log(`GOOGLE_CLOUD_PROJECT=${process.env.GOOGLE_CLOUD_PROJECT ?? "(未設定)"}`);
-  const before = geminiProcessCount();
-  console.log(`開始時の gemini プロセス数: ${before}`);
 
   const mcpConfig = writeMcpConfig(tmpDir);
   const configPath = writeConfig(tmpDir);
@@ -355,7 +361,7 @@ async function main() {
   }
 
   await sleep(2000);
-  const after = geminiProcessCount();
+  const survivors = ownGeminiSurvivors(results);
   const delivered = results.filter((r) => r.delivered).length;
   const idled = results.filter((r) => r.idle).length;
   const clean = results.filter((r) => r.leftover === 0).length;
@@ -371,14 +377,17 @@ async function main() {
     `\n==== reply 着弾 ${delivered}/${results.length} / idle 復帰 ${idled}/${results.length} / ` +
       `kill 後残存 0 が ${clean}/${results.length} ====`,
   );
-  console.log(`gemini プロセス数: 開始 ${before} → 終了 ${after}（0 であること）`);
+  console.log(
+    `テストが起こした gemini の残存: ${survivors.length} 件（0 であること）` +
+      (survivors.length ? ` pid=${survivors.join(", ")}` : ""),
+  );
 
   const ok =
     results.length === ROUNDS &&
     delivered === ROUNDS &&
     idled === ROUNDS &&
     clean === ROUNDS &&
-    after === 0;
+    survivors.length === 0;
   process.exit(ok ? 0 : 1);
 }
 
