@@ -8,7 +8,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   ChatTranscript,
+  collectImages,
   firstUnsettledPending,
+  lightboxCounter,
+  LightboxState,
   InputHistory,
   INPUT_HISTORY_KEY,
   LARGE_PASTE_CHARS,
@@ -20,7 +23,12 @@ import {
   stateLabel,
   summarizeToolInput,
 } from "../src/client/chatModel.ts";
-import type { MasterChatEnvelope, MasterChatEvent } from "../src/shared/protocol.ts";
+import type {
+  ChatAttachment,
+  ChatImage,
+  MasterChatEnvelope,
+  MasterChatEvent,
+} from "../src/shared/protocol.ts";
 
 let seq = 0;
 function env(event: MasterChatEvent): MasterChatEnvelope {
@@ -383,3 +391,143 @@ test("settledLabel は承認と質問で文面を分ける", () => {
   assert.equal(settledLabel("denied", "permission", null), "⛔ 拒否しました");
   assert.match(settledLabel("discarded", "question", null), /破棄/);
 });
+
+// ===== チャット内画像共有 / ライトボックス（PR-M10）=====
+
+/** master が共有した画像 1 枚（保管庫コピー済みの形）。 */
+function img(name: string, over: Partial<ChatImage> = {}): ChatImage {
+  return {
+    name,
+    url: `/control/chat-attachment?name=${name}`,
+    mediaType: "image/png",
+    bytes: 1234,
+    sourcePath: `/home/boss/workspace/tmp/${name}`,
+    title: null,
+    caption: null,
+    ...over,
+  };
+}
+
+/** ボスが添付した画像 1 枚。 */
+function attach(name: string, mediaType = "image/png"): ChatAttachment {
+  return {
+    name,
+    path: `/repo/.ebi-team/chat-attachments/${name}`,
+    mediaType,
+    url: `/control/chat-attachment?name=${name}`,
+    bytes: 999,
+  };
+}
+
+test("image イベントはアイテムとして積まれ、streaming を閉じる", () => {
+  const t = fresh();
+  t.apply(env({ kind: "text", text: "作りました", partial: true }));
+  const change = t.apply(env({ kind: "image", images: [img("chat-1.png", { title: "エビ" })] }));
+  assert.equal(t.items.length, 2);
+  assert.equal(change.appendedFrom, 1);
+  const streamed = t.items[0]!;
+  assert.equal(streamed.kind === "assistant" && streamed.streaming, false, "開いていた streaming は閉じる");
+  const item = t.items[1]!;
+  assert.equal(item.kind, "image");
+  assert.equal(item.kind === "image" ? item.images[0]!.title : null, "エビ");
+});
+
+test("snapshot 再適用で image アイテムが復元される（再起動後の履歴）", () => {
+  const t = fresh();
+  const envelopes = [
+    env({ kind: "user", text: "画像ちょうだい" }),
+    env({ kind: "image", images: [img("chat-2.png", { caption: "1 枚目" })] }),
+  ];
+  t.reset(envelopes);
+  assert.equal(t.items.length, 2);
+  const item = t.items[1]!;
+  assert.equal(item.kind === "image" ? item.images[0]!.caption : null, "1 枚目");
+});
+
+test("collectImages: ボス添付と master 共有を時系列 1 列にまとめる（テキスト添付は除く）", () => {
+  const t = fresh();
+  t.apply(env({ kind: "user", text: "これ見て", attachments: [attach("chat-a.png"), attach("chat-note.txt", "text/plain")] }));
+  t.apply(env({ kind: "image", images: [img("chat-b.png", { title: "成果" })] }));
+  t.apply(env({ kind: "text", text: "以上です", partial: false }));
+  t.apply(env({ kind: "image", images: [img("chat-c.png")] }));
+
+  const list = collectImages(t.items);
+  assert.deepEqual(
+    list.map((e) => e.name),
+    ["chat-a.png", "chat-b.png", "chat-c.png"],
+    "時系列順・テキスト添付は含まない",
+  );
+  assert.deepEqual(list.map((e) => e.from), ["boss", "master", "master"]);
+  // key は seq とインデックスの組（同じ画像を 2 度出しても衝突しない）。
+  assert.equal(new Set(list.map((e) => e.key)).size, 3);
+  assert.equal(list[1]!.title, "成果");
+});
+
+test("collectImages: 画像が 1 枚も無ければ空配列", () => {
+  const t = fresh();
+  t.apply(env({ kind: "text", text: "テキストだけ", partial: false }));
+  assert.deepEqual(collectImages(t.items), []);
+});
+
+test("LightboxState: open / close と現在位置", () => {
+  const entries = collectImagesOf(["a", "b", "c"]);
+  const lb = new LightboxState(entries);
+  assert.equal(lb.isOpen, false);
+  assert.equal(lb.current, null);
+  assert.equal(lightboxCounter(lb), "");
+  assert.equal(lb.open("missing"), false, "未知の key では開かない");
+  assert.equal(lb.open(entries[1]!.key), true);
+  assert.equal(lb.isOpen, true);
+  assert.equal(lb.current?.name, "b");
+  assert.equal(lightboxCounter(lb), "2 / 3");
+  lb.close();
+  assert.equal(lb.isOpen, false);
+  assert.equal(lb.current, null);
+});
+
+test("LightboxState: next/prev は会話内の全画像を横断し、端では折り返さない", () => {
+  const entries = collectImagesOf(["a", "b", "c"]);
+  const lb = new LightboxState(entries);
+  lb.open(entries[0]!.key);
+  assert.equal(lb.hasPrev, false);
+  assert.equal(lb.prev(), false, "先頭で prev は何もしない");
+  assert.equal(lb.current?.name, "a");
+  assert.equal(lb.next(), true);
+  assert.equal(lb.current?.name, "b");
+  assert.equal(lb.next(), true);
+  assert.equal(lb.current?.name, "c");
+  assert.equal(lb.hasNext, false);
+  assert.equal(lb.next(), false, "末尾で next は何もしない");
+  assert.equal(lightboxCounter(lb), "3 / 3");
+  assert.equal(lb.prev(), true);
+  assert.equal(lb.current?.name, "b");
+});
+
+test("LightboxState: 閉じているあいだ next/prev は動かない", () => {
+  const entries = collectImagesOf(["a", "b"]);
+  const lb = new LightboxState(entries);
+  assert.equal(lb.next(), false);
+  assert.equal(lb.prev(), false);
+  assert.equal(lb.position, 0);
+});
+
+test("LightboxState: setEntries は開いている画像に追従し、消えていれば閉じる", () => {
+  const entries = collectImagesOf(["a", "b", "c"]);
+  const lb = new LightboxState(entries);
+  lb.open(entries[1]!.key);
+  // 新しい画像が届いた（先頭は同じまま）→ 開いている画像はそのまま、枚数だけ増える。
+  const grown = collectImagesOf(["a", "b", "c", "d"]);
+  lb.setEntries(grown);
+  assert.equal(lb.current?.name, "b");
+  assert.equal(lightboxCounter(lb), "2 / 4");
+  // トランスクリプトが総入れ替えになって key を見失ったら閉じる。
+  lb.setEntries([]);
+  assert.equal(lb.isOpen, false);
+});
+
+/** name の並びから LightboxEntry 相当（collectImages 経由）を作るヘルパー。 */
+function collectImagesOf(names: readonly string[]) {
+  const t = fresh();
+  for (const n of names) t.apply(env({ kind: "image", images: [img(n)] }));
+  return collectImages(t.items);
+}

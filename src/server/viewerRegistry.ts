@@ -240,6 +240,15 @@ export class ViewerRegistry {
   }
 
   /**
+   * 現在のサイズ上限（テキスト / 画像）。
+   * チャットへの画像共有（PR-M10・src/server/chatImages.ts）が **open_viewer とまったく同じ枠**で
+   * 検証するために公開している（env の解釈をもう 1 か所に書かない）。
+   */
+  get limits(): { maxBytes: number; maxImageBytes: number } {
+    return { maxBytes: this.maxBytes, maxImageBytes: this.maxImageBytes };
+  }
+
+  /**
    * ファイルを開いて viewer を 1 件登録する。パス検証に失敗したら ViewerPathError を throw。
    * content は open 時点のスナップショット（読み取り専用）。
    */

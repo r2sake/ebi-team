@@ -107,6 +107,7 @@ node scripts/gen-master-mcp.mjs
 | 文脈使用率（ヘッダの `ctx`） | `turnEnd.usage` | **切れる**（`—` から） | 次のターンが終わるまでは算出できないので `—` 表示 |
 | 枠（`5h` / `週`） | `rate_limit_event` → `UsageStore` | **切れる** | アカウント単位の値なので、PTY エビが statusLine を投げれば埋まる（§5） |
 | 添付ファイル | `.ebi-team/chat-attachments/`（env `EBI_CHAT_ATTACH_DIR`） | **残る** | 掃除は運用で行う（§7） |
+| チャットへ共有した画像（`chat_image`） | 同上（共有時に保管庫へ**コピー**される） | **残る** | 元ファイルを消しても履歴の画像は残る。保管庫を掃除すると「（画像は削除されています）」表示になる（§10） |
 | 入力履歴（↑/↓） | ブラウザの localStorage（`ebi-team.chat.inputHistory.v1`・直近 50 件） | **残る** | サーバ側には保存しない。別ブラウザ・別端末では共有されない |
 | terminal 側の PTY スクロールバック | メモリ（リングバッファ） | 切れる | chat では PTY 自体を起動しない |
 
@@ -131,11 +132,12 @@ node scripts/gen-master-mcp.mjs
 | --- | --- | --- |
 | `npm test` / `npm run test:unit` | unit のみ | 使わない |
 | `npm run e2e:all-terminal` | `ui` 未指定（terminal）の一式: control / send / reverse-notify / notify-fallback / delivery-hardening / usage / viewer / viewer-persist / supervisor / fixed / minaebi / context-guard / spawn-delivery | **最後の `e2e:spawn-delivery` のみ使う** |
-| `npm run e2e:all-chat` | chat 経路の一式: context-guard（偽 claude スタブ）→ master-chat → master-chat-image → master-chat-approval | **master-chat / master-chat-image / master-chat-approval の実配線チェックが使う** |
+| `npm run e2e:all-chat` | chat 経路の一式: context-guard（偽 claude スタブ）→ master-chat → master-chat-image → master-chat-approval → master-chat-share-image | **master-chat / master-chat-image / master-chat-approval の実配線チェックが使う** |
 | `npm run e2e:context-guard` | terminal C1〜C5 ＋ chat D1〜D6（chat 側は `scripts/fake-claude-stream.mjs` を `claude` として PATH 先頭に置く） | 使わない |
 | `npm run e2e:master-chat` | chat の往復 + `reverse-inject` → `inbound` を連続 10 回 | 使う（haiku・`EBI_E2E_CHAT_ROUNDS` で回数を減らせる） |
 | `npm run e2e:master-chat-image` | 画像添付が実際に turn に届くか（色を答えさせる） | 使う（haiku・1 往復） |
 | `npm run e2e:master-chat-approval` | 承認 / 質問の応答（ブローカ・MCP `permission_prompt`・UI 配線）17 チェック | 使う（haiku・承認 1 往復 + 質問 1 往復。`EBI_E2E_APPROVAL_REAL=0` で偽 claude のみに絞れる） |
+| `npm run e2e:master-chat-share-image` | チャットへの画像共有（`chat_image` → 保管庫コピー → WS → 再起動後の復元 → terminal フォールバック）19 チェック | **使わない**（偽 claude スタブのみ・専用ポート 8802 / 8803） |
 | `npm run e2e:master-brain` | `ClaudeHeadlessBrain` 単体の 2 ターン結合 | 使う（opt-in） |
 | `npm run compare:contextpct` | ヘッドレスの算出 `ctx%` と statusLine の突き合わせ | 使う（opt-in・haiku） |
 
@@ -166,6 +168,8 @@ find .ebi-team/chat-attachments -type f -mtime +30 -delete
 ```
 
 - 目安: スクリーンショット 1 枚 = 0.3〜2MB、大きな貼り付け（8,000 文字超は自動でファイル化）= 数十 KB。日に数回スクショを貼る使い方で **月あたり数百 MB** を見ておく。
+- **`chat_image`（§10）で共有した画像も同じ保管庫に入る**（掃除手順は 1 本のまま）。生成画像は 1 枚 1〜3MB なので、
+  日に 10 枚共有する使い方で **月 300〜900MB** 増える。上の `find -mtime +30 -delete` に自然に含まれる。
 - サーバを止めずに消してよい（保管庫はリクエストのたびに読む）。消した添付を含む過去の発話は、テキスト部分だけが残る。
 - 会話そのものを畳みたいときは `.ebi-team/master-chat.jsonl` を退避（リネーム）してから再起動する。**削除ではなく退避**を勧める（過去の依頼の経緯が唯一残っている場所になりうるため）。
 
@@ -204,3 +208,39 @@ find .ebi-team/chat-attachments -type f -mtime +30 -delete
   「どのバブルをまだ出してよいか」が復元できる。サーバ再起動時、未決着のものは `discarded` として畳まれる。
 - 受け入れ e2e は `npm run e2e:master-chat-approval`（大半は偽 claude スタブ。最後の 2 チェックだけ実 claude で
   `--permission-prompt-tool` → `permission_prompt` → 制御 API の実配線を確かめる。`EBI_E2E_APPROVAL_REAL=0` で省ける）。
+
+## 10. チャットへの画像共有（`chat_image`・PR-M10）
+
+master 専用の MCP ツール `chat_image({ path, title?, caption? })` で、画像を**チャット欄に直接**出せる。
+サムネイルをクリック（Enter / Space）すると**ライトボックス**で拡大表示になる。
+
+```
+chat_image({
+  path: "/Users/…/workspace/GitHub/ebi-team/tmp/images/smoke-20260905/ebi-1.png",
+  title: "エビ（16:9）",
+  caption: "imagegen ジョブ smoke-20260905 の 1 枚目",
+})
+```
+
+- **`open_viewer` との使い分け**: 「ボスに見せたい画像」は `chat_image`、md/txt のレビューや
+  原寸でじっくり比べたいときは `open_viewer`（別パネル）。置き換えではなく**併存**。
+  `open_viewer` の挙動は PR-M10 で一切変えていない。
+- **パスの条件**: 許可ルート（既定 `$HOME/workspace`・env `EBI_VIEWER_ROOTS`）配下の
+  `.png` / `.jpg` / `.jpeg` / `.webp` / `.gif` のみ。許可ルート外・非画像・サイズ超過（既定 8MB）は
+  400 で弾く（検証は `open_viewer` とまったく同じ関門 = `resolveViewerPath`）。
+  **imagegen エビの納品先が許可ルート配下にあることが前提**（`docs/ops/imagegen-role.md`）。
+- **実体はコピーされる**: 共有時に添付保管庫（`.ebi-team/chat-attachments/`）へコピーし、以降は
+  basename だけで扱う（配信は既存の `GET /control/chat-attachment?name=`）。
+  元ファイルを `tmp/` 掃除で消しても、チャット履歴の画像は残る。容量の目安は §7。
+- **会話 JSONL には base64 を載せない**（basename と表示メタだけ）。再接続・サーバ再起動のあとは
+  `chatSnapshot` からそのまま復元される。
+- **ライトボックスの操作**: `Esc` / 背景クリック / `✕` で閉じる。`←` `→`（画面端のボタン）で
+  **会話内の全画像**を横断する（ボスが添付した画像も同じ列に載る）。端では折り返さない。
+  スワイプは入れていない。
+- **terminal（PTY）master でも失敗しない**: `ui:"chat"` の master が居ない構成で呼ぶと
+  自動で `open_viewer` にフォールバックし、`{ shown: "viewer", id }` を返す（裁定 Q-4）。
+  ＝ `ui` を terminal へ戻しても master の書き方を変えなくてよい。
+- **作業エビからは出せない**: `chat_image` は master ロールの MCP にだけ出る（裁定 Q-7）。
+  imagegen エビは従来どおり `reply_to_master` でパスを返し、master が共有する。
+- 受け入れ e2e は `npm run e2e:master-chat-share-image`（**実 claude を使わない**）。
+  見た目の確認は `tmp/shots-m10/`（`node tmp/shots-m10/take-shots.mjs`）。

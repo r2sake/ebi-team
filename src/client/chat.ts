@@ -6,6 +6,7 @@ import type {
 } from "../shared/protocol.ts";
 import {
   ChatTranscript,
+  collectImages,
   firstUnsettledPending,
   formatBytes,
   formatContextPct,
@@ -17,6 +18,8 @@ import {
   oneLine,
   settledLabel,
   stateLabel,
+  lightboxCounter,
+  LightboxState,
   stringifyInput,
   summarizeToolInput,
   type ChatItem,
@@ -78,6 +81,12 @@ export class ChatPanel {
   private masterId: string | null = null;
   /** アカウント枠（WS `usage` 由来・ヘッダ表示用）。未受信は「—」。 */
   private rateLimits: HeaderRateLimits = NO_RATE_LIMITS;
+  /** ライトボックス（PR-M10）の状態機械。DOM 側はこの値を描画するだけ。 */
+  private readonly lightbox = new LightboxState();
+  /** ライトボックスの DOM（初回オープン時に作って body へ足す）。 */
+  private lightboxUi: LightboxUi | null = null;
+  /** ライトボックスを開く直前にフォーカスしていた要素（閉じたら戻す）。 */
+  private lightboxOpener: HTMLElement | null = null;
 
   constructor(
     private readonly el: HTMLElement,
@@ -189,6 +198,8 @@ export class ChatPanel {
   /** WS `chatSnapshot`（接続直後・再接続時の一括復元）。 */
   applySnapshot(envelopes: readonly MasterChatEnvelope[], hasMore: boolean): void {
     this.transcript.reset(envelopes);
+    // アイテムが総入れ替えになるので、開いていたライトボックスは畳む（key が変わりうる）。
+    this.closeLightbox();
     this.renderAll(hasMore);
     this.scrollToBottom(true);
   }
@@ -200,6 +211,8 @@ export class ChatPanel {
     const wasBottom = this.stuckToBottom;
     for (const index of change.touched) this.renderItem(index);
     this.updateStats();
+    // 開いたまま新しい画像が届いたら送り先（と枚数表示）を更新する。
+    if (this.lightbox.isOpen) this.syncLightbox();
     if (wasBottom) {
       this.scrollToBottom(false);
     } else if (change.appendedFrom >= 0) {
@@ -503,14 +516,139 @@ export class ChatPanel {
     this.updateStats();
   }
 
+  // ===== ライトボックス（PR-M10）=====
+
+  /**
+   * サムネイルのクリック / Enter / Space から呼ばれる。
+   * 送りの対象は**トランスクリプト内の全画像**（ボス添付 + master 共有を時系列で 1 列）。
+   */
+  private openLightbox(key: string, opener: HTMLElement): void {
+    this.lightbox.setEntries(collectImages(this.transcript.items));
+    if (!this.lightbox.open(key)) return;
+    this.lightboxOpener = opener;
+    const ui = this.ensureLightboxUi();
+    ui.root.hidden = false;
+    // 背面スクロール抑止（iOS Safari で特に効く）。閉じたら戻す。
+    document.body.style.overflow = "hidden";
+    this.renderLightbox();
+    ui.root.focus();
+  }
+
+  /** 閉じる（Esc / 背景クリック / ×）。フォーカスは開いたサムネイルへ戻す。 */
+  private closeLightbox(): void {
+    if (!this.lightbox.isOpen && !this.lightboxUi) return;
+    this.lightbox.close();
+    if (this.lightboxUi) this.lightboxUi.root.hidden = true;
+    document.body.style.overflow = "";
+    const opener = this.lightboxOpener;
+    this.lightboxOpener = null;
+    // 元のサムネイルがまだ画面にあるときだけ戻す（描き替えで消えていることがある）。
+    if (opener?.isConnected) opener.focus();
+  }
+
+  /** 一覧を作り直して現在位置に追従する（開いている画像が消えていたら閉じる）。 */
+  private syncLightbox(): void {
+    this.lightbox.setEntries(collectImages(this.transcript.items));
+    if (!this.lightbox.isOpen) this.closeLightbox();
+    else this.renderLightbox();
+  }
+
+  private step(delta: 1 | -1): void {
+    const moved = delta === 1 ? this.lightbox.next() : this.lightbox.prev();
+    if (moved) this.renderLightbox();
+  }
+
+  /** 状態機械の現在値を DOM へ書き出す。 */
+  private renderLightbox(): void {
+    const ui = this.lightboxUi;
+    const entry = this.lightbox.current;
+    if (!ui || !entry) return;
+    ui.img.src = entry.url;
+    ui.img.alt = entry.title ?? entry.name;
+    ui.title.textContent = entry.title ?? entry.name;
+    ui.caption.textContent = entry.caption ?? "";
+    ui.caption.hidden = !entry.caption;
+    ui.path.textContent = entry.sourcePath ?? entry.name;
+    ui.counter.textContent = lightboxCounter(this.lightbox);
+    ui.prev.disabled = !this.lightbox.hasPrev;
+    ui.next.disabled = !this.lightbox.hasNext;
+  }
+
+  /** ライトボックスの DOM を 1 回だけ作る（body 直下＝チャットのレイアウトに影響されない）。 */
+  private ensureLightboxUi(): LightboxUi {
+    if (this.lightboxUi) return this.lightboxUi;
+    const root = div("chat-lightbox");
+    root.hidden = true;
+    root.tabIndex = -1;
+    const img = document.createElement("img");
+    img.className = "chat-lightbox-img";
+    img.addEventListener("error", () => {
+      caption.textContent = `（画像は削除されています: ${this.lightbox.current?.name ?? ""}）`;
+      caption.hidden = false;
+    });
+    const close = document.createElement("button");
+    close.className = "chat-lightbox-close";
+    close.textContent = "✕";
+    close.title = "閉じる（Esc）";
+    close.addEventListener("click", () => this.closeLightbox());
+    const counter = span("chat-lightbox-counter", "");
+    const prev = document.createElement("button");
+    prev.className = "chat-lightbox-nav prev";
+    prev.textContent = "‹";
+    prev.title = "前の画像（←）";
+    prev.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.step(-1);
+    });
+    const next = document.createElement("button");
+    next.className = "chat-lightbox-nav next";
+    next.textContent = "›";
+    next.title = "次の画像（→）";
+    next.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.step(1);
+    });
+    const title = div("chat-lightbox-title");
+    const caption = div("chat-lightbox-caption");
+    const path = div("chat-lightbox-path");
+    const foot = div("chat-lightbox-foot");
+    foot.append(title, caption, path);
+    const stage = div("chat-lightbox-stage");
+    stage.appendChild(img);
+    root.append(close, counter, prev, next, stage, foot);
+    // 背景（画像の外側）クリックで閉じる。画像そのもののクリックでは閉じない。
+    root.addEventListener("click", (e) => {
+      if (e.target === root || e.target === stage || e.target === foot) this.closeLightbox();
+    });
+    root.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        this.closeLightbox();
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        this.step(1);
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        this.step(-1);
+      }
+    });
+    document.body.appendChild(root);
+    this.lightboxUi = { root, img, title, caption, path, counter, prev, next };
+    return this.lightboxUi;
+  }
+
   /** items[index] を描画（新規は append、既存は差し替え）。 */
   private renderItem(index: number): void {
     const item = this.transcript.items[index];
     if (!item) return;
-    const next = buildItem(item, (requestId, answer) => {
-      if (!this.masterId) return;
-      this.onAnswer(this.masterId, requestId, answer);
-    });
+    const next = buildItem(
+      item,
+      (requestId, answer) => {
+        if (!this.masterId) return;
+        this.onAnswer(this.masterId, requestId, answer);
+      },
+      (key, opener) => this.openLightbox(key, opener),
+    );
     const prev = this.rendered[index];
     if (prev) {
       // ツールの `<details>` は開閉状態をユーザーが持っているので引き継ぐ。
@@ -527,10 +665,26 @@ export class ChatPanel {
 
 // ===== アイテム 1 件 → DOM =====
 
+/** ライトボックスの DOM 参照一式（ChatPanel が値を書き込む先）。 */
+interface LightboxUi {
+  root: HTMLElement;
+  img: HTMLImageElement;
+  title: HTMLElement;
+  caption: HTMLElement;
+  path: HTMLElement;
+  counter: HTMLElement;
+  prev: HTMLButtonElement;
+  next: HTMLButtonElement;
+}
+
+/** サムネイルを押したときの通知（key = collectImages() のキー・opener = 復帰先のフォーカス）。 */
+type OpenImage = (key: string, opener: HTMLElement) => void;
+
 /** 1 アイテムを表す要素を作る（テキストはすべて textContent 経由＝XSS 安全）。 */
 function buildItem(
   item: ChatItem,
   onAnswer: (requestId: string, answer: { allow?: boolean; choice?: string[]; text?: string }) => void,
+  onOpenImage: OpenImage = () => {},
 ): HTMLElement {
   switch (item.kind) {
     case "user": {
@@ -538,7 +692,9 @@ function buildItem(
       const bubble = div("chat-bubble user");
       bubble.append(meta("ボス", item.ts));
       if (item.text) bubble.appendChild(plain(item.text));
-      if (item.attachments.length > 0) bubble.appendChild(attachmentStrip(item.attachments));
+      if (item.attachments.length > 0) {
+        bubble.appendChild(attachmentStrip(item.attachments, item.seq, onOpenImage));
+      }
       row.appendChild(bubble);
       return row;
     }
@@ -549,6 +705,17 @@ function buildItem(
       renderMarkdownInto(body, item.text);
       bubble.append(meta("master", item.ts), body);
       if (item.streaming) bubble.appendChild(span("chat-caret", "▍"));
+      row.appendChild(bubble);
+      return row;
+    }
+    case "image": {
+      // master がチャットへ共有した画像（PR-M10）。assistant 側のカードとして出す。
+      const row = bubbleRow("assistant");
+      const bubble = div("chat-bubble assistant image");
+      bubble.append(meta("master", item.ts));
+      item.images.forEach((img, i) => {
+        bubble.appendChild(imageCard(img, `${item.seq}:${i}`, onOpenImage));
+      });
       row.appendChild(bubble);
       return row;
     }
@@ -766,25 +933,91 @@ function span(cls: string, text: string): HTMLSpanElement {
   return el;
 }
 
-/** 送信済みメッセージに付いた添付のサムネイル列。 */
-function attachmentStrip(attachments: readonly ChatAttachment[]): HTMLElement {
+/**
+ * 送信済みメッセージに付いた添付のサムネイル列。
+ * 画像はクリック（Enter / Space）で master 共有画像と**同じライトボックス**へ載る（PR-M10）。
+ */
+function attachmentStrip(
+  attachments: readonly ChatAttachment[],
+  seq: number,
+  onOpenImage: OpenImage,
+): HTMLElement {
   const strip = div("chat-attachments");
-  for (const a of attachments) {
+  attachments.forEach((a, i) => {
     const cell = div("chat-attachment");
     if (a.mediaType.startsWith("image/")) {
       const img = document.createElement("img");
       img.className = "chat-attachment-thumb";
       img.src = a.url;
       img.alt = a.name;
-      img.title = a.path;
+      img.title = `${a.path}（クリックで拡大）`;
+      makeZoomable(img, `${seq}:${i}`, onOpenImage);
       cell.appendChild(img);
     }
     const name = span("chat-attachment-name", a.name);
     name.title = a.path;
     cell.appendChild(name);
     strip.appendChild(cell);
-  }
+  });
   return strip;
+}
+
+/**
+ * master が共有した画像 1 枚のカード（見出し + サムネイル + 説明文）。
+ * サムネイルの寸法は CSS（max 320x240・object-fit: contain）で決める。
+ */
+function imageCard(
+  image: {
+    name: string;
+    url: string;
+    sourcePath: string;
+    title: string | null;
+    caption: string | null;
+    bytes: number;
+  },
+  key: string,
+  onOpenImage: OpenImage,
+): HTMLElement {
+  const card = div("chat-image-card");
+  if (image.title) {
+    const t = div("chat-image-title");
+    t.textContent = image.title;
+    card.appendChild(t);
+  }
+  const img = document.createElement("img");
+  img.className = "chat-image-thumb";
+  img.src = image.url;
+  img.alt = image.title ?? image.name;
+  img.title = `${image.sourcePath}（${formatBytes(image.bytes)}・クリックで拡大）`;
+  img.loading = "lazy";
+  img.decoding = "async";
+  makeZoomable(img, key, onOpenImage);
+  // 保管庫を掃除したあとは 404 になる。吹き出しごと消さず、その旨だけ出す。
+  img.addEventListener("error", () => {
+    const gone = div("chat-image-missing");
+    gone.textContent = `（画像は削除されています: ${image.name}）`;
+    img.replaceWith(gone);
+  });
+  card.appendChild(img);
+  if (image.caption) {
+    const c = div("chat-image-caption");
+    c.textContent = image.caption;
+    card.appendChild(c);
+  }
+  return card;
+}
+
+/** サムネイルを「押せる」ようにする（マウス・キーボードの両方）。 */
+function makeZoomable(img: HTMLImageElement, key: string, onOpenImage: OpenImage): void {
+  img.classList.add("zoomable");
+  img.setAttribute("role", "button");
+  img.tabIndex = 0;
+  img.addEventListener("click", () => onOpenImage(key, img));
+  img.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    e.preventDefault();
+    onOpenImage(key, img);
+  });
 }
 
 /**

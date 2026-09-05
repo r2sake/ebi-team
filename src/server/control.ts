@@ -11,7 +11,13 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Registry } from "./registry.ts";
 import type { MailboxMessage } from "./mailbox.ts";
-import { BROADCAST_TARGET, type AgentMode, type AgentKind, type ViewerRecord } from "../shared/protocol.ts";
+import {
+  BROADCAST_TARGET,
+  type AgentMode,
+  type AgentKind,
+  type ChatImage,
+  type ViewerRecord,
+} from "../shared/protocol.ts";
 import {
   ALLOWED_ATTACH_TYPES,
   maxBytesFor,
@@ -185,6 +191,21 @@ export interface ControlDeps {
   readChatAttachment:
     | ((name: string) => Promise<{ bytes: Buffer; mediaType: string; path: string } | null>)
     | null;
+  /**
+   * master がチャットへ画像を共有する（`POST /control/chat-image` の実体・PR-M10）。
+   *
+   * 実体は「許可ルート検証 → 添付保管庫へコピー → MasterSession.shareImage()」で、
+   * 戻り値の ChatImage がそのままチャットの画像カードになる。
+   * **chat master が居ない構成（ui:"terminal"）では null を返す**。その場合この
+   * エンドポイントは `open_viewer` へ自動フォールバックする（設計 §6・Q-4: ツールを
+   * 失敗させない＝ master の書き方を ui で分岐させない）。
+   * 検証失敗（許可ルート外 / 非画像 / サイズ超過 / 不存在）は throw（400）。
+   */
+  shareChatImage: (
+    path: string,
+    title?: string,
+    caption?: string,
+  ) => Promise<ChatImage | null>;
   /**
    * 承認 / 質問の受け口（`POST /control/chat-permission` の実体・PR-M5）。
    *
@@ -630,6 +651,43 @@ export function createControlApi(deps: ControlDeps) {
         const ok = registry.remove(id);
         broadcastRegistry();
         sendJson(res, ok ? 200 : 500, ok ? { id, killed: true } : { error: "kill に失敗しました" });
+        return true;
+      }
+
+      // ---- POST /control/chat-image ----
+      // master 専用 MCP `chat_image` からのブリッジ（PR-M10）。パス検証（許可ルート/realpath/
+      // 拡張子/サイズ）と保管庫へのコピーは shareChatImage（index.ts 側）が行う。
+      // chat master が居ない構成（ui:"terminal"）では **open_viewer へ自動フォールバック**して
+      // ツールを失敗させない（設計 §6 / 裁定 Q-4）。
+      if (pathname === "/control/chat-image" && method === "POST") {
+        const body = await readJsonBody(req);
+        const path = asString(body.path);
+        const title = asString(body.title);
+        const caption = asString(body.caption);
+        if (!path) {
+          sendJson(res, 400, { error: "path（文字列）は必須です" });
+          return true;
+        }
+        try {
+          const image = await deps.shareChatImage(path, title, caption);
+          if (image) {
+            sendJson(res, 200, { shown: "chat", ...image });
+            return true;
+          }
+          // chat master が居ない → viewer パネルで開く（同じ検証を通る経路）。
+          const rec = await openViewer(path, title);
+          sendJson(res, 200, {
+            shown: "viewer",
+            id: rec.id,
+            path: rec.path,
+            title: rec.title,
+            format: rec.format,
+            note: 'チャット UI の master（ui:"chat"）が居ないため、viewer パネルで開きました',
+          });
+        } catch (err) {
+          // パス検証エラー（許可ルート外 / 非画像 / サイズ超過 / 不存在）は 400 で理由を返す。
+          sendJson(res, 400, { error: (err as Error).message });
+        }
         return true;
       }
 

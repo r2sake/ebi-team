@@ -480,6 +480,30 @@ export interface ChatAttachment {
   bytes: number;
 }
 
+/**
+ * master がチャットへ共有した画像 1 枚（PR-M10）。
+ *
+ * 実体は **添付保管庫（`.ebi-team/chat-attachments/`）へコピーされたもの**で、
+ * 参照キーは name（basename）だけ。元の絶対パス（sourcePath）は表示用メタで、
+ * **配信経路では一切参照しない**（新しいパストラバーサル面を増やさない）。
+ */
+export interface ChatImage {
+  /** 保管庫の basename（`chat-<ts>-<rand>.png` 形式）。配信の唯一のキー。 */
+  name: string;
+  /** サムネイル/拡大表示の URL（`/control/chat-attachment?name=...`）。 */
+  url: string;
+  /** MIME（`image/png` 等）。 */
+  mediaType: string;
+  /** バイト数（UI 表示用）。 */
+  bytes: number;
+  /** 共有元の絶対パス（表示・master が Read するとき用。配信には使わない）。 */
+  sourcePath: string;
+  /** 見出し（未指定は null → UI は basename を出す）。 */
+  title: string | null;
+  /** 説明文（未指定は null）。 */
+  caption: string | null;
+}
+
 /** チャット UI に出す usage（MasterUsage のワイヤ表現）。 */
 export interface MasterChatUsage {
   input: number | null;
@@ -505,6 +529,13 @@ export type MasterChatEvent =
       capabilities: string[];
     }
   | { kind: "user"; text: string; attachments?: ChatAttachment[] }
+  /**
+   * master がチャットへ共有した画像（PR-M10・`chat_image` ツール）。
+   * `user` / `inbound` と同じ「ワイヤ側にしか無い kind」で、MasterSession.shareImage()
+   * から直接載せる（MasterEvent には足さない＝ backend 実装に影響しない）。
+   * 配列にしてあるのは将来 1 呼び出しで複数枚を出せるようにするため（現状は常に 1 枚）。
+   */
+  | { kind: "image"; images: ChatImage[] }
   | {
       kind: "inbound";
       /** 送信元エビ id。 */

@@ -12,9 +12,18 @@ import { loadFixedEbi } from "../src/server/config.ts";
 import { applyMasterUiOverride } from "../src/server/fixedEbi.ts";
 import { ChatLog, parseChatLogLine, parseChatLogTail } from "../src/server/master/chatLog.ts";
 import { parseRateLimitEvent, utilizationToPct } from "../src/server/master/rateLimit.ts";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
+import { createControlApi } from "../src/server/control.ts";
 import { Registry } from "../src/server/registry.ts";
+import { ViewerPathError } from "../src/server/viewerRegistry.ts";
 import { UsageStore } from "../src/server/usageStore.ts";
-import type { AgentRecord, MasterChatEnvelope } from "../src/shared/protocol.ts";
+import type {
+  AgentRecord,
+  ChatImage,
+  MasterChatEnvelope,
+  ViewerRecord,
+} from "../src/shared/protocol.ts";
 import type { SpawnConfig } from "../src/server/agent.ts";
 
 const dirs: string[] = [];
@@ -265,4 +274,130 @@ test("chat master と同名の PTY エビは spawn できない（同名二重�
     () => reg.spawn(".", { onData() {}, onStatus() {}, onExit() {}, onNotice() {} }, { id: "master" }),
     /chat モードの master/,
   );
+});
+
+// ===== POST /control/chat-image（PR-M10）=====
+//
+// chat master が居ない構成（ui:"terminal"）で `chat_image` が呼ばれたら、
+// **ツールを失敗させず** open_viewer へ自動フォールバックすること（設計 §6 / 裁定 Q-4）。
+// 制御API を実 HTTP で立てて叩く（handleControl の分岐そのものを通す）。
+
+/** chat-image の検証に必要な deps だけを持つスタブで制御API を立てる。 */
+async function withControlApi(
+  deps: {
+    shareChatImage: (path: string, title?: string, caption?: string) => Promise<ChatImage | null>;
+    openViewer?: (path: string, title?: string) => Promise<ViewerRecord>;
+  },
+  body: Record<string, unknown>,
+): Promise<{ status: number; json: Record<string, unknown> }> {
+  const handle = createControlApi({
+    registry: new Registry(),
+    spawnAgent: async () => "ebi-1",
+    inject: async () => ({ delivered: [], rejected: [], details: [] }),
+    sendMessage: async () => ({ ok: false, error: "未使用", spawned: false }),
+    broadcastRegistry: () => {},
+    summarize: async () => ({ ok: false, reason: "未使用" }),
+    ingestUsage: () => {},
+    subscribe: async () => ({ messages: [] }),
+    openViewer:
+      deps.openViewer ??
+      (async (path, title) => ({
+        id: "viewer-1",
+        path,
+        title: title ?? "viewer",
+        format: "image" as const,
+        content: "",
+        openedAt: 1,
+      })),
+    readViewerFile: async () => null,
+    saveChatAttachment: null,
+    readChatAttachment: null,
+    shareChatImage: deps.shareChatImage,
+    requestChatPermission: null,
+  });
+
+  const server = createServer(async (req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    const handled = await handle(req, res, url.pathname, url.searchParams);
+    if (!handled) {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/control/chat-image`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, json: (await res.json()) as Record<string, unknown> };
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+}
+
+const SAMPLE_IMAGE: ChatImage = {
+  name: "chat-20260905-101010-abcdef12.png",
+  url: "/control/chat-attachment?name=chat-20260905-101010-abcdef12.png",
+  mediaType: "image/png",
+  bytes: 42,
+  sourcePath: "/home/boss/workspace/tmp/a.png",
+  title: null,
+  caption: null,
+};
+
+test("chat master が居れば shown:chat で ChatImage を返す", async () => {
+  const { status, json } = await withControlApi(
+    { shareChatImage: async () => SAMPLE_IMAGE },
+    { path: "/home/boss/workspace/tmp/a.png", title: "エビ" },
+  );
+  assert.equal(status, 200);
+  assert.equal(json.shown, "chat");
+  assert.equal(json.name, SAMPLE_IMAGE.name);
+  assert.equal(json.url, SAMPLE_IMAGE.url);
+});
+
+test("chat master が居なければ open_viewer へフォールバックする（ツールを失敗させない）", async () => {
+  const opened: string[] = [];
+  const { status, json } = await withControlApi(
+    {
+      shareChatImage: async () => null, // ui:"terminal" 構成
+      openViewer: async (path, title) => {
+        opened.push(path);
+        return {
+          id: "viewer-7",
+          path,
+          title: title ?? "a.png",
+          format: "image" as const,
+          content: "",
+          openedAt: 1,
+        };
+      },
+    },
+    { path: "/home/boss/workspace/tmp/a.png" },
+  );
+  assert.equal(status, 200);
+  assert.equal(json.shown, "viewer");
+  assert.equal(json.id, "viewer-7");
+  assert.match(String(json.note), /viewer/);
+  assert.deepEqual(opened, ["/home/boss/workspace/tmp/a.png"]);
+});
+
+test("path 欠落・検証エラーは 400（許可ルート外などの理由をそのまま返す）", async () => {
+  const missing = await withControlApi({ shareChatImage: async () => SAMPLE_IMAGE }, {});
+  assert.equal(missing.status, 400);
+  assert.match(String(missing.json.error), /path/);
+
+  const rejected = await withControlApi(
+    {
+      shareChatImage: async () => {
+        throw new ViewerPathError("許可ルート外のパスです: /etc/x.png");
+      },
+    },
+    { path: "/etc/x.png" },
+  );
+  assert.equal(rejected.status, 400);
+  assert.match(String(rejected.json.error), /許可ルート外/);
 });
