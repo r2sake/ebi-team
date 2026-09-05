@@ -1,16 +1,24 @@
-import type { ChatAttachment, MasterChatEnvelope, MasterChatState } from "../shared/protocol.ts";
+import type {
+  ChatAttachment,
+  MasterChatEnvelope,
+  MasterChatState,
+  UsageMessage,
+} from "../shared/protocol.ts";
 import {
   ChatTranscript,
   formatBytes,
   formatContextPct,
   formatCost,
+  headerMetrics,
   InputHistory,
   LARGE_PASTE_CHARS,
+  NO_RATE_LIMITS,
   oneLine,
   stateLabel,
   stringifyInput,
   summarizeToolInput,
   type ChatItem,
+  type HeaderRateLimits,
 } from "./chatModel.ts";
 import { renderMarkdownInto } from "./viewer.ts";
 
@@ -64,6 +72,8 @@ export class ChatPanel {
   private unseen = 0;
   /** master の agent id（chatState 受信で確定する）。 */
   private masterId: string | null = null;
+  /** アカウント枠（WS `usage` 由来・ヘッダ表示用）。未受信は「—」。 */
+  private rateLimits: HeaderRateLimits = NO_RATE_LIMITS;
 
   constructor(
     private readonly el: HTMLElement,
@@ -427,12 +437,33 @@ export class ChatPanel {
     this.newPill.textContent = `⬇ 新着 ${this.unseen} 件`;
   }
 
+  /**
+   * ヘッダのメトリクス（コスト / 文脈% / 5h・週次の枠）を描き直す（PR-M6）。
+   * 値は要素ごとに span を分け、65/70/85% を跨いだものだけ色を付ける
+   *（contextGuard の通知と同じ帯・chatModel.METRIC_THRESHOLDS）。
+   */
   private updateStats(): void {
-    const s = this.transcript.summary;
-    this.statsEl.textContent = `${formatCost(s.totalCostUsd)} / ctx ${formatContextPct(s.contextUsedPct)}`;
-    this.statsEl.title = s.model
-      ? `model: ${s.model} / 累計コスト（推定）と文脈使用率`
-      : "累計コスト（推定）と文脈使用率";
+    this.statsEl.textContent = "";
+    const metrics = headerMetrics(this.transcript.summary, this.rateLimits);
+    metrics.forEach((m, i) => {
+      if (i > 0) this.statsEl.appendChild(span("chat-stat-sep", "/"));
+      const el = span(`chat-stat lv-${m.level}`, m.text);
+      el.dataset.metric = m.key;
+      el.title = m.title;
+      this.statsEl.appendChild(el);
+    });
+  }
+
+  /**
+   * WS `usage`（アカウント枠のスナップショット）を取り込む。
+   * chat モードの master では `rate_limit_event` → UsageStore 経由で届く（設計書 §5.2 r3）。
+   */
+  applyUsage(u: UsageMessage): void {
+    this.rateLimits = {
+      fiveHourPct: u.rateLimits.fiveHour?.usedPct ?? null,
+      sevenDayPct: u.rateLimits.sevenDay?.usedPct ?? null,
+    };
+    this.updateStats();
   }
 
   /** snapshot 適用時の全描画。 */

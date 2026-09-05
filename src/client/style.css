@@ -912,7 +912,20 @@ button:hover { filter: brightness(1.07); }
 .chat-state.state-busy { color: var(--busy); border-color: var(--busy); }
 .chat-state.state-idle { color: var(--idle); border-color: var(--idle); }
 .chat-state.state-waiting { color: var(--accent); border-color: var(--accent); }
-.chat-stats { font-size: 12px; color: var(--muted); margin-left: auto; }
+.chat-stats {
+  font-size: 12px;
+  color: var(--muted);
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
+  align-items: baseline;
+  white-space: nowrap;
+}
+.chat-stat-sep { opacity: 0.5; }
+/* context-guard と同じ 65/70/85% の帯で色を付ける（PR-M6）。 */
+.chat-stat.lv-soft { color: var(--text); }
+.chat-stat.lv-hard { color: var(--busy); font-weight: 600; }
+.chat-stat.lv-critical { color: #e05b5b; font-weight: 700; }
 .chat-new {
   flex: 0 0 auto;
   background: var(--panel);

@@ -3,7 +3,8 @@
 - 作成: 2026-09-05 engineer エビ（master 委譲・**設計のみ / 実装なし**）
 - **r2: 2026-09-05 更新**（PR-M0 PoC の実測とボス裁定を反映。PR-M1 実装と同じ PR で改訂）。
   変更点の一覧は §0.1。実測の一次資料は `docs/poc/master-headless-poc-2026-09-05.md`
-- **r5: 2026-09-05 更新**（PR-M4 実装＝入力系に合わせて §0.4 を追加し §9 を更新）。ブランチは `ebi/ebiteam-master-chat-m4`
+- **r5: 2026-09-05 更新**（PR-M4 実装＝入力系を §0.4、PR-M6 実装＝usage / context / cost を §0.5 として追加し §5.2 / §9 を更新）。
+  ブランチは `ebi/ebiteam-master-chat-m4` / `ebi/ebiteam-master-chat-m6`
 - **r4: 2026-09-05 更新**（PR-M3 実装＝チャット UI に合わせて §0.3 を追加し §9 を更新）。ブランチは `ebi/ebiteam-master-chat-m3`
 - **r3: 2026-09-05 更新**（PR-M2 実装＝`MasterSession` とサーバ配線に合わせて §3.4 / §4.4 / §5.4 / §6.1 を確定）。
   変更点は §0.2。PR-M2 で実測した点（`rate_limit_event` の `utilization` スケール）も反映済み
@@ -151,6 +152,29 @@ unit +16 本（`chatAttachments.test.ts` 4 / `masterChatUi.test.ts` 9 / `masterC
 
 **PR-M5 以降への持ち越し**: 承認/質問の応答送信（PR-M5）/ ツール結果の「全部見る」/ `chatHistory` による
 過去ログのページング / 添付の掃除（保管庫は溜まりっぱなし。運用で消す）/ 画像以外のファイル添付。
+
+---
+
+## 0.5 r5 での変更（PR-M6 実装の確定事項）
+
+**PR-M6 で実装したもの**: chat ヘッダのメトリクス表示（`src/client/chatModel.ts` の `headerMetrics` /
+`metricLevel` と `chat.ts` の描画・`main.ts` で WS `usage` を chat へも流す・`style.css` の色分け）/
+`MasterSession` の turnEnd 順序の修正 / `scripts/e2e-context-guard.mjs` の chat 経路対応と
+偽 claude スタブ `scripts/fake-claude-stream.mjs` / 併走比較スクリプト
+`scripts/compare-contextpct-statusline.mjs`。unit +9 本（`test/masterChatHeader.test.ts` 8 /
+`masterChatSession.test.ts` に 1）。
+
+| # | 確定した点 | 反映先 |
+|---|---|---|
+| X | **ヘッダは 4 要素**（`$0.02 / ctx 31% / 5h 19% / 週 4%`）。コストは `turnEnd.totalCostUsd`（プロセス跨ぎ累計）、文脈% は `turnEnd.usage`、枠は WS `usage` の `rateLimits`（`rate_limit_event` 由来）。**算出できない値はすべて「—」**で、0% に化けさせない（codex stub / 起動直後） | §5.2 |
+| Y | **色分けの閾値は contextGuard と同じ 65/70/85%**（ボス裁定 Q-6 の割合据え置き）。client は server を import できないので `METRIC_THRESHOLDS` を持ち、**値が一致することを unit テストで強制**する（`DEFAULT_CONTEXT_GUARD_CONFIG` と突き合わせ）。枠（5h / 週次）も同じ帯で色を付ける | §5.2 / §10 Q-6 |
+| Z | **`MasterSession` は turnEnd で「idle にしてから usage を出す」**。逆順（PR-M2 の実装）だと contextGuard のキリ判定が `registry` 上の master を busy と見るため、**`/clear` 促し（quiescent 通知）が chat モードでは永久に発火しない**。e2e の D2 がこの回帰を踏む | §8-R3 |
+| AA | **chat 経路の e2e は実 claude を使わない**。`scripts/fake-claude-stream.mjs` を `claude` という名前で PATH の先頭に置き（`ClaudeHeadlessBrain` は `spawn("claude", …)`）、本文の `ctx:<%>` / `rate:<5h>,<週次>` で `turnEnd.usage` と `rate_limit_event` を決定的に作る。**サブスク枠も課金も消費しない**うえ、65/70/85% を跨ぐ観測を任意に作れる | §9 PR-M6 |
+| AB | **statusLine との誤差は最大 0.5pt**（3 ターン実測・haiku・窓 200,000）。算出 13.3/13.4/13.5% ⇔ statusLine 13/13/13% で、差はすべて **statusLine 側が整数へ丸めているぶん**。閾値 65/70/85% の運用には十分な精度。なお **`claude -p`（ヘッドレス）では statusLine コマンドは呼ばれない**（settings に仕込んでも stdin が来ない）ため、比較は「ヘッドレスで 1 ターン → 同じ session を `--resume` で対話起動して statusLine を捕まえる」方式で採った（`scripts/compare-contextpct-statusline.mjs`） | §5.2 / §8-R3 |
+
+**PR-M7 への持ち越し**: ヘッダの枠表示は**アカウント単位の latest**（PTY エビの statusLine 由来と混ざる）ため、
+chat master 単独で見ているときの出所を README に注記する。`contextSize` のヘッダ表示（いまはツールチップにも出さない）と、
+`/clear` 促しの自動化（裁定 Q-3 の (b)）は引き続き対象外。
 
 ---
 
@@ -606,6 +630,7 @@ flowchart TB
 | 途中停止 | 入力欄の送信ボタンが**ターン実行中は ⏹ に変わる**。押すと `chatStop` → `MasterBrain.interrupt()`。停止後は「中断しました」システム行を残す |
 | 入力履歴 | ↑/↓ でローカル履歴（`localStorage`、直近 100 件・master セッション単位）。スマホは入力欄長押しで履歴ポップオーバー |
 | コスト/文脈 | ヘッダに `$0.00 / ctx 31%` を常時表示（`turnEnd` の usage 由来）。**算出できない backend は「—」**。既存ダッシュボードとは二重表示になるが、master だけは手元に出す価値がある |
+| **r5: 枠とコストのヘッダ表示（PR-M6 実装）** | ヘッダは `$0.02 / ctx 31% / 5h 19% / 週 4%` の 4 要素。コスト＝`turnEnd.totalCostUsd`（プロセス跨ぎ累計）、文脈%＝`turnEnd.usage`（statusLine との誤差は実測 **最大 0.5pt**・§0.5 AB）、枠＝WS `usage` の `rateLimits`。**色分けは contextGuard と同じ 65/70/85%**（soft/hard/critical）で、算出できない値は「—」のまま色を付けない。証跡は `tmp/shots-m6/` |
 
 ### 5.3 スマホ対応（既存の「ログがスクロールできない」問題の解消）
 
@@ -769,7 +794,7 @@ stdin への user メッセージ投入は **4 つの CLI すべてが公式に�
 | **PR-M3** ✅完了 | **チャット UI**。md レンダリング（`markdown.ts` 再利用）・ツール `<details>`・`[reply]`/`[idle]` バブル・partial 逐次描画・自動追従とスクロール・再接続復元・入力欄（Enter 送信 / ⏹ 停止）・「新しい会話」 | Playwright 実画面スクショ 9 枚（`tmp/shots-m3/`）。375px でログが指スクロールできることを実測（scrollTop 0→781）。`ui:"terminal"` はピクセル比較でゼロ差分。unit +19 本 green・既存 fail 0・build 成功 | **1 日** | PR-M2 |
 | **PR-M4** ✅完了 | **入力系**。送信・⏹ 停止（`interrupt()`）・入力履歴（↑/↓ / localStorage）・画像添付・大きな貼り付けのファイル誘導 | 停止 → 続行を unit と `e2e-master-chat.mjs` で確認（10/10 継続）。履歴は再読み込み後も残る（Playwright 実測）。画像添付は `e2e-master-chat-image.mjs` が実 claude(haiku) で 7/7（ツール不使用のまま色を回答＝image ブロックが読まれている）。unit +16 本・既存 fail 0・build 成功。スクショは `tmp/shots-m4/` | **0.5 日** | PR-M3 |
 | **PR-M5** | **承認 / 質問 UI**。ebi-control（master ロール）に `approve` ツール新設 → `--permission-prompt-tool` 配線／`AskUserQuestion` の `tool_use` を選択肢 UI に／未応答スティッキーバー | `scripts/e2e-master-chat-approval.mjs`：承認往復でツール実行が継続する。未応答時に master が止まり、UI に待ち件数が出る | **1 日** | PR-M4 |
-| **PR-M6**（PR-M2 で前倒し済みの部分あり） | **usage / context / cost**。`turnEnd.usage` → `UsageStore` → `contextGuard` の入力載せ替えと `rate_limit_event` の枠取り込みは **PR-M2 で実装済み**。残りは UI（ヘッダのコスト・文脈%表示、算出不能 backend の「—」）と `e2e-context-guard.mjs` の改修 | `e2e-context-guard.mjs` 改修版が green。statusLine 併走比較で文脈%の誤差が許容内（**PoC ⑤ の結果次第**） | **1 日** | PR-M2 |
+| **PR-M6** ✅完了 | **usage / context / cost**。ヘッダに コスト / 文脈% / 5h・週次の枠を表示（65/70/85% で色分け・算出不能は「—」）。`MasterSession` の turnEnd 順序修正（idle → usage）で chat でも `/clear` 促しが発火する。`e2e-context-guard.mjs` に chat 経路（偽 claude・枠なし課金なし）を追加 | `e2e-context-guard.mjs` 改修版 **18/18 green**（terminal C1〜C5 ＋ chat D1〜D6）。unit +9 本 green・既存 fail 0（400 本）・`npm run build` 成功・`e2e:master-chat` 7/7（往復 10/10）。**statusLine 併走比較の誤差は最大 0.5pt**（3 ターン・haiku・statusLine の整数丸めぶんのみ）。スクショ 3 枚 `tmp/shots-m6/` | **1 日** | PR-M2 |
 | **PR-M7** | **移行と docs**。`EBI_MASTER_UI` env・ロールバック手順・e2e 再構成・README / `docs/backends/*.md` 追記・OSS 向け構成例 | 第 1 段（`ui` 未指定）で既存 e2e が全部 green。docs に規約の原文と URL が載っている | **0.5 日** | PR-M5 / PR-M6 |
 | **必須合計** | | | **6.0〜7.5 日** | |
 | **PR-M8**（Q-1 裁定済み・opt-in） | **`CodexAppServerBrain`**（`thread/*` `turn/*` `item/*` の射影・承認往復） | `brain:"codex"` で master が起動し、`e2e-master-chat.mjs` が 10/10 | 1.5 日 | **Q-1 裁定** |

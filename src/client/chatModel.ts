@@ -482,3 +482,78 @@ export function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
+
+// ===== ヘッダのメトリクス表示（PR-M6）=====
+// コスト（プロセス跨ぎ累計）・文脈% ・アカウント枠（5h / 週次）を 1 行に並べる。
+// contextGuard（src/server/contextGuard.ts）と同じ 65/70/85% で色分けするため、
+// **閾値はサーバ側の DEFAULT_CONTEXT_GUARD_CONFIG と同じ値をここに持つ**
+// （client は server を import できないので、値の一致は unit テストで担保する）。
+
+/** メトリクスの警戒度。contextGuard の GuardLevel と同じ帯。 */
+export type MetricLevel = "none" | "soft" | "hard" | "critical";
+
+/** 色分けの閾値（%）。contextGuard の soft/hard/critical と同じ。 */
+export const METRIC_THRESHOLDS = { soft: 65, hard: 70, critical: 85 } as const;
+
+/** 使用率(%) → 警戒度。null（算出不能）は "none"。 */
+export function metricLevel(pct: number | null): MetricLevel {
+  if (pct == null || !Number.isFinite(pct)) return "none";
+  if (pct >= METRIC_THRESHOLDS.critical) return "critical";
+  if (pct >= METRIC_THRESHOLDS.hard) return "hard";
+  if (pct >= METRIC_THRESHOLDS.soft) return "soft";
+  return "none";
+}
+
+/** ヘッダに出すアカウント枠（WS `usage` の rateLimits 由来・使用率だけを取る）。 */
+export interface HeaderRateLimits {
+  fiveHourPct: number | null;
+  sevenDayPct: number | null;
+}
+
+export const NO_RATE_LIMITS: HeaderRateLimits = { fiveHourPct: null, sevenDayPct: null };
+
+/** ヘッダの 1 要素（テキスト＋色分け＋ツールチップ）。 */
+export interface HeaderMetric {
+  key: "cost" | "ctx" | "fiveHour" | "sevenDay";
+  text: string;
+  level: MetricLevel;
+  title: string;
+}
+
+/**
+ * ヘッダのメトリクス列を作る純関数（DOM 非依存）。
+ * 算出できない値は必ず「—」になり、色分けは付かない（codex stub 等の backend）。
+ */
+export function headerMetrics(stats: ChatStats, rl: HeaderRateLimits): HeaderMetric[] {
+  const modelNote = stats.model ? `model: ${stats.model}` : "model: 不明";
+  return [
+    {
+      key: "cost",
+      text: formatCost(stats.totalCostUsd),
+      level: "none",
+      title: `${modelNote} / 会話の累計コスト（推定・プロセスを跨いだ合計）`,
+    },
+    {
+      key: "ctx",
+      text: `ctx ${formatContextPct(stats.contextUsedPct)}`,
+      level: metricLevel(stats.contextUsedPct),
+      title:
+        "文脈使用率（context-guard と同じ算出値）。" +
+        `${METRIC_THRESHOLDS.soft}% で予告 / ${METRIC_THRESHOLDS.hard}% で /clear 促し / ` +
+        `${METRIC_THRESHOLDS.critical}% で危険域`,
+    },
+    {
+      key: "fiveHour",
+      text: `5h ${formatContextPct(rl.fiveHourPct)}`,
+      level: metricLevel(rl.fiveHourPct),
+      title: "アカウント 5 時間枠の使用率（全エビ共通）",
+    },
+    {
+      key: "sevenDay",
+      text: `週 ${formatContextPct(rl.sevenDayPct)}`,
+      level: metricLevel(rl.sevenDayPct),
+      title: "アカウント 7 日枠の使用率（全エビ共通）",
+    },
+  ];
+}
+

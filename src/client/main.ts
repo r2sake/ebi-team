@@ -231,6 +231,8 @@ function handleServerMessage(msg: ServerMessage): void {
     case "usage":
       // 使用状況スナップショット。ダッシュボード表示中なら即描画に反映される。
       dashboard.update(msg);
+      // chat ヘッダの 5h / 週次の枠表示にも同じスナップショットを流す（PR-M6）。
+      chatPanel.applyUsage(msg);
       break;
     case "viewers": {
       const prevIds = new Set(viewers.map((v) => v.id));

@@ -1,0 +1,23 @@
+[
+  {
+    "turn": 1,
+    "mine": 13.3,
+    "slPct": 13,
+    "slSize": 200000,
+    "diff": 0.3
+  },
+  {
+    "turn": 2,
+    "mine": 13.4,
+    "slPct": 13,
+    "slSize": 200000,
+    "diff": 0.4
+  },
+  {
+    "turn": 3,
+    "mine": 13.5,
+    "slPct": 13,
+    "slSize": 200000,
+    "diff": 0.5
+  }
+]

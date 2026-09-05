@@ -363,6 +363,10 @@ export class MasterSession {
       }
       case "turnEnd": {
         this.costLedger.noteProcessTotal(this.processKey(), ev.costUsd);
+        // PR-M6: usage を出す**前に**状態を落とす。contextGuard の「キリが良いか」判定は
+        // registry の master status（= this.stateValue）を読むので、busy のまま usage を
+        // 渡すと /clear 促し（quiescent 通知）が永久に発火しない。
+        this.setState(this.pending > 0 ? "waiting" : "idle");
         if (ev.usage) {
           this.handlers.onUsage(this.id, {
             model: this.lastModel ?? this.opts.model,
@@ -377,7 +381,6 @@ export class MasterSession {
             },
           });
         }
-        this.setState(this.pending > 0 ? "waiting" : "idle");
         break;
       }
       case "permission":
