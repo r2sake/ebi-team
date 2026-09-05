@@ -1,0 +1,207 @@
+{
+  "initialize": {
+    "userAgent": "ebi-team-master-poc/0.146.0 (Mac OS 26.4.1; x86_64) iTerm.app/3.3.12 (ebi-team-master-poc; 0.0.1)",
+    "codexHome": "/Users/yoimaro/.codex",
+    "platformFamily": "unix",
+    "platformOs": "macos"
+  },
+  "threadStart": {
+    "threadId": "01a06f99-af87-73d0-bc04-313777671a10",
+    "model": "gpt-5.6-sol",
+    "modelProvider": "openai",
+    "path": "/Users/yoimaro/.codex/sessions/2026/09/05/rollout-2026-09-05T12-25-38-01a06f99-af87-73d0-bc04-313777671a10.jsonl"
+  },
+  "mcpServerStatus": [
+    {
+      "name": "codex_apps",
+      "tools": [
+        "sites.deploy_site_version",
+        "plugin_management.update_app_permissions",
+        "sites.create_site",
+        "sites.get_site",
+        "sites.read_database_overview",
+        "sites.read_database_table_rows",
+        "sites.save_site_version",
+        "sites.change_site_slug",
+        "sites.update_access",
+        "sites.list_site_versions",
+        "sites.add_custom_domain",
+        "sites.refresh_custom_domain_status",
+        "codex_document_control.list_document_sessions",
+        "safety_settings.get_trusted_contact",
+        "sites.update_site_access",
+        "sites.get_environment_variables",
+        "sites.check_slug_availability",
+        "sites.list_projects",
+        "safety_settings.get_parental_controls",
+        "sites.delete_site",
+        "safety_settings.prepare_parental_control_update",
+        "sites.get_deployment_status",
+        "sites.get_site_analytics_overview",
+        "sites.generate_siwc_bypass_token",
+        "sites.update_environment",
+        "plugin_management.uninstall_app",
+        "sites.get_site_worker_logs",
+        "sites.list_sites_creator_control_panel_projects",
+        "codex_document_control.get_document_tool_schemas",
+        "sites.get_database_table_rows",
+        "sites.get_site_version",
+        "codex_document_control.execute_document_command",
+        "sites.get_environment",
+        "safety_settings.get_family_info",
+        "sites.list_custom_domains",
+        "sites.list_sites",
+        "sites.query_site_analytics_event",
+        "sites.update_environment_variables",
+        "sites.get_project",
+        "safety_settings.update_parental_control",
+        "sites.deploy_private_site_version",
+        "sites.remove_custom_domain",
+        "sites.get_database_overview",
+        "sites.list_site_analytics_events",
+        "sites.update_site_metadata",
+        "plugin_management.get_plugin_dependencies",
+        "hotline.get_local_hotline",
+        "plugin_management.get_app_permissions",
+        "sites.create_source_repository_write_credential"
+      ]
+    },
+    {
+      "name": "ebi-control",
+      "tools": [
+        "kill_engineer",
+        "ask_supervisor",
+        "inject_message",
+        "list_ebi",
+        "read_scrollback",
+        "send_message",
+        "open_viewer",
+        "set_mode",
+        "spawn_engineer",
+        "spawn_ebi"
+      ]
+    }
+  ],
+  "turn1": {
+    "text": "覚えました。",
+    "itemTypes": [
+      "userMessage",
+      "agentMessage"
+    ],
+    "tools": [],
+    "toolResults": [],
+    "contextTokens": 15788,
+    "cumulativeTokens": 15796,
+    "rateLimits": {
+      "primary": {
+        "usedPercent": 5,
+        "windowDurationMins": 300,
+        "resetsAt": 1788593396
+      },
+      "secondary": {
+        "usedPercent": 1,
+        "windowDurationMins": 10080,
+        "resetsAt": 1789180196
+      },
+      "planType": "plus"
+    },
+    "status": "completed"
+  },
+  "turn2": {
+    "text": "ウニ-4127",
+    "itemTypes": [
+      "userMessage",
+      "agentMessage"
+    ],
+    "tools": [],
+    "toolResults": [],
+    "contextTokens": 15825,
+    "cumulativeTokens": 31630,
+    "rateLimits": {
+      "primary": {
+        "usedPercent": 5,
+        "windowDurationMins": 300,
+        "resetsAt": 1788593396
+      },
+      "secondary": {
+        "usedPercent": 1,
+        "windowDurationMins": 10080,
+        "resetsAt": 1789180196
+      },
+      "planType": "plus"
+    },
+    "status": "completed",
+    "remembered": true
+  },
+  "steer": {
+    "ok": true,
+    "expectedTurnId": "01a06f99-d313-7092-8bcb-d6364cc1f979"
+  },
+  "turn3": {
+    "text": "- `master`\n- `poc-engineer-1`",
+    "itemTypes": [
+      "userMessage",
+      "reasoning",
+      "agentMessage",
+      "mcpToolCall"
+    ],
+    "tools": [
+      "ebi-control.list_ebi"
+    ],
+    "toolResults": [
+      "{\n  \"agents\": [\n    {\n      \"id\": \"master\",\n      \"kind\": \"fixed\",\n      \"status\": \"busy\"\n    },\n    {\n      \"id\": \"poc-engineer-1\",\n      \"kind\": \"dynamic\",\n      \"status\": \"idle\",\n      \"branch\": \"ebi/poc\"\n    }\n  ]\n}"
+    ],
+    "contextTokens": 18806,
+    "cumulativeTokens": 85138,
+    "rateLimits": {
+      "primary": {
+        "usedPercent": 5,
+        "windowDurationMins": 300,
+        "resetsAt": 1788593396
+      },
+      "secondary": {
+        "usedPercent": 1,
+        "windowDurationMins": 10080,
+        "resetsAt": 1789180196
+      },
+      "planType": "plus"
+    },
+    "status": "completed",
+    "fakeControlHits": [
+      "HIT GET /control/agents"
+    ]
+  },
+  "turn4": {
+    "text": "- ウニ-4127\n- イクラ-9053",
+    "itemTypes": [
+      "userMessage",
+      "agentMessage"
+    ],
+    "tools": [],
+    "toolResults": [],
+    "contextTokens": 18851,
+    "cumulativeTokens": 104007,
+    "rateLimits": {
+      "primary": {
+        "usedPercent": 5,
+        "windowDurationMins": 300,
+        "resetsAt": 1788593396
+      },
+      "secondary": {
+        "usedPercent": 1,
+        "windowDurationMins": 10080,
+        "resetsAt": 1789180196
+      },
+      "planType": "plus"
+    },
+    "status": "completed"
+  },
+  "steerConsumed": true,
+  "resume": {
+    "ok": true,
+    "sameThread": true,
+    "both": true,
+    "text": "- ウニ-4127\n- イクラ-9053",
+    "contextTokens": 19541
+  }
+}
