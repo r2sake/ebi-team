@@ -231,8 +231,9 @@ unit +27 本（`test/masterPermission.test.ts` 17 / `masterChatSession.test.ts` 
 | AH | **添付保管庫は自動削除しない**（会話 JSONL から参照され続けるため）。掃除は運用で行う前提とし、容量の目安（月あたり数百 MB）と `find -mtime +30 -delete` の例、会話 JSONL は削除ではなく退避を勧める旨を docs/ops に書いた（PR-M4 持ち越し） | `docs/ops/master-chat-ui.md` §7 |
 | AI | **e2e をエビのセッションから回すと 2 つの env が毒になる**（実測で判明）。エビの env には `EBI_IDLE_NOTIFY=off`（`npm start` の設定を継承）と `EBI_ID=<自分の id>` が入っており、e2e が立てる一時サーバまで引き継がれて `e2e:reverse-notify` の idle 自動通知チェックと `e2e:usage` の `EBI_ID` 注入チェックが**コードとは無関係に落ちる**。束ねスクリプトの先頭で `unset EBI_ID; export EBI_IDLE_NOTIFY=on` してから並べることで固定した | §6.4 / `docs/ops/master-chat-ui.md` §6 |
 
-**PR-M5 との関係**: 承認/質問の応答送信は PR-M5 の担当（本 PR ではソースに触っていない）。docs 上は
-「現状は表示のみ・応答送信は PR-M5」と明記してある。PR-M5 マージ後にその 1 行を落とす。
+**PR-M5 との関係**: 承認/質問の応答送信は PR-M5（§0.6）で実装済み。docs（README /
+`docs/ops/master-chat-ui.md`）も「応答送信は PR-M5 で対応中」の注記を落とし、
+**承認は UI からの応答が必須**である旨に改めた。
 
 ---
 
