@@ -202,6 +202,14 @@ export class MasterCostLedger {
     return sum;
   }
 
+  /**
+   * 記録を全部捨てる（「新しい会話」で会話単位の累計を 0 に戻すため）。
+   * プロセス跨ぎの累計は「1 つの会話の累計」なので、会話を切ったらここも切る。
+   */
+  reset(): void {
+    this.perProcess.clear();
+  }
+
   /** 記録済みプロセス数（デバッグ・テスト用）。 */
   get processCount(): number {
     return this.perProcess.size;

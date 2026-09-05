@@ -876,3 +876,239 @@ button:hover { filter: brightness(1.07); }
   .file-picker { padding: 12px; }
   .fp-panel { max-width: 100%; height: 100%; max-height: 100%; }
 }
+
+/* ===== master チャット（ui:"chat"）パネル =====
+   xterm を使わない DOM チャット。ログは通常のブロックスクロール、入力欄は下端固定。
+   設計書 §5.1〜§5.3（PR-M3）。 */
+.chat {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.chat[hidden] { display: none; }
+
+.chat-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.chat-title { font-size: 14px; font-weight: 700; }
+.chat-state {
+  font-size: 12px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+.chat-state.state-busy { color: var(--busy); border-color: var(--busy); }
+.chat-state.state-idle { color: var(--idle); border-color: var(--idle); }
+.chat-state.state-waiting { color: var(--accent); border-color: var(--accent); }
+.chat-stats { font-size: 12px; color: var(--muted); margin-left: auto; }
+.chat-new {
+  flex: 0 0 auto;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  font-weight: 600;
+}
+.chat-new:disabled { opacity: 0.5; cursor: default; }
+
+/* ログ領域（相対配置。新着ピルを右下に重ねる）。 */
+.chat-body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+}
+.chat-log {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  padding: 12px 14px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.chat-newpill {
+  position: absolute;
+  right: 14px;
+  bottom: 12px;
+  border-radius: 999px;
+  padding: 6px 14px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+.chat-newpill[hidden] { display: none; }
+
+.chat-more {
+  align-self: center;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* 発話行（左右振り分け）。 */
+.chat-row { display: flex; }
+.chat-row.user { justify-content: flex-end; }
+.chat-row.assistant,
+.chat-row.inbound,
+.chat-row.tool { justify-content: flex-start; }
+
+.chat-bubble {
+  max-width: min(76ch, 88%);
+  border-radius: 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  font-size: 14px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+.chat-bubble.user {
+  background: #2a2016;
+  border-color: var(--accent);
+}
+.chat-bubble.assistant { background: var(--panel-2); }
+/* エビ返信は左寄せの別スタイル。[reply] は実線、[idle] は破線＋淡色（§5.2）。 */
+.chat-bubble.inbound { background: #16202a; border-color: #3a5a72; }
+.chat-bubble.inbound.tag-idle { border-style: dashed; opacity: 0.8; }
+.chat-bubble.pending { border-color: var(--busy); background: #241f14; }
+
+.chat-meta { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+.chat-plain { white-space: pre-wrap; }
+.chat-idle-note { font-size: 12px; color: var(--muted); }
+.chat-caret { color: var(--accent); animation: chat-blink 1s step-end infinite; }
+@keyframes chat-blink { 50% { opacity: 0; } }
+
+/* バブル内 markdown（viewer と同じレンダラ。余白だけ詰める）。 */
+.chat-md > :first-child { margin-top: 0; }
+.chat-md > :last-child { margin-bottom: 0; }
+.chat-md p { margin: 6px 0; }
+.chat-md pre.md-code {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  font-size: 12px;
+}
+.chat-md code.md-inline-code {
+  background: var(--bg);
+  border-radius: 4px;
+  padding: 1px 4px;
+  font-size: 12px;
+}
+.chat-md table.md-table { border-collapse: collapse; font-size: 12px; display: block; overflow-x: auto; }
+.chat-md table.md-table th, .chat-md table.md-table td { border: 1px solid var(--border); padding: 4px 8px; }
+.chat-md a { color: var(--accent); }
+
+/* ツール実行（既定は畳む）。 */
+.chat-tool, .chat-thinking {
+  max-width: min(76ch, 88%);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.chat-tool > summary, .chat-thinking > summary {
+  cursor: pointer;
+  padding: 4px 0;
+  overflow-wrap: anywhere;
+}
+.chat-tool.state-error { border-color: #a34; }
+.chat-tool-input, .chat-tool-result, .chat-thinking-body {
+  margin: 4px 0 8px;
+  padding: 8px 10px;
+  background: var(--panel);
+  border-radius: 6px;
+  max-height: 300px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 12px;
+}
+
+/* システム行（notice / セッション開始 / ターン終了）。 */
+.chat-system, .chat-turnend {
+  align-self: center;
+  font-size: 11px;
+  color: var(--muted);
+  text-align: center;
+}
+.chat-system.level-warn { color: var(--busy); }
+.chat-system.level-error { color: #e07a7a; }
+.chat-turnend.aborted { color: var(--busy); }
+.chat-turnend.error { color: #e07a7a; }
+
+/* 承認/質問（PR-M5 までボタンは無効）。 */
+.chat-pending-title { font-weight: 700; font-size: 13px; }
+.chat-pending-detail { font-size: 12px; color: var(--muted); white-space: pre-wrap; margin: 4px 0; }
+.chat-pending-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.chat-pending-btn {
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  cursor: not-allowed;
+}
+
+/* 入力欄（下端固定）。 */
+.chat-foot {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--border);
+  background: var(--panel-2);
+  padding: 8px 10px;
+  padding-bottom: max(8px, env(safe-area-inset-bottom));
+}
+.chat-pending-bar {
+  font-size: 12px;
+  color: var(--busy);
+  padding: 4px 2px 8px;
+}
+.chat-pending-bar[hidden] { display: none; }
+.chat-input-row { display: flex; gap: 8px; align-items: flex-end; }
+.chat-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  resize: none;
+  max-height: 160px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  padding: 8px 10px;
+}
+.chat-input:disabled { opacity: 0.6; }
+.chat-send { flex: 0 0 auto; min-height: 38px; }
+.chat-send.stop { background: var(--busy); }
+
+/* registry 行の chat モード印。 */
+.kind-badge.chat-mode { border: none; background: none; }
+
+/* 狭幅（スマホ）: 入力欄を潰さず、ログだけをスクロールさせる。 */
+@media (max-width: 768px) {
+  .chat { border-radius: 6px; }
+  .chat-head { padding: 6px 8px; gap: 6px; flex-wrap: wrap; }
+  .chat-title { font-size: 13px; }
+  .chat-new { padding: 4px 8px; font-size: 12px; }
+  .chat-log { padding: 8px 8px 14px; }
+  .chat-bubble { max-width: 94%; font-size: 14px; }
+  .chat-tool, .chat-thinking { max-width: 94%; }
+  /* iOS の自動ズーム抑止（16px 未満だと拡大される）。 */
+  .chat-input { font-size: 16px; }
+  .chat-send { min-height: 44px; padding: 6px 14px; }
+}

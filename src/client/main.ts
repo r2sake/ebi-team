@@ -2,6 +2,7 @@ import { Pane } from "./pane.ts";
 import { Dashboard } from "./dashboard.ts";
 import { Viewer } from "./viewer.ts";
 import { FilePicker } from "./filePicker.ts";
+import { ChatPanel } from "./chat.ts";
 import {
   type ClientMessage,
   type ServerMessage,
@@ -54,6 +55,21 @@ const viewer = new Viewer(document.getElementById("viewer") as HTMLElement, (id)
   sendMsg({ type: "closeViewer", id }),
 );
 
+// master チャットパネル（ui:"chat" の master 専用）。
+// chat モードの master が居るかどうかは **`chatState` を受け取ったか**で判定する
+//（registry にはモードの情報が無いため。サーバは接続直後、registry より先に chatState を送る）。
+const chatPanel = new ChatPanel(
+  document.getElementById("chat") as HTMLElement,
+  (id, text) => sendMsg({ type: "chatSend", id, text }),
+  (id) => sendMsg({ type: "chatStop", id }),
+  (id) => sendMsg({ type: "chatNew", id }),
+);
+
+/** chat モードの master の id（未確定なら null＝従来どおり PTY ペインを出す）。 */
+function chatMasterId(): string | null {
+  return chatPanel.chatMasterId;
+}
+
 // ファイルピッカー（ユーザーが AI を介さず自分で md/txt を開く導線）。
 // ディレクトリ列挙・オープンはすべて WebSocket（listDir / openViewer）で行う。
 const filePicker = new FilePicker(
@@ -89,7 +105,12 @@ function activeViewer(): ViewerRecord | null {
  */
 function selectionExists(id: string | null): boolean {
   if (!id) return false;
-  return id === DASHBOARD_ID || panes.has(id) || viewers.some((v) => v.id === id);
+  return (
+    id === DASHBOARD_ID ||
+    id === chatMasterId() ||
+    panes.has(id) ||
+    viewers.some((v) => v.id === id)
+  );
 }
 
 // ===== WebSocket 接続（自動再接続つき）=====
@@ -117,6 +138,8 @@ function connect(): void {
   ws.addEventListener("close", () => {
     connStatus.textContent = "切断（再接続中…）";
     connStatus.className = "conn ng";
+    // 再接続時はサーバから chatSnapshot が再送されて会話が戻る。
+    chatPanel.markDisconnected();
     if (reconnectTimer === null) {
       reconnectTimer = window.setTimeout(() => {
         reconnectTimer = null;
@@ -230,6 +253,23 @@ function handleServerMessage(msg: ServerMessage): void {
       renderRegistry();
       break;
     }
+    case "chatState":
+      // chat モードの master が居ることの判定材料も兼ねる（registry には情報が無い）。
+      chatPanel.applyState(msg.id, msg.state, msg.pending);
+      // registry より先に届くのが通常だが、後から届いたときは PTY ペインを畳んで chat に寄せる。
+      if (panes.has(msg.id)) {
+        const wasActive = activeId === msg.id;
+        removePane(msg.id);
+        if (wasActive) setActive(msg.id);
+        else renderRegistry();
+      }
+      break;
+    case "chatSnapshot":
+      chatPanel.applySnapshot(msg.events, msg.hasMore);
+      break;
+    case "chatEvent":
+      chatPanel.applyEvent({ seq: msg.seq, ts: msg.ts, event: msg.event });
+      break;
     case "dirListing":
       // ファイルピッカーのディレクトリ列挙応答。error なら理由をモーダル内に表示。
       if (msg.error) filePicker.setError(msg.error);
@@ -251,6 +291,8 @@ function syncPanes(): void {
 
   // 新規 agent のペインを生成（DOM には足すが既定は非表示）。
   for (const rec of registry) {
+    // ui:"chat" の master は PTY を持たない（WS の input も no-op）ので xterm ペインを作らない。
+    if (rec.id === chatMasterId()) continue;
     if (!panes.has(rec.id)) {
       const pane = new Pane(
         rec,
@@ -321,6 +363,8 @@ function setActive(id: string | null): void {
   applyVisibility();
   renderRegistry();
   renderEmpty();
+  // chat を選んだときだけ入力欄へフォーカス（表示反映後。狭幅では ChatPanel 側で抑止）。
+  if (id !== null && id === chatMasterId()) chatPanel.focusInput();
 }
 
 // activeId に合わせて各ペイン/合成パネルの表示/非表示を反映する（dashboard / viewer / pane の N 分岐）。
@@ -329,10 +373,14 @@ function applyVisibility(): void {
   const showDashboard = activeId === DASHBOARD_ID;
   const activeVw = activeViewer();
   const showViewer = activeVw !== null;
+  const showChat = activeId !== null && activeId === chatMasterId();
   dashboard.setVisible(showDashboard);
   viewer.setVisible(showViewer, activeVw);
-  const showPane = !showDashboard && !showViewer;
+  chatPanel.setVisible(showChat);
+  const showPane = !showDashboard && !showViewer && !showChat;
   for (const [pid, pane] of panes) pane.setVisible(showPane && pid === activeId);
+  // 入力補助バーは xterm ペイン専用（chat では入力欄が本体なので出さない）。
+  syncKeyAssistVisibility();
 }
 
 // ===== 空状態（未選択 / 全 agent 終了）=====
@@ -340,7 +388,10 @@ function renderEmpty(): void {
   const existing = stage.querySelector(".empty");
   // ダッシュボード / viewer 表示中は空状態を出さない（メイン領域はそれらが占める）。
   const isEmpty =
-    activeId !== DASHBOARD_ID && activeViewer() === null && (activeId === null || !panes.has(activeId));
+    activeId !== DASHBOARD_ID &&
+    activeId !== chatMasterId() &&
+    activeViewer() === null &&
+    (activeId === null || !panes.has(activeId));
   if (isEmpty) {
     if (!existing) {
       const div = document.createElement("div");
@@ -400,6 +451,15 @@ function renderRegistry(): void {
     const idTd = document.createElement("td");
     idTd.title = a.id;
     idTd.append(document.createTextNode(a.id));
+    // chat モードの master は 💬 を id 直後に併記（terminal モードとの区別。設計 §5.1）。
+    // 狭い id セルでも省略されないよう、種別/backend バッジより前に置く。
+    if (a.id === chatMasterId()) {
+      const chatBadge = document.createElement("span");
+      chatBadge.className = "kind-badge chat-mode";
+      chatBadge.textContent = "💬";
+      chatBadge.title = 'チャット UI（ui:"chat"）で動いている master';
+      idTd.append(document.createTextNode(" "), chatBadge);
+    }
     if (a.kind !== "dynamic") {
       const badge = document.createElement("span");
       badge.className = `kind-badge kind-${a.kind}`;
@@ -628,7 +688,9 @@ function updateCtrlIndicator(armed: boolean): void {
 
 /** 狭幅かどうかで入力補助バーの表示を切り替える。 */
 function syncKeyAssistVisibility(): void {
-  keyAssist.hidden = !window.matchMedia("(max-width: 768px)").matches;
+  const narrow = window.matchMedia("(max-width: 768px)").matches;
+  // chat パネル表示中は xterm が無いので入力補助バーの出番も無い（入力欄を隠さない）。
+  keyAssist.hidden = !narrow || (activeId !== null && activeId === chatMasterId());
 }
 syncKeyAssistVisibility();
 window.addEventListener("resize", syncKeyAssistVisibility);

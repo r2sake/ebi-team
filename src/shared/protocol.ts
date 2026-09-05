@@ -274,6 +274,7 @@ export type ClientMessage =
   | ChatSendMessage
   | ChatAnswerMessage
   | ChatStopMessage
+  | ChatNewMessage
   | ChatHistoryMessage;
 
 // ===== サーバ → クライアント =====
@@ -559,6 +560,17 @@ export interface ChatAnswerMessage {
 /** 実行中ターンの中断（クライアント → サーバ）。 */
 export interface ChatStopMessage {
   type: "chatStop";
+  id: string;
+}
+
+/**
+ * 新しい会話を始める（クライアント → サーバ）。
+ * ヘッドレス CLI には `/clear` が無いため、サーバは頭脳プロセスを止めて
+ * **`--resume` を付けずに** 起動し直す（＝文脈をリセットする）。会話ログ自体は消さない。
+ * 設計書 §10 Q-3（長文脈対策は「新しい会話」ボタン先行）。
+ */
+export interface ChatNewMessage {
+  type: "chatNew";
   id: string;
 }
 
