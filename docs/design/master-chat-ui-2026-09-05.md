@@ -877,6 +877,7 @@ stdin への user メッセージ投入は **4 つの CLI すべてが公式に�
 | **必須合計** | | | **6.0〜7.5 日** | |
 | **PR-M8**（Q-1 裁定済み・opt-in） | **`CodexAppServerBrain`**（`thread/*` `turn/*` `item/*` の射影・承認往復） | `brain:"codex"` で master が起動し、`e2e-master-chat.mjs` が 10/10 | 1.5 日 | **Q-1 裁定** |
 | ~~**PR-M9**（任意）~~ | ~~**`GeminiAcpBrain`**（ACP JSON-RPC）~~ | **Q-2 裁定により切らない（対象外）** | — | — |
+| **PR-M10** ✅完了 | **チャット内画像共有 + ライトボックス**。master 専用 MCP `chat_image({path,title?,caption?})` 新設 → `POST /control/chat-image`（`resolveViewerPath` で検証 → 添付保管庫へコピー → `MasterSession.shareImage()`）／`MasterChatEvent` に `kind:"image"`／画像カード（最大 320x240・contain）とライトボックス（Esc / 背景 / ✕ で閉じ、←→ で**会話内の全画像**を横断・ボス添付も同じ列）／terminal master では `open_viewer` へ自動フォールバック。**`open_viewer` の挙動は無変更**。設計は `docs/design/master-chat-inline-image-2026-09-05.md` | `scripts/e2e-master-chat-share-image.mjs` **19/19 green**（**実 claude を使わない**・偽 claude スタブと MCP stdio ブリッジ）。unit +22 本 green・既存 fail 0（465 本）・`npm run build` 成功。スクショ 5 枚 `tmp/shots-m10/` | **1 日** | PR-M5 |
 
 ---
 

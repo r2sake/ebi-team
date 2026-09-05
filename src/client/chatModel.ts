@@ -14,6 +14,7 @@
 
 import type {
   ChatAttachment,
+  ChatImage,
   MasterChatEnvelope,
   MasterChatEvent,
   MasterChatUsage,
@@ -23,6 +24,8 @@ import type {
 export type ChatItem =
   | { kind: "user"; seq: number; ts: number; text: string; attachments: ChatAttachment[] }
   | { kind: "assistant"; seq: number; ts: number; text: string; streaming: boolean }
+  /** master がチャットへ共有した画像（PR-M10・`chat_image`）。assistant 側に出る。 */
+  | { kind: "image"; seq: number; ts: number; images: ChatImage[] }
   | { kind: "thinking"; seq: number; ts: number; text: string; streaming: boolean }
   | { kind: "inbound"; seq: number; ts: number; from: string; tag: "reply" | "idle" | "message"; text: string }
   | {
@@ -147,6 +150,9 @@ export class ChatTranscript {
       case "inbound":
         this.closeStream();
         return this.push({ kind: "inbound", seq, ts, from: ev.from, tag: ev.tag, text: ev.text });
+      case "image":
+        this.closeStream();
+        return this.push({ kind: "image", seq, ts, images: [...ev.images] });
       case "text":
       case "thinking":
         return this.applyStream(seq, ts, ev.kind === "text" ? "assistant" : "thinking", ev.text, ev.partial);
@@ -399,6 +405,163 @@ export function stateLabel(state: string): string {
     default:
       return state;
   }
+}
+
+// ===== ライトボックス（PR-M10）=====
+//
+// 「チャット内の画像をクリックで拡大し、←→ で会話内の全画像を横断する」ための状態機械。
+// **DOM 非依存**（chat.ts が値を読んで描画するだけ）にしてあるので、送りの挙動・端での
+// 振る舞い・閉じたあとの復帰が unit で検証できる。
+
+/** ライトボックスで送れる画像 1 件（ボス添付と master 共有を同じ形に潰したもの）。 */
+export interface LightboxEntry {
+  /** 一意キー（`<seq>:<index>`）。クリックされたサムネイルの特定に使う。 */
+  key: string;
+  /** 配信 URL（`/control/chat-attachment?name=...`）。 */
+  url: string;
+  /** 保管庫の basename（代替テキスト・欠損時の表示に使う）。 */
+  name: string;
+  /** 見出し（無ければ null）。 */
+  title: string | null;
+  /** 説明文（無ければ null）。 */
+  caption: string | null;
+  /** 共有元 / 保存先の絶対パス（表示用。配信には使わない）。 */
+  sourcePath: string | null;
+  /** 出どころ（ボスの添付か master の共有か）。 */
+  from: "boss" | "master";
+  /** 元イベントの seq / ts（時系列の並び順の根拠）。 */
+  seq: number;
+  ts: number;
+}
+
+/**
+ * トランスクリプト全体から、時系列順の画像リストを作る。
+ *
+ * 対象は「ボスが添付した画像（user.attachments の image/*）」と
+ * 「master が共有した画像（kind:"image"）」の 2 つで、**同じ 1 列に混ぜる**
+ * （設計 §5.2 / 裁定 Q-6(a)。`chat_image` は 1 枚ずつ出すので、吹き出し内に閉じると送りが死ぬ）。
+ * items は既に時系列（seq 昇順）で並んでいるので、そのままの順で拾えばよい。
+ */
+export function collectImages(items: readonly ChatItem[]): LightboxEntry[] {
+  const out: LightboxEntry[] = [];
+  for (const item of items) {
+    if (item.kind === "user") {
+      item.attachments.forEach((a, i) => {
+        if (!a.mediaType.startsWith("image/")) return; // テキスト添付は拡大対象にしない。
+        out.push({
+          key: `${item.seq}:${i}`,
+          url: a.url,
+          name: a.name,
+          title: null,
+          caption: null,
+          sourcePath: a.path,
+          from: "boss",
+          seq: item.seq,
+          ts: item.ts,
+        });
+      });
+    } else if (item.kind === "image") {
+      item.images.forEach((img, i) => {
+        out.push({
+          key: `${item.seq}:${i}`,
+          url: img.url,
+          name: img.name,
+          title: img.title,
+          caption: img.caption,
+          sourcePath: img.sourcePath,
+          from: "master",
+          seq: item.seq,
+          ts: item.ts,
+        });
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * ライトボックスの状態機械（開いている index と next/prev/close だけ）。
+ *
+ * - 端では**折り返さない**（最後の画像で `next()` は何もしない）。UI 側は端でボタンを
+ *   無効化するので、押しても何も起きないことと表示が一致する。
+ * - `setEntries()` は開いたまま新しい画像が届いたときのための更新口。開いている画像が
+ *   まだ一覧にあれば**その画像を開いたまま**追従し、消えていれば閉じる。
+ */
+export class LightboxState {
+  private entries: LightboxEntry[] = [];
+  private index = -1;
+
+  constructor(entries: readonly LightboxEntry[] = []) {
+    this.entries = [...entries];
+  }
+
+  /** 一覧を差し替える（開いている画像は key で追従する）。 */
+  setEntries(entries: readonly LightboxEntry[]): void {
+    const currentKey = this.current?.key ?? null;
+    this.entries = [...entries];
+    if (currentKey == null) return;
+    const next = this.entries.findIndex((e) => e.key === currentKey);
+    this.index = next; // 見失ったら -1（＝閉じる）。
+  }
+
+  /** key の画像を開く。見つからなければ何もしない（false）。 */
+  open(key: string): boolean {
+    const i = this.entries.findIndex((e) => e.key === key);
+    if (i < 0) return false;
+    this.index = i;
+    return true;
+  }
+
+  /** 閉じる。 */
+  close(): void {
+    this.index = -1;
+  }
+
+  /** 次の画像へ（最後なら何もしない）。移動したら true。 */
+  next(): boolean {
+    if (this.index < 0 || this.index >= this.entries.length - 1) return false;
+    this.index += 1;
+    return true;
+  }
+
+  /** 前の画像へ（先頭なら何もしない）。移動したら true。 */
+  prev(): boolean {
+    if (this.index <= 0) return false;
+    this.index -= 1;
+    return true;
+  }
+
+  get isOpen(): boolean {
+    return this.index >= 0 && this.index < this.entries.length;
+  }
+
+  /** いま開いている画像（閉じていれば null）。 */
+  get current(): LightboxEntry | null {
+    return this.isOpen ? (this.entries[this.index] ?? null) : null;
+  }
+
+  /** 何枚目か（1 始まり・閉じていれば 0）。 */
+  get position(): number {
+    return this.isOpen ? this.index + 1 : 0;
+  }
+
+  /** 全体の枚数。 */
+  get count(): number {
+    return this.entries.length;
+  }
+
+  get hasNext(): boolean {
+    return this.isOpen && this.index < this.entries.length - 1;
+  }
+
+  get hasPrev(): boolean {
+    return this.isOpen && this.index > 0;
+  }
+}
+
+/** ライトボックスの枚数インジケータ（`3 / 12`）。閉じているときは空文字。 */
+export function lightboxCounter(state: LightboxState): string {
+  return state.isOpen ? `${state.position} / ${state.count}` : "";
 }
 
 // ===== 入力系（PR-M4）=====

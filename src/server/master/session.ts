@@ -15,6 +15,7 @@
 import type {
   AgentRecord,
   ChatAttachment,
+  ChatImage,
   MasterChatEnvelope,
   MasterChatEvent,
   MasterChatState,
@@ -553,6 +554,19 @@ export class MasterSession {
       this.emit({ kind: "notice", level: "error", text: `エビ返信の投入に失敗: ${(err as Error).message}` });
       return { ok: false, confirmed: false };
     }
+  }
+
+  /**
+   * master がチャットへ共有した画像を 1 件トランスクリプトへ載せる（PR-M10）。
+   *
+   * `user` / `inbound` と同じ「ワイヤ側にしか無い kind」なので emitChat を直接呼ぶ
+   * （MasterEvent には足さない＝ backend 実装に影響しない）。seq 採番・JSONL 追記・
+   * WS broadcast は既存経路に乗るので、**再起動後の snapshot 復元も追加実装ゼロ**で効く。
+   * JSONL に載るのは basename と表示メタだけ（base64 は載らない＝ログが肥大しない）。
+   */
+  shareImage(images: readonly ChatImage[]): void {
+    if (images.length === 0) return;
+    this.emitChat({ kind: "image", images: [...images] });
   }
 
   /** 実行中ターンの中断（WS `chatStop`）。会話は殺さない。 */

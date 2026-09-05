@@ -276,6 +276,16 @@ Slack / Discord などの外部チャンネルに常駐する「待機・秘書�
 - **永続化（再起動後の復元）**: 開いているビューアは `.ebi-team/viewers.json`（`EBI_VIEWERS_PATH` で変更可・gitignore 対象）へ open/close のたびに atomic 保存され、サーバ再起動時に同じタブが復元されます。保存するのは `{id, path, title, openedAt}` のみで、本文は復元時にファイルから読み直します（＝再起動後は最新の内容が表示されます）。復元時にファイルが消えている／許可ルート外になっているエントリは警告ログを出して読み飛ばし、`viewers.json` からも掃除します（起動は止めません）。
 
 > **運用原則**: 統括役（master）がユーザーへ md/txt/画像の成果物・プラン・レポートを提示するときは、**原則 `open_viewer` で UI に表示する**。「どう表示しましょうか」と表示方法を質問する前に、まず `open_viewer` で開いて見せること。ターミナルへの全文貼り付けは、ユーザーが明示的に望んだ場合に限る。
+> ただし**画像**（imagegen エビの成果画像など「見せたい 1 枚」）は、`ui:"chat"` の master なら `open_viewer` ではなく **`chat_image` でチャット欄に直接出す**（下の「チャット内の画像共有」）。viewer は md/txt のレビューと、原寸で並べて比べたいときに使う。
+
+### チャット内の画像共有 (chat_image)
+
+`ui:"chat"` の master 専用ツール `chat_image({ path, title?, caption? })` で、画像を**チャットの吹き出しに直接**出せます。サムネイル（最大 320x240・`contain`）をクリックすると**ライトボックス**で拡大し、`←` `→` で会話内の全画像（ボスが添付した画像も含む）を横断できます。閉じるのは `Esc` / 背景クリック / `✕`。
+
+- パスの条件は viewer と同じ関門（許可ルート配下・`realpath`・拡張子 `.png/.jpg/.jpeg/.webp/.gif`・サイズ上限）を通します。許可ルート外や非画像は 400 で弾きます。
+- 共有した画像は**添付保管庫（`.ebi-team/chat-attachments/`）へコピー**され、以降は basename だけで参照します（配信は `GET /control/chat-attachment?name=`）。元ファイルを消しても履歴の画像は残り、サーバ再起動後も会話ログ（`master-chat.jsonl`）から復元されます。
+- `ui` が `terminal` の構成で呼ぶと、自動で `open_viewer` にフォールバックします（ツールは失敗しません）。
+- 作業エビの MCP には露出しません（画像を見せるのは master 経由）。詳細は [`docs/ops/master-chat-ui.md`](docs/ops/master-chat-ui.md) §10。
 
 ### master コンテキスト枯渇ガード (context-guard)
 

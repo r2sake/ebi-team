@@ -54,7 +54,11 @@ npm run imagegen:check -- job /path/to/job.yaml
 | 加工 | リサイズ（`sips -Z` の長辺合わせ）と PNG→WebP（`cwebp -q 90`）**だけ**。減色・トリム・切り抜き・背景除去は禁止 |
 | 待ち時間の目安 | 90 s × 枚数 ＋ 120 s（2 枚の実測 171.7 s） |
 
-報告は `reply_to_master` 1 回・`imagegen_result: v1` の YAML 1 ブロック。`path` は絶対パスなので `open_viewer({path})` にそのまま渡せる。
+報告は `reply_to_master` 1 回・`imagegen_result: v1` の YAML 1 ブロック。`path` は絶対パスなので、
+master は **`chat_image({path, title?, caption?})` でそのままボスのチャット欄へ共有できる**
+（クリックで拡大表示。`open_viewer` は md/txt のレビューや原寸比較のときに使う）。
+納品先 `tmp/images/<job_id>/` は ebi-team リポジトリ配下＝ viewer の許可ルート（既定 `$HOME/workspace`）内なので条件を満たす。
+**ジョブ側で `dest_root` を許可ルートの外（`/tmp` 等）に向けると `chat_image` も `open_viewer` も 400 で弾かれる**ので注意。
 
 ## 3. 失敗したとき
 

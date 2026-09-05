@@ -21,6 +21,9 @@
 //     違うのは「MCP ブリッジを挟まない」ことだけ）
 //  - 本文に `ask:<質問>|<選択肢1>,<選択肢2>` があれば AskUserQuestion の承認要求を同じ口へ出し、
 //    返ってきた `updatedInput.answers` を tool_result にして復唱する
+//  - 本文に `img:<絶対パス>` があれば `POST $EBI_CONTROL_URL/control/chat-image` を叩き
+//    （＝ master 専用 MCP `chat_image` が叩くのと同じ制御API）、結果を tool_result にする。
+//    実 claude なら MCP ブリッジ経由になる部分を、ここでは直接叩いて代用する
 //
 // 実 claude を模すのはここまで（partial は出さない）。
 
@@ -60,6 +63,17 @@ async function askPermission(toolName, input, toolUseId) {
   });
   if (!res.ok) return { behavior: "deny", message: `HTTP ${res.status}` };
   return res.json();
+}
+
+/** 画像共有（chat_image 相当）を制御API へ投げる。 */
+async function shareImage(path) {
+  const res = await fetch(`${CONTROL_URL}/control/chat-image`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path, title: "偽 claude の共有", caption: "e2e で共有した画像" }),
+  });
+  const body = await res.json().catch(() => null);
+  return { status: res.status, body };
 }
 
 let toolSeq = 0;
@@ -160,6 +174,36 @@ async function turn(text) {
   if (ask) {
     const answer = await runAskUserQuestion(ask[1].trim(), ask[2].split(",").map((s) => s.trim()));
     notes.push(answer ? `ANSWER=${answer}` : "NO_ANSWER");
+  }
+  // 画像共有（PR-M10）。tool_use → 制御API → tool_result の 1 往復として出す。
+  const img = /img:([^\s\n]+)/.exec(text);
+  if (img) {
+    const id = nextToolId();
+    const path = img[1].trim();
+    out({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        model: MODEL,
+        content: [{ type: "tool_use", id, name: "mcp__ebi-control__chat_image", input: { path } }],
+      },
+    });
+    const shared = await shareImage(path);
+    out({
+      type: "user",
+      message: {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: id,
+            is_error: shared.status !== 200,
+            content: JSON.stringify(shared.body),
+          },
+        ],
+      },
+    });
+    notes.push(shared.status === 200 ? `IMAGE_${shared.body?.shown ?? "?"}` : `IMAGE_ERR_${shared.status}`);
   }
 
   // 3) assistant 本文 + message.usage（文脈占有量の唯一の供給源）。

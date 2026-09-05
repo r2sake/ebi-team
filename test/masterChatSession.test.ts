@@ -618,3 +618,49 @@ test("handlePermissionRequest は brain へ委譲し、未起動なら deny を�
   );
   await h.session.stop();
 });
+
+// ===== チャットへの画像共有（PR-M10）=====
+
+test("shareImage: seq を進めてイベントを流し、snapshot に含まれる", async () => {
+  const h = makeSession();
+  await h.session.start();
+  const before = h.events.length;
+  h.session.shareImage([
+    {
+      name: "chat-20260905-101010-abcdef12.png",
+      url: "/control/chat-attachment?name=chat-20260905-101010-abcdef12.png",
+      mediaType: "image/png",
+      bytes: 4242,
+      sourcePath: "/home/boss/workspace/tmp/images/a.png",
+      title: "エビ",
+      caption: "生成サンプル",
+    },
+  ]);
+  const envelope = h.events[before];
+  assert.ok(envelope, "chatEvent が 1 件流れる");
+  assert.equal(envelope!.event.kind, "image");
+  assert.equal(
+    envelope!.event.kind === "image" ? envelope!.event.images[0]!.name : null,
+    "chat-20260905-101010-abcdef12.png",
+  );
+  // base64 は載せない（JSONL 肥大の防止）＝ name / url / メタだけ。
+  assert.equal(JSON.stringify(envelope!.event).includes("base64"), false);
+  // seq は既存イベントの続き（単調増加）。
+  assert.equal(envelope!.seq, (h.events[before - 1]?.seq ?? 0) + 1);
+
+  const snap = h.session.snapshot();
+  assert.ok(
+    snap.events.some((e) => e.event.kind === "image"),
+    "snapshot（再接続・再起動後の復元）に image イベントが含まれる",
+  );
+  await h.session.stop();
+});
+
+test("shareImage: 空配列では何も流さない", async () => {
+  const h = makeSession();
+  await h.session.start();
+  const before = h.events.length;
+  h.session.shareImage([]);
+  assert.equal(h.events.length, before);
+  await h.session.stop();
+});

@@ -498,6 +498,32 @@ server.tool(
   },
 );
 
+// ---- chat_image: 画像をボスのチャット欄へ直接共有する（master 専用・PR-M10）----
+server.tool(
+  "chat_image",
+  "指定した画像をボスのチャット欄にインライン表示する（クリックで拡大＝ライトボックス）。" +
+    "**imagegen エビの成果画像など『ボスに見せたい画像』は open_viewer ではなくこちらを使う**" +
+    "（open_viewer は別パネルで開く操作で、md/txt のレビューや原寸でじっくり見せたいときに使う）。" +
+    "画像はチャットの添付保管庫へコピーされるので、元ファイルが tmp 掃除で消えても履歴に残る。" +
+    "パスは許可ルート（既定 $HOME/workspace・EBI_VIEWER_ROOTS で設定）配下の " +
+    ".png/.jpg/.jpeg/.webp/.gif のみ（それ以外は 400）。" +
+    'チャット UI の master（ui:"chat"）が居ない構成では自動で open_viewer にフォールバックする。',
+  {
+    path: z
+      .string()
+      .describe("共有する画像の絶対パス（許可ルート配下の .png/.jpg/.jpeg/.webp/.gif）"),
+    title: z.string().optional().describe("画像の上に出す見出し（未指定はファイル名）"),
+    caption: z
+      .string()
+      .optional()
+      .describe("画像の下に出す説明文。後から会話ログを grep して探せるよう、何の画像か一言書く"),
+  },
+  async ({ path, title, caption }) => {
+    const r = await callControl("POST", "/control/chat-image", { path, title, caption });
+    return toResult(r);
+  },
+);
+
 // ---- ask_supervisor: target エビの状況要約を回収して返す（バッチC 本実装）----
 server.tool(
   "ask_supervisor",

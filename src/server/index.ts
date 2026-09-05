@@ -56,6 +56,7 @@ import {
 } from "./fixedEbi.ts";
 import { MasterSession } from "./master/session.ts";
 import { ChatAttachmentStore, MAX_ATTACHMENTS_PER_TURN } from "./chatAttachments.ts";
+import { shareChatImage } from "./chatImages.ts";
 import { configureFixedEbiLog, fixedEbiLogPath, logFixedEbi } from "./fixedEbiLog.ts";
 import { NoticeBuffer, DEFAULT_NOTICE_BUFFER_SIZE } from "./noticeBuffer.ts";
 import { createControlApi, type GeneralizedSpawnParams } from "./control.ts";
@@ -650,6 +651,25 @@ const controlApi = createControlApi({
     return chatAttachments.save(bytes, mediaType);
   },
   readChatAttachment: async (name) => (masterSession ? chatAttachments.read(name) : null),
+  // master がチャットへ共有する画像（PR-M10）。許可ルート検証（open_viewer と同一）→
+  // 保管庫へコピー → トランスクリプトへ載せる。chat master が居ない構成では null を返し、
+  // 制御API 側が open_viewer へ自動フォールバックする（ツールを失敗させない・裁定 Q-4）。
+  shareChatImage: async (path, title, caption) => {
+    const session = masterSession;
+    if (!session) return null;
+    const image = await shareChatImage(
+      path,
+      { title: title ?? null, caption: caption ?? null },
+      {
+        roots: viewerRegistry.getRoots(),
+        maxBytes: viewerRegistry.limits.maxBytes,
+        maxImageBytes: viewerRegistry.limits.maxImageBytes,
+        save: (bytes, mediaType) => chatAttachments.save(bytes, mediaType),
+      },
+    );
+    session.shareImage([image]);
+    return image;
+  },
   // 承認/質問（PR-M5）。claude の --permission-prompt-tool → 制御MCP → ここ。
   // ボスが UI で答えるまで resolve しない（未応答は待ち続ける・自動拒否しない）。
   requestChatPermission: async (req, signal) => {
