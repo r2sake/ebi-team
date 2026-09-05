@@ -151,6 +151,8 @@ export function supportsChannelInject(agent: Pick<Agent, "launch">): boolean {
  *   - "notify": notification 経路で到達確認（ブリッジ ACK）が取れた
  *   - "pty-fallback": notify を試みたが ACK が取れず PTY 注入へ自動フォールバックした
  *   - "pty": 最初から PTY 注入（購読 live でない / notifySubscribe:false / EBI_INJECT_MODE=pty）
+ *   - "chat": ヘッドレス master（ui:"chat"）の stdin へ user メッセージとして投入した
+ *     （PTY もエコー照合も介さない。confirmed は --replay-user-messages の投入 ACK）
  *   - "none": agent 不在で配送できなかった
  * - confirmed: 相手セッションへ実際に本文が渡ったと確認できたか。
  *   notify は ACK＋本文エコー、PTY は「今この場で stdin へ書けた」ことをもって true とする。
@@ -164,7 +166,7 @@ export function supportsChannelInject(agent: Pick<Agent, "launch">): boolean {
  */
 export interface DeliverOutcome {
   ok: boolean;
-  via: "notify" | "pty-fallback" | "pty" | "none";
+  via: "notify" | "pty-fallback" | "pty" | "chat" | "none";
   confirmed: boolean;
   /** PTY 注入が busy で滞留した（＝まだ相手の入力欄に入っていない）か。 */
   queued: boolean;
@@ -181,6 +183,30 @@ export interface InjectResult {
   delivered: string[];
   rejected: { id: string; reason: string }[];
   details: { id: string; via: DeliverOutcome["via"]; confirmed: boolean; queued: boolean }[];
+}
+
+/**
+ * PTY を持たない配送先（ui:"chat" の master）。
+ *
+ * chat モードの master は node-pty を一切起動しないため registry の agents に載らないが、
+ * 「宛先として解決でき、reply_to_master が届き、サイドバーに出る」必要がある。
+ * MasterSession（src/server/master/session.ts）がこの形で自分を登録する。
+ */
+export interface ChatDeliveryTarget {
+  /** registry サイドバー / contextGuard の quiescence 判定に使う合成レコード。 */
+  record(): AgentRecord;
+  /**
+   * 配送（stdin へ user メッセージ 1 行）。
+   * confirmed はプロトコル上の投入 ACK（--replay-user-messages）が取れたか。
+   */
+  deliver(input: {
+    from: string;
+    /** タグ無しの本文。 */
+    message: string;
+    /** `[reply] ` 等のタグ付き本文（PTY 注入と同じ表記）。 */
+    body: string;
+    kind: "reply" | "idle" | "message";
+  }): Promise<{ ok: boolean; confirmed: boolean }>;
 }
 
 /** spawn 時のオプション（worktree 情報など）。 */
@@ -223,6 +249,8 @@ export interface WorktreeMeta {
  */
 export class Registry {
   private readonly agents = new Map<string, Agent>();
+  /** PTY を持たない配送先（ui:"chat" の master）。id は agents と同じ名前空間。 */
+  private readonly chatTargets = new Map<string, ChatDeliveryTarget>();
   private seq = 0;
 
   constructor(
@@ -231,6 +259,25 @@ export class Registry {
     /** notification 注入方式の郵便受け。未指定なら常に PTY 経路（テスト等の簡略化用）。 */
     private readonly mailbox: Mailbox | null = null,
   ) {}
+
+  /**
+   * PTY を持たない配送先（ui:"chat" の master）を登録する。
+   * 同 id の PTY agent とは排他（chat モードでは PTY を起動しないため両立しない）。
+   */
+  setChatTarget(id: string, target: ChatDeliveryTarget): void {
+    this.chatTargets.set(id, target);
+    void this.dump();
+  }
+
+  /** chat 配送先の登録を解除する。 */
+  clearChatTarget(id: string): void {
+    if (this.chatTargets.delete(id)) void this.dump();
+  }
+
+  /** 指定 id が chat 配送先（PTY を持たない master）か。 */
+  isChatTarget(id: string): boolean {
+    return this.chatTargets.has(id);
+  }
 
   /** notification 配送が有効か（EBI_INJECT_MODE=pty なら無効）。 */
   notifyEnabled(): boolean {
@@ -296,9 +343,17 @@ export class Registry {
     message: string,
     kind?: "reply" | "idle",
   ): Promise<DeliverOutcome> {
+    const body = kind === "idle" ? `[idle] ${message}` : kind === "reply" ? `[reply] ${message}` : message;
+    // ui:"chat" の master は PTY を持たない。mailbox（notification）にも載せず、
+    // **stdin へ user メッセージ 1 行**として投入する（設計書 §2.3）。
+    // PTY 注入も エコー照合も走らないため、配送ハードニングはこの経路では丸ごと不要。
+    const chat = this.chatTargets.get(id);
+    if (chat) {
+      const r = await chat.deliver({ from, message, body, kind: kind ?? "message" });
+      return { ok: r.ok, via: "chat", confirmed: r.confirmed, queued: false };
+    }
     const agent = this.agents.get(id);
     if (!agent) return { ok: false, via: "none", confirmed: false, queued: false };
-    const body = kind === "idle" ? `[idle] ${message}` : kind === "reply" ? `[reply] ${message}` : message;
     // notifySubscribe:false のエビ（外部チャンネル待機セッション・受信 PTY 固定）は、たとえ
     // 何らかの理由で購読者として登録されていても notification 経路に載せない。自セッションに
     // ebi-control channel が無く notification が harness に黙って捨てられるため（全配送経路
@@ -452,11 +507,13 @@ export class Registry {
   }
 
   has(id: string): boolean {
-    return this.agents.has(id);
+    return this.agents.has(id) || this.chatTargets.has(id);
   }
 
   /** 指定 agent が固定エビ（削除不可）か。存在しなければ false。 */
   isPinned(id: string): boolean {
+    // chat master は固定エビなので常に削除不可。
+    if (this.chatTargets.has(id)) return true;
     return this.agents.get(id)?.pinned ?? false;
   }
 
@@ -465,12 +522,17 @@ export class Registry {
   }
 
   list(): AgentRecord[] {
-    return [...this.agents.values()].map((a) => a.toRecord());
+    // PTY agent ＋ chat 配送先（PTY を持たない master）の合成。
+    // contextGuard の quiescence 判定（master が idle か）もこの一覧を見る。
+    return [
+      ...[...this.agents.values()].map((a) => a.toRecord()),
+      ...[...this.chatTargets.values()].map((t) => t.record()),
+    ];
   }
 
   /** id を採番して予約する（worktree の事前計算で agent-id を使いたい場合用）。 */
   reserveId(id?: string): string {
-    return id && !this.agents.has(id) ? id : this.nextId();
+    return id && !this.agents.has(id) && !this.chatTargets.has(id) ? id : this.nextId();
   }
 
   /**
@@ -478,6 +540,10 @@ export class Registry {
    * worktree 由来の場合は branch / worktree メタを付与する（kill 時のクリーンアップに使う）。
    */
   spawn(cwd: string, handlers: AgentHandlers, opts?: SpawnOptions): Agent {
+    // chat 配送先（PTY 無しの master）と同名の PTY エビは作らせない（同名二重エビの防止）。
+    if (opts?.id && this.chatTargets.has(opts.id)) {
+      throw new Error(`${opts.id} は chat モードの master です（同名の PTY エビは作れません）`);
+    }
     const agentId = this.reserveId(opts?.id);
     // 固定エビは launch を明示で受け取る。動的エビはサーバ既定（spawnConfig）から構築する。
     const launch: LaunchParams = opts?.launch ?? {
@@ -589,23 +655,23 @@ export class Registry {
       return result;
     }
 
-    // 単体 id 宛。
+    // 単体 id 宛。chat master（PTY 無し）も宛先として解決する。
     const agent = this.agents.get(to);
-    if (!agent) {
+    if (!agent && !this.chatTargets.has(to)) {
       result.rejected.push({ id: to, reason: "注入先が見つかりません" });
       return result;
     }
-    // isolated かつ他 agent 由来は遮断。ユーザー由来は通す。
-    if (agent.mode === "isolated" && from !== "user") {
+    // isolated かつ他 agent 由来は遮断。ユーザー由来は通す（chat master に isolated は無い）。
+    if (agent && agent.mode === "isolated" && from !== "user") {
       result.rejected.push({
         id: to,
         reason: `isolated のため他エビ（${from}）からの注入を遮断しました`,
       });
       return result;
     }
-    const o = await this.deliver(agent.id, from, message);
-    result.delivered.push(agent.id);
-    result.details.push({ id: agent.id, via: o.via, confirmed: o.confirmed, queued: o.queued });
+    const o = await this.deliver(to, from, message);
+    result.delivered.push(to);
+    result.details.push({ id: to, via: o.via, confirmed: o.confirmed, queued: o.queued });
     return result;
   }
 
@@ -641,11 +707,11 @@ export class Registry {
     }
 
     const target = this.agents.get(toAgent);
-    if (!target) {
+    if (!target && !this.chatTargets.has(toAgent)) {
       result.rejected.push({ id: toAgent, reason: `逆方向通知の宛先が見つかりません: ${toAgent}` });
       return result;
     }
-    if (target.mode === "isolated") {
+    if (target && target.mode === "isolated") {
       result.rejected.push({ id: toAgent, reason: `${toAgent} は isolated のため逆方向通知を受信しません` });
       return result;
     }
@@ -682,11 +748,15 @@ export class Registry {
       await mkdir(dirname(this.dumpPath), { recursive: true });
       const snapshot = {
         dumpedAt: new Date().toISOString(),
-        agents: [...this.agents.values()].map((a) => ({
-          ...a.toRecord(),
-          worktreeRepo: a.worktreeRepo,
-          worktreePath: a.worktreePath,
-        })),
+        agents: [
+          ...[...this.agents.values()].map((a) => ({
+            ...a.toRecord(),
+            worktreeRepo: a.worktreeRepo,
+            worktreePath: a.worktreePath,
+          })),
+          // PTY を持たない chat master も可観測性のためダンプに載せる（復元はしない）。
+          ...[...this.chatTargets.values()].map((t) => t.record()),
+        ],
       };
       await writeFile(this.dumpPath, JSON.stringify(snapshot, null, 2), "utf8");
     } catch (err) {

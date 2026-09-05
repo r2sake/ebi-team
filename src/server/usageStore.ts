@@ -144,6 +144,57 @@ export class UsageStore {
     });
   }
 
+  /**
+   * ヘッドレス master（ui:"chat"）の usage を取り込む。
+   *
+   * chat モードには statusLine が無いため /control/usage は飛んでこない。代わりに
+   * MasterSession が `turnEnd` の usage（ターン最後の assistant の message.usage ÷
+   * result.modelUsage[model].contextWindow）を渡してくる（設計書 §8-R3）。
+   * 保持形は statusLine 由来のエントリと**同一**なので、ダッシュボードも contextGuard も
+   * 入力インターフェースを変えずに済む。
+   */
+  updateFromChat(
+    ebiId: string,
+    input: {
+      model: string | null;
+      costUsd: number | null;
+      contextUsedPct: number | null;
+      contextSize: number | null;
+      tokens: UsageEntry["tokens"];
+    },
+  ): void {
+    this.agents.set(ebiId, {
+      model: input.model,
+      costUsd: input.costUsd,
+      contextUsedPct: input.contextUsedPct,
+      contextSize: input.contextSize,
+      tokens: input.tokens,
+      updatedAt: Date.now(),
+    });
+  }
+
+  /**
+   * アカウント単位のレート制限枠を取り込む（chat モードの `rate_limit_event` 由来）。
+   * statusLine 経路と同じく latest 上書き＋変化時のみ履歴追記。
+   */
+  updateRateLimits(
+    ebiId: string,
+    limits: Partial<UsageRateLimits>,
+    model: string | null = null,
+  ): void {
+    const now = Date.now();
+    if (limits.fiveHour) {
+      const prev = this.rateLimits.fiveHour;
+      this.rateLimits.fiveHour = limits.fiveHour;
+      this.persistIfChanged("five_hour", prev, limits.fiveHour.usedPct, limits.fiveHour.resetsAt, ebiId, model, now);
+    }
+    if (limits.sevenDay) {
+      const prev = this.rateLimits.sevenDay;
+      this.rateLimits.sevenDay = limits.sevenDay;
+      this.persistIfChanged("seven_day", prev, limits.sevenDay.usedPct, limits.sevenDay.resetsAt, ebiId, model, now);
+    }
+  }
+
   /** 既知のエビ id 一覧（usage を 1 度でも受けたもの）。 */
   knownIds(): string[] {
     return [...this.agents.keys()];

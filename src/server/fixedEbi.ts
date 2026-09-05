@@ -8,7 +8,7 @@
 
 import type { Registry } from "./registry.ts";
 import type { AgentHandlers } from "./agent.ts";
-import type { FixedEbiSpec } from "./config.ts";
+import { MASTER_UI_MODES, type FixedEbiSpec, type MasterUiMode } from "./config.ts";
 import { logFixedEbi } from "./fixedEbiLog.ts";
 
 /**
@@ -49,6 +49,26 @@ export function applyMasterBackendFailsafe(spec: FixedEbiSpec): FixedEbiSpec {
   if (spec.kind !== "master") return spec;
   if (spec.launch.backend === "claude") return spec;
   return { ...spec, launch: { ...spec.launch, backend: "claude" } };
+}
+
+/**
+ * env `EBI_MASTER_UI`（"terminal" | "chat"）で master の UI 方式を上書きする純関数。
+ *
+ * 目的（設計書 §6.3 ロールバック段 1）: **再起動だけで現行 PTY master に戻せる**こと。
+ * config を書き換えずに切り戻せる口が要る（config 変更はボスの手が入る＝夜中に戻せない）。
+ * - kind が master 以外の spec は素通し。
+ * - 値が空/不正なら何もしない（起動を止めない。不正値でサーバを落とす価値がない）。
+ */
+export function applyMasterUiOverride(
+  spec: FixedEbiSpec,
+  envValue: string | undefined,
+): FixedEbiSpec {
+  if (spec.kind !== "master") return spec;
+  if (!envValue) return spec;
+  if (!MASTER_UI_MODES.includes(envValue as MasterUiMode)) return spec;
+  const ui = envValue as MasterUiMode;
+  if (spec.ui === ui) return spec;
+  return { ...spec, ui };
 }
 
 /** crashloop 判定・バックオフのパラメータ。 */

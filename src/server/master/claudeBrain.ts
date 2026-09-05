@@ -64,6 +64,12 @@ export interface ClaudeHeadlessBrainOptions {
   ackTimeoutMs?: number;
   /** プロセスを跨いだコスト累計のレジャ（resume を挟む運用で共有する）。 */
   costLedger?: MasterCostLedger;
+  /**
+   * 正規化前の生 NDJSON イベントの覗き口（best-effort・例外は握り潰す）。
+   * MasterEvent の union に載せるほどではないが呼び出し側が要る情報
+   *（`rate_limit_event` の枠情報など）を取り出すために使う。**正規化経路には影響しない**。
+   */
+  onRawEvent?: (raw: unknown) => void;
 }
 
 interface PendingAck {
@@ -97,6 +103,11 @@ export class ClaudeHeadlessBrain implements MasterBrain {
   /** 実際に spawn した引数列（テスト・ログ用）。 */
   get args(): readonly string[] {
     return this.startedArgs;
+  }
+
+  /** 子プロセスの pid（未起動なら null）。 */
+  get pid(): number | null {
+    return this.proc?.pid ?? null;
   }
 
   async start(startOpts: MasterBrainStartOptions): Promise<void> {
@@ -274,6 +285,14 @@ export class ClaudeHeadlessBrain implements MasterBrain {
   private onLine(line: string): void {
     const raw = parseNdjsonLine(line);
     if (raw == null) return;
+    if (this.opts.onRawEvent) {
+      // 覗き口の失敗で会話を壊さない（best-effort）。
+      try {
+        this.opts.onRawEvent(raw);
+      } catch (err) {
+        console.warn("[master-chat] onRawEvent で例外:", (err as Error).message);
+      }
+    }
     this.settleRawSideEffects(raw);
     for (const ev of this.normalizer.push(raw)) {
       if (ev.kind === "ack") {

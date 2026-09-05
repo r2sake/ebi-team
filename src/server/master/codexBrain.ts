@@ -58,6 +58,8 @@ export class CodexHeadlessBrain implements MasterBrain {
   readonly id = "codex" as const;
   readonly capabilities = CODEX_BRAIN_CAPABILITIES;
   readonly unsupported = unsupportedOf(CODEX_BRAIN_CAPABILITIES);
+  /** 未起動（stub なので常に null）。 */
+  readonly pid = null;
 
   start(_opts: MasterBrainStartOptions): Promise<void> {
     return Promise.reject(new MasterBrainNotImplementedError("codex", "start"));
