@@ -116,3 +116,97 @@ test("監視窓の既定値（ACK 所要 30 秒前後に対して十分な上限
   assert.ok(CODEX_ACK_FAILURE_WATCH.minObserveMs >= 1000);
   assert.ok(CODEX_ACK_FAILURE_WATCH.minObserveMs < CODEX_ACK_FAILURE_WATCH.windowMs);
 });
+
+// ===== config 由来のカスタム役割プロンプト（設計 PR-3）=====
+//
+// 役割プロンプトは注入時に TUI がそのままエコーするため、ACK 走査バッファに必ず入る。
+// 組込み役割（roles.ts）と e2e のタスク本文は上のケースが錠前を掛けているが、
+// **config の roles に書いたカスタム役割プロンプトは自動検査の対象外**だった。
+// imagegen のように 1 ターンが長い役割ほど誤検知の実害が大きいのでここで機械照合する。
+
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+import { ENGINEER_APPEND_SYSTEM_PROMPT, IMAGE_REQUEST_APPEND } from "../src/server/roles.ts";
+import { resolveAckWatchSpec } from "../src/server/agent.ts";
+
+/** config ファイルから { 役割id: appendSystemPrompt } を取り出す（無ければ null）。 */
+function rolePromptsOf(path: string): Record<string, string> | null {
+  if (!existsSync(path)) return null;
+  const raw = JSON.parse(readFileSync(path, "utf8")) as { roles?: Record<string, unknown> };
+  const out: Record<string, string> = {};
+  for (const [id, def] of Object.entries(raw.roles ?? {})) {
+    if (def === null || typeof def !== "object") continue;
+    const p = (def as { appendSystemPrompt?: unknown }).appendSystemPrompt;
+    if (typeof p === "string") out[id] = p;
+  }
+  return out;
+}
+
+const CONFIG_PATHS = [
+  resolve(process.cwd(), "ebi-team.config.example.json"),
+  // 稼働 config（.gitignore 済み・worktree には無い）。あるときだけ検査する。
+  process.env.EBI_CONFIG_PATH ?? resolve(process.cwd(), "ebi-team.config.json"),
+];
+
+test("config の roles.* の appendSystemPrompt は ACK 誤検知語・fatal 検知語を含まない", () => {
+  let checked = 0;
+  for (const path of CONFIG_PATHS) {
+    const prompts = rolePromptsOf(path);
+    if (prompts === null) continue;
+    for (const [id, prompt] of Object.entries(prompts)) {
+      const hit = matchAckFailure(prompt, CODEX_ACK_FAILURE_PATTERNS);
+      assert.equal(
+        hit,
+        null,
+        `${path} の roles.${id}.appendSystemPrompt が ACK 検知語に一致します（誤 respawn の元）: ${hit?.message}`,
+      );
+      // 起動エラー検知（fatalPatterns）も同じ走査バッファに掛かる。imagegen の初版は
+      // 「`codex login` のやり直し」と書いていて、正常起動なのに「起動エラー」通知が出た。
+      const fatal = matchAckFailure(prompt, CODEX_BACKEND.fatalPatterns ?? []);
+      assert.equal(
+        fatal,
+        null,
+        `${path} の roles.${id}.appendSystemPrompt が fatal 検知語に一致します（偽の起動エラー通知の元）: ${fatal?.message}`,
+      );
+      checked++;
+    }
+  }
+  // example config には必ず役割があるので 0 件はテスト自体の故障。
+  assert.ok(checked > 0, "検査対象の役割プロンプトが 1 件も見つかりませんでした");
+});
+
+test("engineer 役割プロンプト（画像依頼の追記込み）も ACK 誤検知語を含まない", () => {
+  assert.equal(matchAckFailure(ENGINEER_APPEND_SYSTEM_PROMPT, CODEX_ACK_FAILURE_PATTERNS), null);
+  assert.equal(matchAckFailure(IMAGE_REQUEST_APPEND, CODEX_ACK_FAILURE_PATTERNS), null);
+  // master が転記だけで済むよう、様式のキーが本文に入っていること。
+  assert.match(ENGINEER_APPEND_SYSTEM_PROMPT, /imagegen_job: v1/);
+  assert.match(ENGINEER_APPEND_SYSTEM_PROMPT, /6 枚まで/);
+});
+
+// ===== 役割別の ACK 監視窓（設計 §6.4-3 / ボス裁定 A4）=====
+
+test("役割別 ACK 監視窓: 未指定は backend 既定のまま（既存挙動と同一）", () => {
+  assert.equal(resolveAckWatchSpec(CODEX_ACK_FAILURE_WATCH, undefined), CODEX_ACK_FAILURE_WATCH);
+  assert.equal(resolveAckWatchSpec(CODEX_ACK_FAILURE_WATCH, null), CODEX_ACK_FAILURE_WATCH);
+  // 監視を持たない backend（claude / gemini）は上書きしても監視しない。
+  assert.equal(resolveAckWatchSpec(null, 30000), null);
+});
+
+test("役割別 ACK 監視窓: 短くすると生成の長い役割で失敗報告が窓の外に落ちる", () => {
+  const spec = resolveAckWatchSpec(CODEX_ACK_FAILURE_WATCH, 45000);
+  assert.notEqual(spec, null);
+  assert.equal(spec!.windowMs, 45000);
+  // 実測 76 秒の生成は窓の外＝正しい失敗報告で respawn されない。
+  assert.ok(spec!.windowMs < 76000);
+  // ACK 実測 30 秒前後は窓の内側＝本来の「静かな故障」検知は残る。
+  assert.ok(spec!.windowMs > 30000);
+  assert.ok(spec!.minObserveMs < spec!.windowMs);
+  assert.deepEqual(spec!.patterns, CODEX_ACK_FAILURE_WATCH.patterns);
+});
+
+test("役割別 ACK 監視窓: 0 はその役割だけ監視を止める（不正値は既定へフォールバック）", () => {
+  assert.equal(resolveAckWatchSpec(CODEX_ACK_FAILURE_WATCH, 0), null);
+  assert.equal(resolveAckWatchSpec(CODEX_ACK_FAILURE_WATCH, -1), CODEX_ACK_FAILURE_WATCH);
+  assert.equal(resolveAckWatchSpec(CODEX_ACK_FAILURE_WATCH, Number.NaN), CODEX_ACK_FAILURE_WATCH);
+});

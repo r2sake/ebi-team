@@ -65,7 +65,32 @@ export interface EbiRole {
    * ため、defaultModel は **この backend で spawn したときだけ**適用される（index.ts の spawnAgent）。
    */
   backend?: BackendId;
+  /**
+   * この役割で spawn したときの ACK 監視窓（ms）の上書き。未指定なら backend 既定
+   * （codex は 90 秒）。0 を指定すると監視そのものを行わない。
+   *
+   * 効かせる理由（imagegen 役割・設計 §6.4）: codex の ACK 監視は役割プロンプト注入から
+   * 90 秒。1 枚 76 秒かかる画像生成タスクが ACK の busy を跨いで注入されると、**正しい失敗報告**
+   * が監視窓の内側に落ちて「静かな故障」と誤判定され、無駄な作り直しが走る。実測の ACK 所要は
+   * 30 秒前後なので、生成が長い役割だけ窓を短くして重なりを断つ。
+   * ackFailureWatch を持たない backend（claude / gemini）では無視される＝挙動不変。
+   */
+  ackWatchMs?: number;
 }
+
+/**
+ * 「必要な画像は自分で作らず、imagegen_job(YAML) にして master へ渡す」節。
+ * engineer 役割プロンプトの末尾に足す（設計 §2.3）。master は届いた YAML を imagegen エビへ
+ * **転記するだけ**で済む。様式の SoT は src/server/imagegen.ts。
+ */
+export const IMAGE_REQUEST_APPEND =
+  "実装に画像素材（アイコン・イラスト・ヒーロー画像等）が必要になった場合、自分で画像を作ろうとしないこと。" +
+  "必要な画像を洗い出し、reply_to_master の本文末尾に次の YAML ブロックを 1 個だけ付けて master に渡す" +
+  "（master がそのまま imagegen エビへ転記する）: " +
+  "imagegen_job: v1 / job_id: <英数と-> / requester: <自分のid> / " +
+  "images: の下に - id / purpose / prompt / count / size(WxH または none) / fit(contain|none) / format(png|webp) を並べる。" +
+  "1 ジョブは合計 6 枚まで。prompt は日本語で、被写体・背景色・画風・禁止事項（文字を入れない等）まで書き切ること。" +
+  "画像が不要なタスクではこのブロックを付けない。";
 
 /**
  * engineer エビの役割注入（--append-system-prompt）。
@@ -77,7 +102,8 @@ export const ENGINEER_APPEND_SYSTEM_PROMPT =
   "作業は与えられた cwd/worktree 内で完結させる。" +
   "完了したら必ず reply_to_master ツールで、結論ファーストの簡潔な報告（成果・差分・次アクション）を master に送る" +
   "（master はこれを待っている。scrollback を読ませない＝トークン節約）。報告後は master に kill される前提でよい。" +
-  "破壊的操作・外部送信・git push は勝手にしない。";
+  "破壊的操作・外部送信・git push は勝手にしない。" +
+  IMAGE_REQUEST_APPEND;
 
 /**
  * 組込みの役割（公開リポジトリに同梱される既定セット）。常にレジストリに存在する
@@ -137,6 +163,15 @@ function asOptionalString(v: unknown, field: string, roleId: string): string | u
   return v;
 }
 
+/** raw なフィールド値を 0 以上の整数として検証する。未指定は undefined、型不正は throw。 */
+function asOptionalNonNegativeInt(v: unknown, field: string, roleId: string): number | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v !== "number" || !Number.isInteger(v) || v < 0) {
+    throw new Error(`カスタム役割 "${roleId}" の ${field} は 0 以上の整数である必要があります`);
+  }
+  return v;
+}
+
 /**
  * 1 件の生ロール定義（config.roles[id]）を検証・正規化する。
  * 不正な形（オブジェクトでない・型が違う・mcpRole が engineer 以外 等）は明確な Error を throw する。
@@ -185,12 +220,24 @@ function normalizeCustomRole(id: string, raw: unknown): EbiRole {
 
   // defaultModel の既定はバックエンドで変わる。claude 以外は CLI 既定モデルに任せる
   //（claude 語彙の "sonnet" を codex/gemini に渡すと毎ターン 400 になる）。
+  const ackWatchMs = asOptionalNonNegativeInt(r.ackWatchMs, "ackWatchMs", id);
+
   const defaultModel =
     asOptionalString(r.defaultModel, "defaultModel", id) ??
     (backend === undefined || backend === "claude" ? CUSTOM_ROLE_DEFAULT_MODEL : "");
   const appendSystemPrompt = asOptionalString(r.appendSystemPrompt, "appendSystemPrompt", id) ?? "";
 
-  return { id, label, emoji, mcpRole, permissionMode, defaultModel, backend, appendSystemPrompt };
+  return {
+    id,
+    label,
+    emoji,
+    mcpRole,
+    permissionMode,
+    defaultModel,
+    backend,
+    appendSystemPrompt,
+    ...(ackWatchMs === undefined ? {} : { ackWatchMs }),
+  };
 }
 
 /**

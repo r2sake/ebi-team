@@ -145,8 +145,23 @@ cp ebi-team.config.example.json ebi-team.config.json
 | `defaultModel` | 起動モデル（`opus` / `sonnet` / `haiku` など） | `"sonnet"`（`backend` が claude 以外なら空＝各 CLI の既定モデル） |
 | `backend` | その役割の既定バックエンド（`claude` / `codex` / `gemini`）。後述の「マルチバックエンド」参照 | 未指定（サーバ既定へフォールバック） |
 | `appendSystemPrompt` | その役割の人格・振る舞いのルールを注入するシステムプロンプト | 空（注入なし） |
+| `ackWatchMs` | codex の ACK 監視窓（ms）の上書き。`0` でその役割だけ監視しない | 未指定（backend 既定＝codex は 90000） |
 
 組込みの `engineer` は同名キーで上書きできますが、削除はできません（`roles` は既存レジストリへの追加/上書きのみです）。
+
+`ackWatchMs` は「1 ターンが長い役割」向けの逃げ道です。codex エビは役割プロンプト注入から一定時間、応答文を走査して「ツールが無いと述べて黙る静かな故障」を検知し、当たれば 1 回だけ作り直します。画像生成のように 1 ターンが 1 分を超える役割では、**正しい失敗報告**がこの窓の内側に落ちて誤検知されうるため、その役割だけ窓を短くします（同梱サンプルの `imagegen` は 45000）。
+
+### 画像生成役割 (imagegen)
+
+`ebi-team.config.example.json` の `roles.imagegen` は、codex 組込みの画像生成ツールで素材画像を作る役割のサンプルです（要 ChatGPT Plus 以上）。依頼／報告は YAML 1 ブロックに固定していて、様式の定義と検証は `src/server/imagegen.ts`、サンプルは `docs/samples/imagegen-*.yaml` にあります。
+
+```bash
+npm run imagegen:check -- job    docs/samples/imagegen-job.yaml   # 依頼を投げる前に形を確かめる
+npm run imagegen:check -- result docs/samples/imagegen-result.yaml
+ops/clean-generated-images.sh --dry-run                            # ~/.codex/generated_images の掃除
+```
+
+運用は「生成は ebi-team の `tmp/images/<job_id>/` に置き、採否を見てから対象リポジトリへ配る」形です。詳細は `docs/design/imagegen-role-2026-09-05.md` と `docs/ops/imagegen-role.md`。
 
 ### マルチバックエンド (claude / codex / gemini)
 

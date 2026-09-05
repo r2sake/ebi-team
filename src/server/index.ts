@@ -953,6 +953,8 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
       systemPrompt: appendSystemPrompt,
       // 役割プロンプトを起動引数で渡せない backend（codex）は ready 後に PTY 注入する。
       initialInject: initialInjectFor(command, input),
+      // 役割別の ACK 監視窓（imagegen のように 1 ターンが長い役割で誤 respawn を避ける）。
+      ackWatchMs: role?.ackWatchMs ?? null,
     };
     const agent = registry.spawn(cwd, handlers, { id: agentId, kind: params.kind, role: role?.id, launch });
     watchEarlyExit(agent, backend, params);
@@ -982,6 +984,7 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     mcpConfigPath,
     systemPrompt: appendSystemPrompt,
     initialInject: initialInjectFor(command, input),
+    ackWatchMs: role?.ackWatchMs ?? null,
   };
   const agent = registry.spawn(wt.worktreePath, handlers, {
     id: agentId,
