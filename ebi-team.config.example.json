@@ -57,6 +57,9 @@
     {
       "_comment_master_mcp": "master の --mcp-config は args に書かないこと。サーバが spawn 時に dev/本番を判定して .ebi-team/master-control(.dev).mcp.json を --strict-mcp-config 付きで自動付与する（src/server/fixedEbi.ts の applyMasterMcpConfig）。手書きすると npm run dev / npm start でファイル名が食い違い、claude が起動即死→約15秒で crashloop 停止する（2026-08-12 の実障害）。どうしても固定したい場合だけ args に --mcp-config を明示すれば自動付与は行われない（env EBI_MASTER_MCP_CONFIG での上書きも可）。",
       "_comment_master_ui": "ui は master の UI 方式（\"terminal\"(既定・現行の PTY 表示) | \"chat\"(専用チャットUI・ヘッドレス頭脳)）。\"chat\" にすると PTY を一切起動せず、claude -p の stream-json プロセスを 1 本抱えて多ターン会話を回す（受信も PTY 注入ではなく stdin への user メッセージ投入になる）。brain は master の頭脳 CLI（既定 \"claude\"。\"codex\" は規約グレーの opt-in・docs/design/master-chat-ui-2026-09-05.md §1.2 参照）。env EBI_MASTER_UI=terminal|chat で config より優先して切り替えられる（再起動 1 手でロールバック可）。ui:\"chat\" のとき notifySubscribe は参照されない。会話は .ebi-team/master-chat.jsonl に残る（env EBI_MASTER_CHAT_LOG_PATH、\"off\" で無効）。",
+      "_comment_master_ui_example": "下の \"ui\" / \"brain\" は既定値をそのまま書いたもの（＝現行と同じ PTY 表示）。チャット UI に切り替えるときは \"ui\" を \"chat\" にする。移行は『別ポートで EBI_MASTER_UI=chat を試す → config を \"chat\" にする』の 2 段で行い、戻すのは env か config を戻して再起動するだけ（手順・再起動で切れるもの/残るものの表・添付保管庫の掃除は docs/ops/master-chat-ui.md）。brain の値域は claude / codex / gemini / agy で、実装済みは claude のみ。codex は OpenAI 公式が『programmatic な Codex CLI ワークフローには API キーを使え』と明記している規約グレーの opt-in（原文と URL は docs/backends/codex.md §9）、gemini / agy は未実装で指定すると起動時に明示エラーになる。",
+      "ui": "terminal",
+      "brain": "claude",
       "_comment_master_receive": "master は配下エビからの reply_to_master 通知を『受信する側』。受信は notifySubscribe:false で PTY 注入に固定する。master の args には --dangerously-load-development-channels を付けないこと（付けると harness が master セッションを『開発チャンネルをロードする＝バックグラウンドジョブ/サブエージェント』扱いにし、master 宛メッセージが黙って全損する既知トラップ。配送の根治は notifySubscribe:false＋PTY フォールバック側で行う）。ebi-control の channel 登録が必要になるのは reply_to_master を『送信する側』の役割エビだけで、それは index.ts が notify モード時に自動付与する。",
       "id": "master",
       "kind": "master",

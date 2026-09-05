@@ -431,4 +431,50 @@ preflight の担当範囲。
 2. 役割・spawn 引数から `backend: "codex"` を外す
 3. PR-D のみ revert（PR-A / PR-B は挙動不変、PR-C は gemini 用なので残してよい）
 
-**master は常に claude**（固定エビの backend は command から解決）。最悪でも統括系は落ちない。
+**PTY の master は常に claude**（固定エビの backend は command から解決）。最悪でも統括系は落ちない。
+チャット UI の master 頭脳を codex にする話は別枠（§9・opt-in）。
+
+---
+
+## 9. master 頭脳としての codex（`brain:"codex"`・**規約グレーの opt-in**）
+
+> ここは**作業エビの backend**（§1〜§8）ではなく、**master をチャット UI（`ui:"chat"`）で動かすときの頭脳**の話。
+> 関連: [`claude.md`](claude.md)（既定の頭脳） / [`../ops/master-chat-ui.md`](../ops/master-chat-ui.md) /
+> 設計 [`../design/master-chat-ui-2026-09-05.md`](../design/master-chat-ui-2026-09-05.md) §1.2
+
+`fixedEbi[].ui: "chat"` の master には `brain`（頭脳 CLI）を指定できる。**既定は `claude`** で、
+`codex` は **明示指定したときだけ有効になる opt-in**（ボス裁定 Q-1 = (b)）。実装は PR-M8（現状は stub で、
+指定すると `MasterBrainNotImplementedError` で起動が止まる）。
+
+```jsonc
+{ "id": "master", "kind": "master", "ui": "chat", "brain": "codex", "model": "gpt-5.5" }
+```
+
+### 9.1 規約の位置づけ（原文と URL）
+
+OpenAI の公式 auth ドキュメントは、**プログラム的な Codex CLI ワークフローには API キーを使え**と名指しで書いている。
+
+> **"Use API key authentication for programmatic Codex CLI workflows, such as CI/CD jobs."**
+> — https://developers.openai.com/codex/auth （→ https://learn.chatgpt.com/docs/auth へ 308 リダイレクト）
+
+同ページはアクセストークンについても "intended for trusted scripts, schedulers, and private CI runners" と述べており、
+ヘッドレス用のログインは `codex login --device-auth`（beta）として案内されている。
+
+したがって **「ChatGPT サブスクの資格情報で `codex app-server` を常駐させて master を回す」のは、
+禁止条項ではないが公式の推奨から明確に外れる**。engineer エビの PTY 運用（人が対話する CLI を自動化する）とは性質が違い、
+こちらは**明示的に programmatic** なので言い訳が効かない。**この規約リスクを引き受けるかはボスの判断**であり、
+ebi-team としては既定を `claude` に固定し、`brain:"codex"` を書いた人だけが自己責任で使う形にしている。
+
+加えて `codex app-server` は `--help` 上で **`[experimental]`**（0.146.0 実測）＝プロトコルの破壊的変更を織り込む必要がある。
+
+### 9.2 技術的には最も素直（実装メモ）
+
+規約の話を別にすれば、`codex app-server` の JSON-RPC は `MasterBrain` 抽象へほぼ 1:1 で射影できる
+（`thread/start` / `thread/resume` / `turn/start` / `turn/steer` / `turn/interrupt`、通知 `item/agentMessage/delta` ほか）。
+PoC で判明済みの罠は `src/server/master/codexBrain.ts` の冒頭コメントに SoT として置いてある。
+
+- `turn/start` の `input` は**配列**（`{items:[...]}` は -32600）。`turn/steer` は `expectedTurnId` 必須。
+- item は `item.type`。最終回答は `agentMessage` かつ `phase === "final_answer"`。
+- 文脈占有量は `thread/tokenUsage/updated` の **`last.inputTokens`**（`total` はスレッド累計で文脈ではない）。
+  **窓サイズは通知に含まれない**ので、モデル別テーブルが別途要る。
+- `account/rateLimits/updated` で 5h / 週次の枠使用率と `planType` が取れる（claude 頭脳には無い情報）。
