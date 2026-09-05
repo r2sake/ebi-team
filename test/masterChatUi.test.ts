@@ -19,6 +19,8 @@ import {
   formatContextPct,
   formatCost,
   oneLine,
+  replyable,
+  replyExcerpt,
   sendEnabled,
   settledLabel,
   stateLabel,
@@ -206,6 +208,82 @@ test("状態ラベルは日本語（未知の値はそのまま）", () => {
   assert.equal(stateLabel("busy"), "実行中…");
   assert.equal(stateLabel("waiting"), "応答待ち");
   assert.equal(stateLabel("zzz"), "zzz");
+});
+
+// ===== PR-M11（返信 / 引用）=====
+
+test("返信ボタンを出すのは master 側の発言だけ（自分の発話・ツール・システム行には出さない）", () => {
+  const t = fresh();
+  t.apply(env({ kind: "text", text: "master の返事", partial: false }));
+  t.apply(env({ kind: "user", text: "ボスの発話" }));
+  t.apply(env({ kind: "inbound", from: "engineer", tag: "reply", text: "できました" }));
+  t.apply(env({ kind: "toolCall", id: "t1", name: "Bash", input: { command: "ls" } }));
+  t.apply(env({ kind: "notice", level: "info", text: "お知らせ" }));
+  assert.deepEqual(
+    t.items.map((it) => [it.kind, replyable(it)]),
+    [
+      ["assistant", true],
+      ["user", false],
+      ["inbound", true],
+      ["tool", false],
+      ["notice", false],
+    ],
+  );
+});
+
+test("引用の抜粋は 1 行に潰して 60 文字で切る", () => {
+  const t = fresh();
+  t.apply(env({ kind: "text", text: `複数\n行の\n返事 ${"あ".repeat(100)}`, partial: false }));
+  const excerpt = replyExcerpt(t.items[0]!);
+  assert.equal(excerpt.length, 60);
+  assert.ok(excerpt.startsWith("複数 行の 返事 あ"));
+  assert.ok(excerpt.endsWith("…"));
+});
+
+test("引用の抜粋: エビ返信は送信元つき、共有画像は見出しを使う", () => {
+  const t = fresh();
+  t.apply(env({ kind: "inbound", from: "engineer", tag: "reply", text: "実装できました" }));
+  assert.equal(replyExcerpt(t.items[0]!), "engineer: 実装できました");
+  const image: ChatImage = {
+    name: "chat-1.png",
+    url: "/control/chat-attachment?name=chat-1.png",
+    mediaType: "image/png",
+    bytes: 10,
+    sourcePath: "/tmp/chat-1.png",
+    title: "エビの立ち絵",
+    caption: "透過版",
+  };
+  t.apply(env({ kind: "image", images: [image] }));
+  assert.equal(replyExcerpt(t.items[1]!), "エビの立ち絵");
+  t.apply(env({ kind: "image", images: [{ ...image, title: null, caption: null }] }));
+  assert.equal(replyExcerpt(t.items[2]!), "画像 1 枚");
+});
+
+test("user イベントの replyTo はトランスクリプトへ載る（無ければ undefined）", () => {
+  const t = fresh();
+  t.apply(env({ kind: "user", text: "了解", replyTo: { seq: 3, excerpt: "確認をお願いします" } }));
+  t.apply(env({ kind: "user", text: "ふつうの発話" }));
+  const first = t.items[0]!;
+  const second = t.items[1]!;
+  assert.deepEqual(first.kind === "user" ? first.replyTo : null, {
+    seq: 3,
+    excerpt: "確認をお願いします",
+  });
+  assert.equal(second.kind === "user" ? second.replyTo : "x", undefined);
+});
+
+test("引用元は seq で引ける（snapshot 復元後も同じ seq を指す）", () => {
+  const target = env({ kind: "text", text: "master の返事", partial: false });
+  const envelopes = [
+    target,
+    env({ kind: "user", text: "了解", replyTo: { seq: target.seq, excerpt: "master の返事" } }),
+  ];
+  const t = new ChatTranscript();
+  t.reset(envelopes);
+  const user = t.items.find((it) => it.kind === "user");
+  const ref = user?.kind === "user" ? user.replyTo?.seq : null;
+  assert.equal(ref, target.seq);
+  assert.equal(t.items.findIndex((it) => it.seq === ref), 0);
 });
 
 // ===== PR-M11（送信 / 停止の分離）=====

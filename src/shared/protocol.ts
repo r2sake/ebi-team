@@ -467,6 +467,23 @@ export type ServerMessage =
  * 応答として受け取ったものをそのまま送り返す（クライアントから任意パスは指定できない＝
  * サーバ側は保存ディレクトリ配下の basename だけを受け付ける）。
  */
+/**
+ * 返信（引用）の参照先（PR-M11）。
+ *
+ * seq は `MasterChatEnvelope.seq`＝**会話ログの採番**で、JSONL に載り再起動を跨いで安定する。
+ * excerpt は表示用の抜粋で、クライアントが作ってサーバが clamp する（中身は信用しない）。
+ * master の CLI へは `> [reply to master#<seq>] <excerpt>` の 1 行として届く。
+ */
+export interface ChatReplyRef {
+  /** 引用元イベントの seq。 */
+  seq: number;
+  /** 表示用の抜粋（1 行・サーバ側で MAX_REPLY_EXCERPT 文字に clamp）。 */
+  excerpt: string;
+}
+
+/** 引用抜粋の上限（サーバが clamp する。クライアントはこれより短く作る）。 */
+export const MAX_REPLY_EXCERPT = 200;
+
 export interface ChatAttachment {
   /** 保存先の basename（`chat-<ts>-<rand>.png` 形式）。サーバの検証キー。 */
   name: string;
@@ -528,7 +545,7 @@ export type MasterChatEvent =
       mcpServers: { name: string; status: string }[];
       capabilities: string[];
     }
-  | { kind: "user"; text: string; attachments?: ChatAttachment[] }
+  | { kind: "user"; text: string; attachments?: ChatAttachment[]; replyTo?: ChatReplyRef }
   /**
    * master がチャットへ共有した画像（PR-M10・`chat_image` ツール）。
    * `user` / `inbound` と同じ「ワイヤ側にしか無い kind」で、MasterSession.shareImage()
@@ -614,6 +631,11 @@ export interface ChatSendMessage {
    * サーバは image/* のものを stream-json の image content block として投入する。
    */
   attachments?: ChatAttachment[];
+  /**
+   * 返信の引用元（PR-M11）。付いていると master へ届く本文の先頭に
+   * `> [reply to master#<seq>] <抜粋>` が 1 行足される。
+   */
+  replyTo?: ChatReplyRef;
 }
 
 /**

@@ -60,8 +60,14 @@ const viewer = new Viewer(document.getElementById("viewer") as HTMLElement, (id)
 //（registry にはモードの情報が無いため。サーバは接続直後、registry より先に chatState を送る）。
 const chatPanel = new ChatPanel(
   document.getElementById("chat") as HTMLElement,
-  (id, text, attachments) =>
-    sendMsg({ type: "chatSend", id, text, ...(attachments.length > 0 ? { attachments } : {}) }),
+  (id, text, attachments, replyTo) =>
+    sendMsg({
+      type: "chatSend",
+      id,
+      text,
+      ...(attachments.length > 0 ? { attachments } : {}),
+      ...(replyTo ? { replyTo } : {}),
+    }),
   (id) => sendMsg({ type: "chatStop", id }),
   (id) => sendMsg({ type: "chatNew", id }),
   (id, requestId, answer) => sendMsg({ type: "chatAnswer", id, requestId, ...answer }),

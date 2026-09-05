@@ -54,7 +54,7 @@ import {
   applyMasterMcpConfig,
   applyMasterUiOverride,
 } from "./fixedEbi.ts";
-import { MasterSession } from "./master/session.ts";
+import { MasterSession, sanitizeReplyRef } from "./master/session.ts";
 import { ChatAttachmentStore, MAX_ATTACHMENTS_PER_TURN } from "./chatAttachments.ts";
 import { shareChatImage } from "./chatImages.ts";
 import { configureFixedEbiLog, fixedEbiLogPath, logFixedEbi } from "./fixedEbiLog.ts";
@@ -976,7 +976,13 @@ function handleClientMessage(ws: WebSocket, msg: ClientMessage): void {
             images.push({ mediaType: file.mediaType, base64: file.bytes.toString("base64") });
           }
         }
-        const r = await session.sendUserText(msg.text, { images, attachments: resolved });
+        // 引用は clamp / 制御文字除去してから通す（クライアント由来の文字列を信用しない）。
+        const replyTo = sanitizeReplyRef(msg.replyTo);
+        const r = await session.sendUserText(msg.text, {
+          images,
+          attachments: resolved,
+          ...(replyTo ? { replyTo } : {}),
+        });
         if (!r.accepted) send(ws, { type: "error", text: r.reason ?? "送信できませんでした" });
       })().catch((err) => {
         send(ws, { type: "error", text: `送信に失敗しました: ${(err as Error).message}` });

@@ -12,10 +12,12 @@
 // このファイルは PTY（node-pty）にも registry にも依存しない。サーバ配線は index.ts が持ち、
 // registry へは「chat 配送先」として自分を登録してもらう（registry.setChatTarget）。
 
+import { MAX_REPLY_EXCERPT } from "../../shared/protocol.ts";
 import type {
   AgentRecord,
   ChatAttachment,
   ChatImage,
+  ChatReplyRef,
   MasterChatEnvelope,
   MasterChatEvent,
   MasterChatState,
@@ -512,24 +514,31 @@ export class MasterSession {
       images?: { mediaType: string; base64: string }[];
       /** UI 表示・master への提示用のメタ（保存先の絶対パスを含む）。 */
       attachments?: ChatAttachment[];
+      /** 返信の引用元（PR-M11）。既に sanitize 済みのものを渡す。 */
+      replyTo?: ChatReplyRef;
     } = {},
   ): Promise<{ accepted: boolean; reason?: string }> {
     const brain = this.brain;
     if (!brain) return { accepted: false, reason: "master（chat）が起動していません" };
     const attachments = opts.attachments ?? [];
+    const replyTo = opts.replyTo;
     this.emitChat({
       kind: "user",
       text,
       ...(attachments.length > 0 ? { attachments } : {}),
+      ...(replyTo ? { replyTo } : {}),
     });
     this.markBusy();
     // 画像は image ブロックとして載せるが、**絶対パスも本文に添える**。
     // master がツール（Read/Bash）で同じファイルを扱えるようにするためで、
     // 画像そのものの内容は image ブロック側から伝わる。
-    const body =
-      attachments.length > 0
-        ? `${text}\n\n[添付ファイル]\n${attachments.map((a) => a.path).join("\n")}`
-        : text;
+    // 引用ヘッダ → 本文 → 添付フッタ の順で組む。
+    // 引用は master の CLI からも 1 行で読める形にする（どの発言への返答かが本文だけで分かる）。
+    const body = [
+      ...(replyTo ? [replyQuoteLine(replyTo)] : []),
+      text,
+      ...(attachments.length > 0 ? [`\n[添付ファイル]\n${attachments.map((a) => a.path).join("\n")}`] : []),
+    ].join("\n");
     const images = opts.images ?? [];
     void brain.send({ text: body, ...(images.length > 0 ? { images } : {}) }).catch((err) => {
       this.emit({ kind: "notice", level: "error", text: `送信に失敗しました: ${(err as Error).message}` });
@@ -710,4 +719,29 @@ export class MasterSession {
   flushLog(): Promise<void> {
     return this.log.flush();
   }
+}
+
+// ===== 返信（引用）ヘルパ（PR-M11）=====
+
+/**
+ * クライアント由来の引用参照を安全な形にする。
+ *
+ * - seq は有限の正整数だけ通す（存在しない seq でも表示は壊れないので、存在確認まではしない）
+ * - excerpt は制御文字（改行・タブを含む）を空白へ潰し、`MAX_REPLY_EXCERPT` で切る
+ *   ＝ CLI へ渡る行が 1 行に収まり、長さでログを汚されない
+ */
+export function sanitizeReplyRef(ref: unknown): ChatReplyRef | undefined {
+  if (!ref || typeof ref !== "object") return undefined;
+  const { seq, excerpt } = ref as { seq?: unknown; excerpt?: unknown };
+  if (typeof seq !== "number" || !Number.isFinite(seq) || !Number.isInteger(seq) || seq <= 0) {
+    return undefined;
+  }
+  const raw = typeof excerpt === "string" ? excerpt : "";
+  const flat = raw.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
+  return { seq, excerpt: flat.slice(0, MAX_REPLY_EXCERPT) };
+}
+
+/** master の CLI へ届く引用ヘッダ 1 行。 */
+export function replyQuoteLine(ref: ChatReplyRef): string {
+  return `> [reply to master#${ref.seq}] ${ref.excerpt}`;
 }
