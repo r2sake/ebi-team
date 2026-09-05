@@ -10,6 +10,11 @@ import type {
   UsageMessage,
   UsageRateLimits,
 } from "../shared/protocol.ts";
+import {
+  recordUsageHistory,
+  type UsageHistoryRecord,
+  type UsageWindow,
+} from "./usageHistory.ts";
 
 /** statusLine JSON のうち、利用するフィールドだけを緩く型付けしたもの（best-effort）。 */
 interface StatusLineJson {
@@ -60,6 +65,14 @@ export class UsageStore {
   private rateLimits: UsageRateLimits = { fiveHour: null, sevenDay: null };
 
   /**
+   * @param history 履歴の追記関数（既定は usageHistory の JSONL 追記）。
+   *   テストが実ファイルへ書かずに検証できるよう差し替え可能にしてある。
+   */
+  constructor(
+    private readonly history: (rec: UsageHistoryRecord) => void = recordUsageHistory,
+  ) {}
+
+  /**
    * statusLine JSON を取り込む。値検証は最小（best-effort）。不明な ebiId でも受理する。
    * rate_limits が含まれていればアカウント単位で latest を更新する。
    */
@@ -92,14 +105,43 @@ export class UsageStore {
       const fhPct = asNumber(fh?.used_percentage);
       const fhReset = asNumber(fh?.resets_at);
       if (fhPct !== null && fhReset !== null) {
+        const prev = this.rateLimits.fiveHour;
         this.rateLimits.fiveHour = { usedPct: fhPct, resetsAt: fhReset };
+        this.persistIfChanged("five_hour", prev, fhPct, fhReset, ebiId, model, entry.updatedAt);
       }
       const sdPct = asNumber(sd?.used_percentage);
       const sdReset = asNumber(sd?.resets_at);
       if (sdPct !== null && sdReset !== null) {
+        const prev = this.rateLimits.sevenDay;
         this.rateLimits.sevenDay = { usedPct: sdPct, resetsAt: sdReset };
+        this.persistIfChanged("seven_day", prev, sdPct, sdReset, ebiId, model, entry.updatedAt);
       }
     }
+  }
+
+  /**
+   * 値（使用率 or リセット時刻）が前回と変わったときだけ履歴へ 1 行残す。
+   * statusLine は数秒〜数十秒おきに同じ値を送ってくるため、無条件追記だとログが肥大化する。
+   */
+  private persistIfChanged(
+    window: UsageWindow,
+    prev: { usedPct: number; resetsAt: number } | null,
+    usedPct: number,
+    resetsAt: number,
+    ebiId: string,
+    model: string | null,
+    receivedAt: number,
+  ): void {
+    if (prev && prev.usedPct === usedPct && prev.resetsAt === resetsAt) return;
+    this.history({
+      ts: new Date(receivedAt).toISOString(),
+      receivedAt,
+      ebiId,
+      model,
+      window,
+      usedPct,
+      resetsAt,
+    });
   }
 
   /** 既知のエビ id 一覧（usage を 1 度でも受けたもの）。 */

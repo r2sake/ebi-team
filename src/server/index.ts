@@ -52,6 +52,7 @@ import { configureFixedEbiLog, fixedEbiLogPath } from "./fixedEbiLog.ts";
 import { NoticeBuffer, DEFAULT_NOTICE_BUFFER_SIZE } from "./noticeBuffer.ts";
 import { createControlApi, type GeneralizedSpawnParams } from "./control.ts";
 import { UsageStore } from "./usageStore.ts";
+import { configureUsageHistory, usageHistoryPath } from "./usageHistory.ts";
 import { ContextGuard, contextGuardConfigFromEnv, type GuardNotice } from "./contextGuard.ts";
 import { ViewerRegistry } from "./viewerRegistry.ts";
 import {
@@ -123,6 +124,15 @@ const FIXED_EBI_LOG_PATH =
     ? null
     : (process.env.EBI_FIXED_EBI_LOG_PATH ?? join(process.cwd(), ".ebi-team", "fixed-ebi.log"));
 configureFixedEbiLog(FIXED_EBI_LOG_PATH);
+// レート制限使用率（rate_limits）の恒久ログ（JSONL）。statusLine が運んでくる five_hour /
+// seven_day の used_percentage を、値が変わったときだけ追記する（in-memory の latest しか
+// 持っておらず「先週どれだけ枠を使ったか」を後から追えなかった反省から）。
+// env EBI_USAGE_HISTORY_PATH で変更、"off" で無効化。
+const USAGE_HISTORY_PATH =
+  process.env.EBI_USAGE_HISTORY_PATH === "off"
+    ? null
+    : (process.env.EBI_USAGE_HISTORY_PATH ?? join(process.cwd(), ".ebi-team", "usage-history.jsonl"));
+configureUsageHistory(USAGE_HISTORY_PATH);
 // 再アタッチ用スクロールバックのリングバッファ上限（バイト相当・既定 1MB）。
 // インライン TUI 化（agent.ts の INLINE_TUI_ENV）以降、ここには代替スクリーンの再描画ノイズでは
 // なく「実ログ」が積まれるため、リロード後に十分遡れるよう既定を広げている。
@@ -1538,6 +1548,7 @@ httpServer.listen(PORT, HOST, () => {
   );
   console.log(`[ebi-team] 配送ログ: ${deliveryLogPath() ?? "（無効・console のみ）"}`);
   console.log(`[ebi-team] 固定エビログ: ${fixedEbiLogPath() ?? "（無効・console のみ）"}`);
+  console.log(`[ebi-team] 使用率履歴: ${usageHistoryPath() ?? "（無効）"}`);
   console.log(`[ebi-team] master MCP config: ${ROLE_MCP_CONFIG.master}`);
   // 監督機能の状態のみ表示。キー値は出さない。
   console.log(`[ebi-team] ${supervisor.describeStartup()}`);
