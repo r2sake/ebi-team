@@ -16,6 +16,7 @@ import {
 import { Mailbox } from "./mailbox.ts";
 import { configureDeliveryLog, deliveryLogPath, logDelivery } from "./deliveryLog.ts";
 import { buildAckFatalMessage, decideAckFailureAction } from "./ackRespawn.ts";
+import { buildFinalReportRelayText } from "./finalReport.ts";
 import type { Agent, SpawnConfig, AgentHandlers, LaunchParams } from "./agent.ts";
 import {
   BASE_ALLOWED_DEV_CHANNELS,
@@ -549,6 +550,29 @@ const handlers: AgentHandlers = {
         text: `${id} の作り直しに失敗しました: ${(err as Error).message}`,
       });
     });
+  },
+  onFinalReport(id, report) {
+    // [C] 最終報告の自動転送。エビが reply_to_master を呼ばずに最終メッセージへ
+    // `imagegen_result:` 等を書いて idle になった場合に Agent から呼ばれる。
+    // 本文ごと master へ [reply] で届ける（B と違い、master が read_scrollback する必要が無い）。
+    const text = buildFinalReportRelayText(id, report);
+    void registry
+      .reverseInject(id, "master", text, "reply")
+      .then((result) => {
+        if (result.delivered.length === 0 && result.rejected.length > 0) {
+          console.warn(
+            `[ebi-team] 最終報告の自動転送に失敗（${id}）: ${result.rejected[0]?.reason}`,
+          );
+          broadcast({
+            type: "notice",
+            id,
+            text: `最終報告の自動転送に失敗しました: ${result.rejected[0]?.reason}`,
+          });
+        }
+      })
+      .catch((err) => {
+        console.error(`[ebi-team] [${id}] 最終報告の自動転送で例外:`, err);
+      });
   },
   onIdleNotify(id) {
     // [B] idle 自動通知（保険）。busy→idle のエッジで、master/supervisor 以外かつ
