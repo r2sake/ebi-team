@@ -18,6 +18,11 @@
 //
 //  D. 無回帰: 順方向 send_message が通る
 //
+//  E. 最終報告の自動転送（C）
+//     - エビが reply_to_master を呼ばず YAML ブロックを出して idle → master に
+//       `[from:<id>#n] [reply] [自動転送] …` が本文ごと届く
+//     - 同一内容の再出力では二重転送しない
+//
 // 後始末（一時サーバ/プロセス/temp config/EBI_ID env）まで行う。実 claude は使わない。
 
 import { spawn } from "node:child_process";
@@ -109,7 +114,7 @@ server = spawn("node", ["--import", "tsx", "src/server/index.ts"], {
 server.stdout.on("data", (d) => process.stdout.write("[srv] " + d));
 server.stderr.on("data", (d) => process.stderr.write("[srv-err] " + d));
 
-const overall = setTimeout(() => { fail("全体タイムアウト"); finish(); }, 60000);
+const overall = setTimeout(() => { fail("全体タイムアウト"); finish(); }, 90000);
 
 async function finish() {
   clearTimeout(overall);
@@ -278,6 +283,54 @@ async function main() {
       ok("順方向送信が対象 scrollback に反映");
     } else {
       fail("順方向送信が反映されない: " + (sb.body?.data?.slice?.(-200)));
+    }
+  }
+
+  // ===== E. 最終報告の自動転送（C）=====
+  // 直す故障: codex エビが reply_to_master を呼ばず、最終メッセージに imagegen_result の
+  // YAML を書いて idle になる（2026-09-06 の武器画像ジョブで 3/3 再現）。
+  // ここでは bash エビに「YAML ブロックを出力してから idle に戻る」だけをさせ、
+  // master に `[reply] [自動転送] …` が**本文ごと**届くことを固定する。
+  console.log("\n--- E. 最終報告の自動転送（C）---");
+  {
+    const r = await postJson("/control/spawn", { cwd: root, asEngineer: true });
+    const relayId = r.body?.id ?? null;
+    if (r.status === 200 && relayId) ok(`relay 用 engineer spawn（id=${relayId}）`);
+    else fail("relay 用 spawn 失敗: " + JSON.stringify(r));
+
+    if (relayId) {
+      await sleep(1500); // ready 化待ち（hasBeenReady が立たないと C は発火しない）
+      // 行頭タグ（`[from:master#n] `）は bash から見ると「存在しないコマンド」なので、
+      // `;` で切ってから printf を走らせる。printf の出力が「最終メッセージ」の代わり。
+      const yaml = [
+        "  imagegen_result: v1",
+        "  job_id: e2e-relay",
+        "  results:",
+        "    - id: sword",
+        "      status: ok",
+        "      path: /tmp/e2e-relay/sword.png",
+        "  gen_seconds: 1.5",
+      ].join("\\n");
+      await postJson("/control/inject", { to: relayId, message: `; printf '${yaml}\\n'` });
+      await sleep(2000); // 出力 → idle → C 発火 → master へ配送
+      const sb = await masterScrollback();
+      if (new RegExp(`\\[from:${relayId}(#\\d+)?\\] \\[reply\\] \\[自動転送\\]`).test(sb)) {
+        ok(`自動転送: master に \`[from:${relayId}(#n)] [reply] [自動転送] …\``);
+      } else {
+        fail("自動転送が master に届かない: " + sb.slice(-400));
+      }
+      if (sb.includes("job_id: e2e-relay") && sb.includes("gen_seconds: 1.5")) {
+        ok("報告本文（YAML ブロック）がそのまま master に載る（read_scrollback 不要）");
+      } else {
+        fail("報告本文が転送されていない: " + sb.slice(-400));
+      }
+      // 同一内容の再描画では二重に送らない（dedupe）。
+      const before = sb.split("[自動転送]").length;
+      await postJson("/control/inject", { to: relayId, message: `; printf '${yaml}\\n'` });
+      await sleep(2000);
+      const after = (await masterScrollback()).split("[自動転送]").length;
+      if (after === before) ok("同一内容の再出力では二重転送しない");
+      else fail(`同一内容が二重転送された: before=${before} after=${after}`);
     }
   }
 

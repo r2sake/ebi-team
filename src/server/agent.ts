@@ -2,6 +2,7 @@ import * as pty from "node-pty";
 import { IdleDetector } from "./idleDetector.ts";
 import type { AgentRecord, AgentStatus, AgentMode, AgentKind } from "../shared/protocol.ts";
 import { deliveryText } from "../shared/deliveryTag.ts";
+import { extractFinalReport, isRelayEnabled, type FinalReport } from "./finalReport.ts";
 import {
   CLAUDE_BACKEND,
   applyEnvDenyList,
@@ -227,6 +228,14 @@ const IDLE_NOTIFY_ENABLED = !["off", "0", "false"].includes(
 );
 
 /**
+ * [C] 最終報告の自動転送の on/off。env `EBI_FINAL_REPORT_RELAY` が "off"/"0"/"false" のとき無効。
+ * 既定 on。[B]（EBI_IDLE_NOTIFY）とは**別の口**にしてあるのは、本番の `npm start` が
+ * B を off で常用している（通知洪水を嫌ってのこと）ためで、そこに相乗りすると
+ * 直したい故障がそのまま残る。C はマーカーに当たったときだけ出るので洪水にならない。
+ */
+const FINAL_REPORT_RELAY_ENABLED = isRelayEnabled(process.env.EBI_FINAL_REPORT_RELAY);
+
+/**
  * バックエンド既定 env（TUI をインライン描画させる env 等）を注入するか。
  * 何を敷くかは backend が決める（Claude なら CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN 等。
  * 背景の詳細は backends/claude.ts のコメントを参照）。
@@ -365,6 +374,13 @@ export interface AgentHandlers {
    * 1 度だけ呼ばれる。index.ts 側で「kill →同一 id・同一引数で 1 回だけ再 spawn」に配線する。
    */
   onAckFailure?: (id: string, reason: string) => void;
+  /**
+   * [C] 最終報告の自動転送フック（任意）。busy→idle のエッジで、そのターンに出力された
+   * scrollback に所定マーカーの報告ブロック（imagegen_result 等）が在り、かつ本人が
+   * reply_to_master を呼んでいないときに 1 度だけ呼ばれる。
+   * index.ts 側で registry.reverseInject(id, "master", text, "reply") へ配線する。
+   */
+  onFinalReport?: (id: string, report: FinalReport) => void;
 }
 
 /**
@@ -517,6 +533,13 @@ export class Agent {
   private lastReplyAt = 0;
   /** [B] 直近に idle 自動通知を発火した時刻。per-agent クールダウン判定に使う。0 は未発。 */
   private lastIdleNotifyAt = 0;
+  /**
+   * [C] 現ターンの開始位置（scrollback の位置マーク）。busy へ遷移した瞬間に更新し、
+   * idle でこのマーク以降だけを走査する。前のターンで既に転送済みの報告を再送しないための起点。
+   */
+  private turnStartMark = 0;
+  /** [C] 直近に自動転送した報告本文。同一内容の再描画を二重に送らないための控え。 */
+  private lastRelayedReportBody: string | null = null;
 
   // ===== 再アタッチ用スクロールバック（上限付きリングバッファ）=====
   // PTY 出力チャンクを到着順に保持し、UTF-8 バイト換算の合計が上限を超えたら
@@ -1234,6 +1257,9 @@ export class Agent {
   }
 
   private onBusy(): void {
+    // [C] このターンの走査起点。notifyOutput は appendScrollback より先に呼ばれるため、
+    // ここで取ったマークは「busy 化のきっかけになったチャンクを含む」位置になる（意図どおり）。
+    this.turnStartMark = this.scrollbackMark();
     this.handlers.onStatus(this.id, "busy");
   }
 
@@ -1244,9 +1270,39 @@ export class Agent {
     // ready 判定: boot 猶予を過ぎていて idle に達したら ready とみなす。
     this.promoteReadyIfEligible();
     void this.flushQueue();
+    // [C] 最終報告の自動転送（本文ごと拾う保険）。転送できたなら B（中身の無い待機通知）は要らない。
+    if (this.maybeRelayFinalReport()) return;
     // [B] idle 自動通知（保険）。idleDetector は busy→idle のエッジでのみ onIdle を
     // 呼ぶため、ここで判定すれば「同一 idle 区間で 1 回だけ」が自然に担保される。
     this.maybeIdleNotify();
+  }
+
+  /**
+   * [C] 最終報告の自動転送の発火判定。転送したら true。以下を全て満たすときだけ onFinalReport を呼ぶ:
+   *  - 機能が on（EBI_FINAL_REPORT_RELAY）かつ配線されている
+   *  - master/supervisor 以外（自分宛ループを防ぐ）
+   *  - 一度でも ready 済み（起動直後の初期化 idle で誤発火しない）
+   *  - 直近 REPLY_SUPPRESS_MS 内に A（reply_to_master）が無い
+   *    ＝ **本人がツールで報告できたときは何もしない**（二重報告を作らない）
+   *  - 今のターンの出力に所定マーカーの報告ブロックが在る（finalReport.ts の 2 段の錠前）
+   *  - 直前に転送したのと同一本文ではない（再描画の二重送信を防ぐ）
+   */
+  private maybeRelayFinalReport(): boolean {
+    if (!FINAL_REPORT_RELAY_ENABLED || !this.handlers.onFinalReport) return false;
+    if (this.kind === "master" || this.kind === "supervisor") return false;
+    if (!this.hasBeenReady || this.disposed) return false;
+    if (Date.now() - this.lastReplyAt < REPLY_SUPPRESS_MS) return false;
+    const report = extractFinalReport(this.scrollbackSince(this.turnStartMark));
+    if (report === null) return false;
+    if (report.body === this.lastRelayedReportBody) return false;
+    this.lastRelayedReportBody = report.body;
+    const msg =
+      `最終報告の自動転送: ${report.markerId} を検出しました` +
+      `（本人が reply_to_master を呼ばなかったため master へ [reply] で転送します）`;
+    console.log(`[ebi-team] [${this.id}] ${msg}`);
+    this.handlers.onNotice(this.id, msg);
+    this.handlers.onFinalReport(this.id, report);
+    return true;
   }
 
   /**

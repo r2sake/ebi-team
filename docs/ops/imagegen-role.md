@@ -72,6 +72,13 @@ master は **`chat_image({path, title?, caption?})` でそのままボスのチ�
 
 `GEN_TOOL_OFF` の一次診断（ボス／master が手で 2 コマンド）は設計 §6.2 を参照。
 
+### 報告そのものが来ないとき
+
+imagegen エビが `reply_to_master` を呼ばず、`imagegen_result` の YAML を自分の TUI に書いて
+idle になることがある（2026-09-06 の実測で 3/3 再現）。サーバ側の**最終報告の自動転送 [C]**が
+ターン末の出力から報告ブロックを拾って `[reply] [自動転送] …` として届けるので、通常はナッジ不要。
+仕組み・条件・無効化 env は [`codex-final-report-relay.md`](./codex-final-report-relay.md) を参照。
+
 ## 4. 生成物の掃除
 
 codex の画像生成ツールは `~/.codex/generated_images/<uuid>/` を作り続ける（1 枚 ≒ 0.8〜0.9 MB）。
