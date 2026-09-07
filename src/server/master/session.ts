@@ -625,8 +625,9 @@ export class MasterSession {
    * 新しい会話を始める（WS `chatNew`）。
    *
    * ヘッドレス CLI には `/clear` が無いので、**プロセスを止めて `--resume` 無しで起動し直す**。
-   * 文脈（＝CLI 側の会話履歴）だけがリセットされ、UI のトランスクリプトと JSONL は残る
-   * （区切りは notice イベントとして 1 行入る）。設計書 §10 Q-3 の「手動ボタン先行」。
+   * 文脈（＝CLI 側の会話履歴）がリセットされ、区切りとして `cleared` イベントを 1 件流す。
+   * UI はこれを見てトランスクリプトを畳む（＝表示も軽くなる）が、JSONL は追記のままで
+   * 過去は失われない。設計書 §10 Q-3 の「手動ボタン先行」。
    *
    * 自動復帰（scheduleRestart）と競合しないよう、停止中は stopping を立てて exit を吸収する。
    */
@@ -650,7 +651,8 @@ export class MasterSession {
     this.lastSessionId = null;
     this.consecutiveFailures = 0;
     this.costLedger.reset();
-    this.emit({ kind: "notice", level: "info", text: "新しい会話を開始しました（文脈をリセットしました）" });
+    // 区切りは構造化イベントで流す（UI はここでトランスクリプトを畳んで軽くする）。
+    this.emitChat({ kind: "cleared" });
     if (this.stopping) return; // サーバ終了と競合したときは起動し直さない。
     await this.launch(null);
   }

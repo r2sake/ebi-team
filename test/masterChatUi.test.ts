@@ -15,6 +15,8 @@ import {
   InputHistory,
   INPUT_HISTORY_KEY,
   LARGE_PASTE_CHARS,
+  CLEARED_TEXT,
+  MAX_CHAT_ITEMS,
   formatBytes,
   formatContextPct,
   formatCost,
@@ -632,3 +634,143 @@ function collectImagesOf(names: readonly string[]) {
   for (const n of names) t.apply(env({ kind: "image", images: [img(n)] }));
   return collectImages(t.items);
 }
+
+// ===== 表示件数の上限（案 1-b・docs/log-heavy-PLAN.md §4）=====
+
+test("MAX_CHAT_ITEMS はサーバ ring（DEFAULT_SNAPSHOT_LIMIT）と同値の 400", () => {
+  assert.equal(MAX_CHAT_ITEMS, 400);
+});
+
+test("trim(): 上限を超えた分だけ先頭から落ち、落とした件数を返す", () => {
+  const t = fresh();
+  for (let i = 0; i < 10; i += 1) t.apply(env({ kind: "text", text: `m${i}`, partial: false }));
+  assert.equal(t.hasDropped, false);
+
+  assert.equal(t.trim(4), 6);
+  assert.equal(t.items.length, 4);
+  assert.equal(t.items[0]!.kind === "assistant" && t.items[0]!.text, "m6");
+  assert.equal(t.items[3]!.kind === "assistant" && t.items[3]!.text, "m9");
+  assert.equal(t.hasDropped, true);
+
+  // 上限に届いていなければ no-op（落とした件数 0）。
+  assert.equal(t.trim(400), 0);
+  assert.equal(t.items.length, 4);
+});
+
+test("trim(): reset() で「落とした」記録も戻る", () => {
+  const t = fresh();
+  for (let i = 0; i < 5; i += 1) t.apply(env({ kind: "text", text: `m${i}`, partial: false }));
+  t.trim(2);
+  assert.equal(t.hasDropped, true);
+  t.reset([]);
+  assert.equal(t.hasDropped, false);
+  assert.equal(t.items.length, 0);
+});
+
+test("trim(): 追記中の streaming が生き残ったら、続きは同じアイテムへ載る", () => {
+  const t = fresh();
+  for (let i = 0; i < 5; i += 1) t.apply(env({ kind: "text", text: `m${i}`, partial: false }));
+  t.apply(env({ kind: "text", text: "とちゅ", partial: true }));
+
+  // 先頭 4 件を落とす（＝ streaming は index 4 → 0 へずれる）。
+  assert.equal(t.trim(2), 4);
+  const change = t.apply(env({ kind: "text", text: "うまで", partial: true }));
+  assert.equal(t.items.length, 2);
+  assert.deepEqual(change.touched, [1]); // 新規追加ではなく既存 index 1 の更新。
+  assert.equal(change.appendedFrom, -1);
+  assert.equal(t.items[1]!.kind === "assistant" && t.items[1]!.text, "とちゅうまで");
+  // 落とされずに残ったほうが書き換わっていないこと（index ずれの検出）。
+  assert.equal(t.items[0]!.kind === "assistant" && t.items[0]!.text, "m4");
+});
+
+test("trim(): 追記中の streaming だけが残っても index がずれない", () => {
+  const t = fresh();
+  t.apply(env({ kind: "text", text: "きえる", partial: true }));
+  t.apply(env({ kind: "user", text: "boss", attachments: [] })); // ← ここで streaming は閉じる
+  t.apply(env({ kind: "thinking", text: "のこる", partial: true }));
+
+  assert.equal(t.trim(1), 2);
+  assert.equal(t.items.length, 1);
+  const change = t.apply(env({ kind: "thinking", text: "つづき", partial: true }));
+  assert.deepEqual(change.touched, [0]);
+  assert.equal(t.items[0]!.kind === "thinking" && t.items[0]!.text, "のこるつづき");
+});
+
+test("trim(): toolResult / permissionSettled の touched が trim 後の実 index を指す", () => {
+  const t = fresh();
+  for (let i = 0; i < 5; i += 1) t.apply(env({ kind: "text", text: `m${i}`, partial: false }));
+  t.apply(env({ kind: "toolCall", id: "tc1", name: "Bash", input: { command: "ls" } }));
+  t.trim(2); // 残るのは [m4, tool]
+
+  const change = t.apply(env({ kind: "toolResult", id: "tc1", ok: true, content: "done" }));
+  assert.deepEqual(change.touched, [1]);
+  const tool = t.items[1]!;
+  assert.equal(tool.kind === "tool" && tool.state, "ok");
+  assert.equal(t.items[0]!.kind === "assistant" && t.items[0]!.text, "m4");
+});
+
+// ===== cleared（新しい会話の区切り・案 2）=====
+
+test("cleared: それまでの表示を捨てて区切り 1 行だけ残す", () => {
+  const t = fresh();
+  t.apply(env({ kind: "text", text: "むかしのはなし", partial: false }));
+  t.apply(env({ kind: "user", text: "ボスの発言", attachments: [] }));
+  assert.equal(t.items.length, 2);
+
+  const change = t.apply(env({ kind: "cleared" }));
+  assert.equal(t.items.length, 1);
+  assert.deepEqual(change.touched, [0]);
+  assert.equal(change.appendedFrom, 0);
+  assert.equal(change.cleared, true); // DOM 側は全再描画すべき合図。
+  const item = t.items[0]!;
+  assert.equal(item.kind, "notice");
+  assert.equal(item.kind === "notice" && item.text, CLEARED_TEXT);
+});
+
+test("cleared: 追記中の streaming を閉じ、以降の partial は新規アイテムになる", () => {
+  const t = fresh();
+  t.apply(env({ kind: "text", text: "とちゅ", partial: true }));
+  t.apply(env({ kind: "cleared" }));
+  t.apply(env({ kind: "text", text: "あたらしい", partial: true }));
+  assert.equal(t.items.length, 2); // 区切り行 + 新しい発話
+  assert.equal(t.items[1]!.kind === "assistant" && t.items[1]!.text, "あたらしい");
+});
+
+test("cleared: コスト累計と文脈% は 0 から（model は引き継ぐ）", () => {
+  const t = fresh();
+  t.apply(env({ kind: "session", sessionId: "s1", model: "opus", apiKeySource: null, mcpServers: [], capabilities: [] }));
+  t.apply(env({
+    kind: "turnEnd",
+    ok: true,
+    aborted: false,
+    usage: { inputTokens: 0, outputTokens: 0, contextUsedPct: 42 },
+    costUsd: 1.5,
+    totalCostUsd: 3.5,
+    errorText: null,
+  }));
+  assert.equal(t.summary.totalCostUsd, 3.5);
+  assert.equal(t.summary.contextUsedPct, 42);
+
+  t.apply(env({ kind: "cleared" }));
+  assert.equal(t.summary.totalCostUsd, null);
+  assert.equal(t.summary.contextUsedPct, null);
+  assert.equal(t.summary.model, "opus");
+});
+
+test("cleared: snapshot（再接続）から復元しても区切り以降だけが残る", () => {
+  const envelopes: MasterChatEnvelope[] = [];
+  let n = 0;
+  const push = (event: MasterChatEvent) => {
+    n += 1;
+    envelopes.push({ seq: n, ts: 1_700_000_000_000 + n, event });
+  };
+  push({ kind: "text", text: "前の会話", partial: false });
+  push({ kind: "cleared" });
+  push({ kind: "text", text: "新しい会話", partial: false });
+
+  const t = new ChatTranscript();
+  t.reset(envelopes);
+  assert.equal(t.items.length, 2);
+  assert.equal(t.items[0]!.kind === "notice" && t.items[0]!.text, CLEARED_TEXT);
+  assert.equal(t.items[1]!.kind === "assistant" && t.items[1]!.text, "新しい会話");
+});

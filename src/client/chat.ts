@@ -15,6 +15,7 @@ import {
   headerMetrics,
   InputHistory,
   LARGE_PASTE_CHARS,
+  MAX_CHAT_ITEMS,
   NO_RATE_LIMITS,
   oneLine,
   replyable,
@@ -88,6 +89,10 @@ export class ChatPanel {
   private stuckToBottom = true;
   /** 追従を切った後に届いた新着の件数（「⬇ 新着 N 件」ピル用）。 */
   private unseen = 0;
+  /** 予約中の追従スクロール（rAF ハンドル・0 なら未予約）。scrollToBottom() を参照。 */
+  private scrollRaf = 0;
+  /** 「これより前はログファイルにのみ残っています」の行（ログ先頭に 1 本だけ）。 */
+  private moreRow: HTMLElement | null = null;
   /** master の agent id（chatState 受信で確定する）。 */
   private masterId: string | null = null;
   /** アカウント枠（WS `usage` 由来・ヘッダ表示用）。未受信は「—」。 */
@@ -225,6 +230,7 @@ export class ChatPanel {
   /** WS `chatSnapshot`（接続直後・再接続時の一括復元）。 */
   applySnapshot(envelopes: readonly MasterChatEnvelope[], hasMore: boolean): void {
     this.transcript.reset(envelopes);
+    this.transcript.trim(MAX_CHAT_ITEMS);
     // アイテムが総入れ替えになるので、開いていたライトボックスは畳む（key が変わりうる）。
     this.closeLightbox();
     this.renderAll(hasMore);
@@ -236,7 +242,13 @@ export class ChatPanel {
     const change = this.transcript.apply(envelope);
     if (change.touched.length === 0) return;
     const wasBottom = this.stuckToBottom;
-    for (const index of change.touched) this.renderItem(index);
+    if (change.cleared) {
+      // 「新しい会話」の区切り。index が総入れ替えなので増分更新はできない。
+      this.renderAll(false);
+    } else {
+      for (const index of change.touched) this.renderItem(index);
+      this.trimOverflow();
+    }
     this.updateStats();
     // 開いたまま新しい画像が届いたら送り先（と枚数表示）を更新する。
     if (this.lightbox.isOpen) this.syncLightbox();
@@ -541,12 +553,27 @@ export class ChatPanel {
     }
   }
 
+  /**
+   * 最下部へ追従する。
+   *
+   * `scrollHeight` の読み取りは**同期の強制リフロー**なので、DOM を書き換えた直後に呼ぶと
+   * ログ全体のレイアウトが再計算される。ストリーミングは 1 トークンごとにここへ来るため、
+   * 素直に書くと 1 トークンのコストが「溜まったログの量」に比例して伸びる
+   *（実測 3,589 アイテムで 25ms/token・docs/log-heavy-PLAN.md §3）。
+   *
+   * そこで実際のスクロールだけを rAF へ逃がし、**1 フレームに 1 回**へ畳む。
+   * 追従フラグやピルの更新は DOM を読まないので同期のままでよい。
+   */
   private scrollToBottom(force: boolean): void {
     if (!this.visible && !force) return;
-    this.logEl.scrollTop = this.logEl.scrollHeight;
     this.stuckToBottom = true;
     this.unseen = 0;
     this.updatePill();
+    if (this.scrollRaf !== 0) return; // 同じフレームの重複要求は合流させる。
+    this.scrollRaf = requestFrame(() => {
+      this.scrollRaf = 0;
+      this.logEl.scrollTop = this.logEl.scrollHeight;
+    });
   }
 
   private updatePill(): void {
@@ -583,16 +610,42 @@ export class ChatPanel {
     this.updateStats();
   }
 
+  /**
+   * 表示件数の上限を掛け、溢れた分の DOM を捨てる（案 1-b）。
+   *
+   * `rendered` は items と配列 index で 1:1 なので、`ChatTranscript.trim()` が落としたのと
+   * **同じ件数だけ先頭を shift** する。ここを外すと以降の renderItem(index) が
+   * 別の発言を書き換える。
+   */
+  private trimOverflow(): void {
+    const dropped = this.transcript.trim(MAX_CHAT_ITEMS);
+    if (dropped === 0) return;
+    for (let i = 0; i < dropped; i += 1) this.rendered[i]?.remove();
+    this.rendered.splice(0, dropped);
+    this.setMoreRow(true);
+  }
+
+  /** ログ先頭の「これより前は…」行を出し入れする。 */
+  private setMoreRow(show: boolean): void {
+    if (!show) {
+      this.moreRow?.remove();
+      this.moreRow = null;
+      return;
+    }
+    if (this.moreRow?.isConnected) return;
+    // JSONL のページングは未実装。ここでは「もっと前がある」ことだけ示す。
+    const more = div("chat-more");
+    more.textContent = "（これより前の会話はログファイルにのみ残っています）";
+    this.logEl.prepend(more);
+    this.moreRow = more;
+  }
+
   /** snapshot 適用時の全描画。 */
   private renderAll(hasMore: boolean): void {
     this.logEl.innerHTML = "";
     this.rendered.length = 0;
-    if (hasMore) {
-      // JSONL のページングは PR-M4 以降。ここでは「もっと前がある」ことだけ示す。
-      const more = div("chat-more");
-      more.textContent = "（これより前の会話はログファイルにのみ残っています）";
-      this.logEl.appendChild(more);
-    }
+    this.moreRow = null;
+    this.setMoreRow(hasMore || this.transcript.hasDropped);
     for (let i = 0; i < this.transcript.items.length; i += 1) this.renderItem(i);
     this.updateStats();
   }
@@ -1185,4 +1238,13 @@ function safeLocalStorage(): Storage | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * 次フレームへ処理を遅らせる（追従スクロールの合流用）。
+ * `requestAnimationFrame` が無い環境（テスト・非表示タブの一部実装）では setTimeout で代替する。
+ */
+function requestFrame(fn: () => void): number {
+  if (typeof window.requestAnimationFrame === "function") return window.requestAnimationFrame(fn);
+  return window.setTimeout(fn, 16);
 }

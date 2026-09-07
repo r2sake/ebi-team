@@ -459,9 +459,11 @@ test("新しい会話: resume 無しで起動し直し、コスト累計と pend
   // 会話単位の累計コストは 0 に戻り、発話を受け付けられる状態に戻る。
   assert.equal(h.session.totalCostUsd, 0);
   assert.equal(h.session.state, "idle");
-  // 区切りが notice としてトランスクリプトに残る。
-  const texts = h.events.map((e) => (e.event.kind === "notice" ? e.event.text : ""));
-  assert.ok(texts.some((t) => t.includes("新しい会話")));
+  // 区切りが cleared イベントとしてトランスクリプト（ring）に残る＝
+  // 再接続・サーバ再起動後の snapshot 復元でも同じ「区切り済み」状態が再現する。
+  assert.equal(h.events.filter((e) => e.event.kind === "cleared").length, 1);
+  const snap = h.session.snapshot();
+  assert.ok(snap.events.some((e) => e.event.kind === "cleared"));
 });
 
 test("新しい会話の直後も送信できる（新プロセスの stdin へ載る）", async () => {

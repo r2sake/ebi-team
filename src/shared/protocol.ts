@@ -601,6 +601,17 @@ export type MasterChatEvent =
       answer: string | null;
     }
   | { kind: "notice"; level: "info" | "warn" | "error"; text: string }
+  /**
+   * 「新しい会話」（WS `chatNew`）で文脈をリセットした区切り。
+   *
+   * `notice` の 1 行ではなく構造化イベントにしてあるのは、**UI がここでトランスクリプトを
+   * 畳める**ようにするため（それまでの表示を捨てて軽くする）。ring に 1 件残るので、
+   * 再接続・サーバ再起動後の snapshot 復元でも同じ「区切り済み」状態が再現する
+   *（`permissionSettled` と同じ流儀）。JSONL は追記のままで過去は失われない。
+   *
+   * 未知の kind として無視する旧クライアントは、これまでどおり全ログを出し続けるだけ。
+   */
+  | { kind: "cleared" }
   | { kind: "exit"; code: number | null; signal: string | null };
 
 /** seq / ts を付けた配信単位。seq は master セッション内で単調増加（欠落検出用）。 */
