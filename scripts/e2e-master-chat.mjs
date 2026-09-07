@@ -2,6 +2,7 @@
 //   (1) WS `chatSend` → `chatEvent`(text) → `chatEvent`(turnEnd)
 //   (2) POST /control/reverse-inject → `chatEvent`(inbound) → text/turnEnd
 // が **連続 10 回 100%** で成立することを確認する。
+// あわせて「新しい会話」の区切り（`cleared`・docs/log-heavy-PLAN.md 案 2）も見る。
 //
 // 実行（サブスク枠を実際に消費する。既定では走らせない）:
 //   node scripts/e2e-master-chat.mjs
@@ -14,7 +15,7 @@
 //  - モデルは haiku（枠の消費を最小化する）。
 
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -268,6 +269,46 @@ async function main() {
       fail("usage が UsageStore に載らない（contextGuard の入力が欠測）");
     }
     log(`rate limits（rate_limit_event 由来）: ${JSON.stringify(state.usage?.rateLimits ?? null)}`);
+
+    // ---- 「新しい会話」の区切り（cleared・docs/log-heavy-PLAN.md 案 2）----
+    // UI 側の畳み込み（区切り以降だけ表示する）は test/masterChatUi.test.ts の単体で見る。
+    // ここではワイヤと永続の 2 点だけ確認する:
+    //   (a) chatNew で `cleared` が live と再接続 snapshot の両方に載る
+    //   (b) JSONL は切り詰められない（過去は失われない）
+    {
+      const before = state.events.length;
+      const jsonlPath = join(tmpDir, "master-chat.jsonl");
+      const linesBefore = readFileSync(jsonlPath, "utf8").split("\n").filter(Boolean).length;
+
+      client.ws.send(JSON.stringify({ type: "chatNew", id: "master" }));
+      const cleared = await waitEvent(state, before, (e) => e.kind === "cleared", 60_000);
+      if (cleared) ok("chatNew → chatEvent(cleared) が流れる");
+      else fail("chatNew で cleared が流れない");
+
+      // 再接続（新しい WS）した snapshot にも cleared が残る＝リロードしても区切りが再現する。
+      const fresh = await openWs();
+      await sleep(1500);
+      const snap = fresh.state.snapshots[0];
+      const idx = snap ? snap.events.findIndex((e) => e.event.kind === "cleared") : -1;
+      const after = snap ? snap.events.slice(idx + 1) : [];
+      if (idx >= 0 && after.every((e) => e.event.kind !== "cleared")) {
+        ok(`再接続 snapshot に cleared が 1 件残る（区切り以降 ${after.length} 件）`);
+      } else {
+        fail(`再接続 snapshot に cleared が無い（idx=${idx} / events=${snap?.events.length ?? 0}）`);
+      }
+      try {
+        fresh.ws.close();
+      } catch {}
+
+      // JSONL は追記のまま（リセットで消さない）。
+      const linesAfter = readFileSync(jsonlPath, "utf8").split("\n").filter(Boolean).length;
+      if (linesAfter > linesBefore) ok(`JSONL は切り詰められない（${linesBefore} → ${linesAfter} 行）`);
+      else fail(`JSONL が増えていない（${linesBefore} → ${linesAfter} 行）`);
+
+      // 新しいプロセスが idle へ戻るまで待つ（この後の中断チェックの前提）。
+      const until = Date.now() + 60_000;
+      while (Date.now() < until && state.states[state.states.length - 1] !== "idle") await sleep(300);
+    }
 
     // 中断（chatStop）で会話が壊れないこと。
     // エコー係の役割プロンプトに沿う形で「長い本文をそのまま吐かせる」ことでターンを引き延ばす

@@ -99,6 +99,11 @@ export interface ChatChange {
   touched: number[];
   /** touched のうち「新規追加」の先頭 index（無ければ -1）。 */
   appendedFrom: number;
+  /**
+   * `cleared`（新しい会話）でトランスクリプトを畳んだ。
+   * index が総入れ替えになるので、DOM 側は増分ではなく**全再描画**すること。
+   */
+  cleared?: true;
 }
 
 const NO_CHANGE: ChatChange = { touched: [], appendedFrom: -1 };
@@ -257,6 +262,21 @@ export class ChatTranscript {
       case "notice":
         this.closeStream();
         return this.push({ kind: "notice", seq, ts, level: ev.level, text: ev.text });
+      case "cleared": {
+        // 「新しい会話」の区切り。これより前の表示は捨てる（JSONL には残っている）。
+        this.closeStream();
+        this.items.length = 0;
+        // 会話が切り替わる＝コスト累計も文脈% も 0 から。model は引き継ぐ。
+        this.resetStats();
+        this.push({
+          kind: "notice",
+          seq,
+          ts,
+          level: "info",
+          text: CLEARED_TEXT,
+        });
+        return { touched: [0], appendedFrom: 0, cleared: true };
+      }
       case "exit":
         this.closeStream();
         return this.push({
@@ -369,6 +389,10 @@ export class ChatTranscript {
  * 「リロード直後の見え方」と「開きっぱなしの見え方」を揃える。
  */
 export const MAX_CHAT_ITEMS = 400;
+
+/** `cleared` の区切り行に出す文言。 */
+export const CLEARED_TEXT =
+  "🆕 新しい会話を開始しました（文脈をリセットしました。これより前の会話は .ebi-team/master-chat.jsonl にのみ残っています）";
 
 /** usage から文脈使用率(%)を取り出す（算出できない backend は null）。 */
 export function contextPctOf(usage: MasterChatUsage | null): number | null {

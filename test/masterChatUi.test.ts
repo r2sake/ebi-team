@@ -15,6 +15,7 @@ import {
   InputHistory,
   INPUT_HISTORY_KEY,
   LARGE_PASTE_CHARS,
+  CLEARED_TEXT,
   MAX_CHAT_ITEMS,
   formatBytes,
   formatContextPct,
@@ -706,4 +707,70 @@ test("trim(): toolResult / permissionSettled の touched が trim 後の実 inde
   const tool = t.items[1]!;
   assert.equal(tool.kind === "tool" && tool.state, "ok");
   assert.equal(t.items[0]!.kind === "assistant" && t.items[0]!.text, "m4");
+});
+
+// ===== cleared（新しい会話の区切り・案 2）=====
+
+test("cleared: それまでの表示を捨てて区切り 1 行だけ残す", () => {
+  const t = fresh();
+  t.apply(env({ kind: "text", text: "むかしのはなし", partial: false }));
+  t.apply(env({ kind: "user", text: "ボスの発言", attachments: [] }));
+  assert.equal(t.items.length, 2);
+
+  const change = t.apply(env({ kind: "cleared" }));
+  assert.equal(t.items.length, 1);
+  assert.deepEqual(change.touched, [0]);
+  assert.equal(change.appendedFrom, 0);
+  assert.equal(change.cleared, true); // DOM 側は全再描画すべき合図。
+  const item = t.items[0]!;
+  assert.equal(item.kind, "notice");
+  assert.equal(item.kind === "notice" && item.text, CLEARED_TEXT);
+});
+
+test("cleared: 追記中の streaming を閉じ、以降の partial は新規アイテムになる", () => {
+  const t = fresh();
+  t.apply(env({ kind: "text", text: "とちゅ", partial: true }));
+  t.apply(env({ kind: "cleared" }));
+  t.apply(env({ kind: "text", text: "あたらしい", partial: true }));
+  assert.equal(t.items.length, 2); // 区切り行 + 新しい発話
+  assert.equal(t.items[1]!.kind === "assistant" && t.items[1]!.text, "あたらしい");
+});
+
+test("cleared: コスト累計と文脈% は 0 から（model は引き継ぐ）", () => {
+  const t = fresh();
+  t.apply(env({ kind: "session", sessionId: "s1", model: "opus", apiKeySource: null, mcpServers: [], capabilities: [] }));
+  t.apply(env({
+    kind: "turnEnd",
+    ok: true,
+    aborted: false,
+    usage: { inputTokens: 0, outputTokens: 0, contextUsedPct: 42 },
+    costUsd: 1.5,
+    totalCostUsd: 3.5,
+    errorText: null,
+  }));
+  assert.equal(t.summary.totalCostUsd, 3.5);
+  assert.equal(t.summary.contextUsedPct, 42);
+
+  t.apply(env({ kind: "cleared" }));
+  assert.equal(t.summary.totalCostUsd, null);
+  assert.equal(t.summary.contextUsedPct, null);
+  assert.equal(t.summary.model, "opus");
+});
+
+test("cleared: snapshot（再接続）から復元しても区切り以降だけが残る", () => {
+  const envelopes: MasterChatEnvelope[] = [];
+  let n = 0;
+  const push = (event: MasterChatEvent) => {
+    n += 1;
+    envelopes.push({ seq: n, ts: 1_700_000_000_000 + n, event });
+  };
+  push({ kind: "text", text: "前の会話", partial: false });
+  push({ kind: "cleared" });
+  push({ kind: "text", text: "新しい会話", partial: false });
+
+  const t = new ChatTranscript();
+  t.reset(envelopes);
+  assert.equal(t.items.length, 2);
+  assert.equal(t.items[0]!.kind === "notice" && t.items[0]!.text, CLEARED_TEXT);
+  assert.equal(t.items[1]!.kind === "assistant" && t.items[1]!.text, "新しい会話");
 });

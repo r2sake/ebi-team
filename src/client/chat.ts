@@ -242,8 +242,13 @@ export class ChatPanel {
     const change = this.transcript.apply(envelope);
     if (change.touched.length === 0) return;
     const wasBottom = this.stuckToBottom;
-    for (const index of change.touched) this.renderItem(index);
-    this.trimOverflow();
+    if (change.cleared) {
+      // 「新しい会話」の区切り。index が総入れ替えなので増分更新はできない。
+      this.renderAll(false);
+    } else {
+      for (const index of change.touched) this.renderItem(index);
+      this.trimOverflow();
+    }
     this.updateStats();
     // 開いたまま新しい画像が届いたら送り先（と枚数表示）を更新する。
     if (this.lightbox.isOpen) this.syncLightbox();
