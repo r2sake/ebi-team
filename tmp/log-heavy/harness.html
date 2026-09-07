@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <title>log-heavy 計測ハーネス</title>
+    <link rel="stylesheet" href="/src/client/style.css" />
+    <style>
+      html, body { height: 100%; margin: 0; }
+      #chat { position: absolute; inset: 0; display: flex; flex-direction: column; }
+    </style>
+  </head>
+  <body>
+    <div id="chat"></div>
+    <script type="module">
+      import { ChatPanel } from "/src/client/chat.ts";
+      const panel = new ChatPanel(document.getElementById("chat"), () => {}, () => {}, () => {}, () => {});
+      panel.applyState("master", "idle", 0);
+      panel.setVisible(true);
+      window.__panel = panel;
+      window.__measure = async (n) => {
+        const events = await (await fetch(`/tmp/log-heavy/events-${n}.json`)).json();
+        const t0 = performance.now();
+        panel.applySnapshot(events, false);
+        const t1 = performance.now();
+        // レイアウト確定まで含める。
+        document.querySelector(".chat-log").getBoundingClientRect();
+        const t2 = performance.now();
+        return {
+          n,
+          items: panel.transcript.items.length,
+          domNodes: document.querySelectorAll("*").length,
+          logNodes: document.querySelector(".chat-log").querySelectorAll("*").length,
+          logRows: document.querySelector(".chat-log").children.length,
+          scrollHeight: document.querySelector(".chat-log").scrollHeight,
+          textLen: document.querySelector(".chat-log").textContent.length,
+          renderMs: +(t1 - t0).toFixed(1),
+          layoutMs: +(t2 - t1).toFixed(1),
+          heapMB: performance.memory ? +(performance.memory.usedJSHeapSize / 1048576).toFixed(1) : null,
+        };
+      };
+      // ストリーミング 1 トークン分の再描画コスト（末尾の assistant を伸ばす）。
+      window.__stream = (tokens) => {
+        const last = panel.transcript.items[panel.transcript.items.length - 1];
+        let seq = 9_000_000;
+        const t0 = performance.now();
+        for (let i = 0; i < tokens; i++) {
+          panel.applyEvent({ seq: seq++, ts: Date.now(), event: { kind: "text", text: "あいうえお ", partial: true } });
+        }
+        const t1 = performance.now();
+        return { tokens, totalMs: +(t1 - t0).toFixed(1), perTokenMs: +((t1 - t0) / tokens).toFixed(2) };
+      };
+    </script>
+  </body>
+</html>
+<script type="module">
+  // 追加計測: 主因の切り分け（末尾追従 OFF / markdown 再パース単体）。
+  window.__streamNoFollow = (tokens) => {
+    const panel = window.__panel;
+    panel.stuckToBottom = false;
+    let seq = 8_000_000;
+    const t0 = performance.now();
+    for (let i = 0; i < tokens; i++) {
+      panel.applyEvent({ seq: seq++, ts: Date.now(), event: { kind: "text", text: "あいうえお ", partial: true } });
+    }
+    const t1 = performance.now();
+    panel.stuckToBottom = true;
+    return { tokens, perTokenMs: +((t1 - t0) / tokens).toFixed(2) };
+  };
+  window.__scrollCost = (times) => {
+    const log = document.querySelector(".chat-log");
+    const t0 = performance.now();
+    for (let i = 0; i < times; i++) { log.scrollTop = log.scrollHeight; }
+    const t1 = performance.now();
+    return { times, perCallMs: +((t1 - t0) / times).toFixed(2) };
+  };
+</script>
