@@ -22,7 +22,8 @@
         const t0 = performance.now();
         panel.applySnapshot(events, false);
         const t1 = performance.now();
-        // レイアウト確定まで含める。
+        // レイアウト確定まで含める（rAF 化した追従スクロールもここで消化される）。
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
         document.querySelector(".chat-log").getBoundingClientRect();
         const t2 = performance.now();
         return {
@@ -48,6 +49,23 @@
         }
         const t1 = performance.now();
         return { tokens, totalMs: +(t1 - t0).toFixed(1), perTokenMs: +((t1 - t0) / tokens).toFixed(2) };
+      };
+      // ストリーミング N トークン + 「その後 1 フレーム確定するまで」を含めた実コスト。
+      // rAF 化すると同期ループから追い出されるので、比較にはこちらを使う。
+      window.__streamFrame = async (tokens) => {
+        let seq = panel.transcript.lastAppliedSeq + 1;
+        const t0 = performance.now();
+        for (let i = 0; i < tokens; i++) {
+          panel.applyEvent({ seq: seq++, ts: Date.now(), event: { kind: "text", text: "あいうえお ", partial: true } });
+        }
+        const loopMs = performance.now() - t0;
+        await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+        const totalMs = performance.now() - t0;
+        return {
+          tokens,
+          loopPerTokenMs: +(loopMs / tokens).toFixed(2),
+          totalPerTokenMs: +(totalMs / tokens).toFixed(2),
+        };
       };
     </script>
   </body>

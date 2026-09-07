@@ -88,6 +88,8 @@ export class ChatPanel {
   private stuckToBottom = true;
   /** 追従を切った後に届いた新着の件数（「⬇ 新着 N 件」ピル用）。 */
   private unseen = 0;
+  /** 予約中の追従スクロール（rAF ハンドル・0 なら未予約）。scrollToBottom() を参照。 */
+  private scrollRaf = 0;
   /** master の agent id（chatState 受信で確定する）。 */
   private masterId: string | null = null;
   /** アカウント枠（WS `usage` 由来・ヘッダ表示用）。未受信は「—」。 */
@@ -541,12 +543,27 @@ export class ChatPanel {
     }
   }
 
+  /**
+   * 最下部へ追従する。
+   *
+   * `scrollHeight` の読み取りは**同期の強制リフロー**なので、DOM を書き換えた直後に呼ぶと
+   * ログ全体のレイアウトが再計算される。ストリーミングは 1 トークンごとにここへ来るため、
+   * 素直に書くと 1 トークンのコストが「溜まったログの量」に比例して伸びる
+   *（実測 3,589 アイテムで 25ms/token・docs/log-heavy-PLAN.md §3）。
+   *
+   * そこで実際のスクロールだけを rAF へ逃がし、**1 フレームに 1 回**へ畳む。
+   * 追従フラグやピルの更新は DOM を読まないので同期のままでよい。
+   */
   private scrollToBottom(force: boolean): void {
     if (!this.visible && !force) return;
-    this.logEl.scrollTop = this.logEl.scrollHeight;
     this.stuckToBottom = true;
     this.unseen = 0;
     this.updatePill();
+    if (this.scrollRaf !== 0) return; // 同じフレームの重複要求は合流させる。
+    this.scrollRaf = requestFrame(() => {
+      this.scrollRaf = 0;
+      this.logEl.scrollTop = this.logEl.scrollHeight;
+    });
   }
 
   private updatePill(): void {
@@ -1185,4 +1202,13 @@ function safeLocalStorage(): Storage | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * 次フレームへ処理を遅らせる（追従スクロールの合流用）。
+ * `requestAnimationFrame` が無い環境（テスト・非表示タブの一部実装）では setTimeout で代替する。
+ */
+function requestFrame(fn: () => void): number {
+  if (typeof window.requestAnimationFrame === "function") return window.requestAnimationFrame(fn);
+  return window.setTimeout(fn, 16);
 }
