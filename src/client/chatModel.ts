@@ -109,6 +109,8 @@ const NO_CHANGE: ChatChange = { touched: [], appendedFrom: -1 };
  */
 export class ChatTranscript {
   readonly items: ChatItem[] = [];
+  /** trim() で先頭から落とした累計件数（UI の「これより前は…」行の出し分け用）。 */
+  private droppedCount = 0;
   private stats: ChatStats = { model: null, totalCostUsd: null, contextUsedPct: null };
   /** 直近に受けた seq（重複配信を捨てるため）。 */
   private lastSeq = 0;
@@ -135,6 +137,7 @@ export class ChatTranscript {
   /** snapshot で総入れ替えする（再接続・初回接続）。 */
   reset(envelopes: readonly MasterChatEnvelope[]): void {
     this.items.length = 0;
+    this.droppedCount = 0;
     this.stats = { model: null, totalCostUsd: null, contextUsedPct: null };
     this.lastSeq = 0;
     this.openStream = -1;
@@ -328,12 +331,44 @@ export class ChatTranscript {
     this.openStream = -1;
   }
 
+  /**
+   * 表示件数の上限を掛ける（先頭から溢れた分を落とす）。落とした件数を返す。
+   *
+   * サーバの ring は 400 件で有界だが、タブを開きっぱなしにすると live イベントが
+   * 際限なく積もる（＝ DOM も無限に増える）。ここで items 側にも同じ上限を掛ける。
+   *
+   * **index の整合が肝**: `openStream` は items の配列 index なので、落とした件数だけ
+   * 前へずらす（落とした側に居たら「閉じた」扱いにする）。呼び出し側（ChatPanel）も
+   * items と 1:1 で並ぶ `rendered` を同じ件数だけ shift しないと、別の発言が
+   * 書き換わる不具合になる。
+   */
+  trim(max: number): number {
+    const drop = this.items.length - Math.max(1, max);
+    if (drop <= 0) return 0;
+    this.items.splice(0, drop);
+    this.droppedCount += drop;
+    if (this.openStream >= 0) this.openStream = this.openStream >= drop ? this.openStream - drop : -1;
+    return drop;
+  }
+
+  /** trim() で落としたアイテムがあるか（あれば UI は「これより前は…」行を出す）。 */
+  get hasDropped(): boolean {
+    return this.droppedCount > 0;
+  }
+
   private push(item: ChatItem): ChatChange {
     this.items.push(item);
     const index = this.items.length - 1;
     return { touched: [index], appendedFrom: index };
   }
 }
+
+/**
+ * クライアント側で保持する表示アイテムの上限。
+ * サーバの ring（`DEFAULT_SNAPSHOT_LIMIT`）と同値にしてある＝
+ * 「リロード直後の見え方」と「開きっぱなしの見え方」を揃える。
+ */
+export const MAX_CHAT_ITEMS = 400;
 
 /** usage から文脈使用率(%)を取り出す（算出できない backend は null）。 */
 export function contextPctOf(usage: MasterChatUsage | null): number | null {

@@ -15,6 +15,7 @@ import {
   InputHistory,
   INPUT_HISTORY_KEY,
   LARGE_PASTE_CHARS,
+  MAX_CHAT_ITEMS,
   formatBytes,
   formatContextPct,
   formatCost,
@@ -632,3 +633,77 @@ function collectImagesOf(names: readonly string[]) {
   for (const n of names) t.apply(env({ kind: "image", images: [img(n)] }));
   return collectImages(t.items);
 }
+
+// ===== 表示件数の上限（案 1-b・docs/log-heavy-PLAN.md §4）=====
+
+test("MAX_CHAT_ITEMS はサーバ ring（DEFAULT_SNAPSHOT_LIMIT）と同値の 400", () => {
+  assert.equal(MAX_CHAT_ITEMS, 400);
+});
+
+test("trim(): 上限を超えた分だけ先頭から落ち、落とした件数を返す", () => {
+  const t = fresh();
+  for (let i = 0; i < 10; i += 1) t.apply(env({ kind: "text", text: `m${i}`, partial: false }));
+  assert.equal(t.hasDropped, false);
+
+  assert.equal(t.trim(4), 6);
+  assert.equal(t.items.length, 4);
+  assert.equal(t.items[0]!.kind === "assistant" && t.items[0]!.text, "m6");
+  assert.equal(t.items[3]!.kind === "assistant" && t.items[3]!.text, "m9");
+  assert.equal(t.hasDropped, true);
+
+  // 上限に届いていなければ no-op（落とした件数 0）。
+  assert.equal(t.trim(400), 0);
+  assert.equal(t.items.length, 4);
+});
+
+test("trim(): reset() で「落とした」記録も戻る", () => {
+  const t = fresh();
+  for (let i = 0; i < 5; i += 1) t.apply(env({ kind: "text", text: `m${i}`, partial: false }));
+  t.trim(2);
+  assert.equal(t.hasDropped, true);
+  t.reset([]);
+  assert.equal(t.hasDropped, false);
+  assert.equal(t.items.length, 0);
+});
+
+test("trim(): 追記中の streaming が生き残ったら、続きは同じアイテムへ載る", () => {
+  const t = fresh();
+  for (let i = 0; i < 5; i += 1) t.apply(env({ kind: "text", text: `m${i}`, partial: false }));
+  t.apply(env({ kind: "text", text: "とちゅ", partial: true }));
+
+  // 先頭 4 件を落とす（＝ streaming は index 4 → 0 へずれる）。
+  assert.equal(t.trim(2), 4);
+  const change = t.apply(env({ kind: "text", text: "うまで", partial: true }));
+  assert.equal(t.items.length, 2);
+  assert.deepEqual(change.touched, [1]); // 新規追加ではなく既存 index 1 の更新。
+  assert.equal(change.appendedFrom, -1);
+  assert.equal(t.items[1]!.kind === "assistant" && t.items[1]!.text, "とちゅうまで");
+  // 落とされずに残ったほうが書き換わっていないこと（index ずれの検出）。
+  assert.equal(t.items[0]!.kind === "assistant" && t.items[0]!.text, "m4");
+});
+
+test("trim(): 追記中の streaming だけが残っても index がずれない", () => {
+  const t = fresh();
+  t.apply(env({ kind: "text", text: "きえる", partial: true }));
+  t.apply(env({ kind: "user", text: "boss", attachments: [] })); // ← ここで streaming は閉じる
+  t.apply(env({ kind: "thinking", text: "のこる", partial: true }));
+
+  assert.equal(t.trim(1), 2);
+  assert.equal(t.items.length, 1);
+  const change = t.apply(env({ kind: "thinking", text: "つづき", partial: true }));
+  assert.deepEqual(change.touched, [0]);
+  assert.equal(t.items[0]!.kind === "thinking" && t.items[0]!.text, "のこるつづき");
+});
+
+test("trim(): toolResult / permissionSettled の touched が trim 後の実 index を指す", () => {
+  const t = fresh();
+  for (let i = 0; i < 5; i += 1) t.apply(env({ kind: "text", text: `m${i}`, partial: false }));
+  t.apply(env({ kind: "toolCall", id: "tc1", name: "Bash", input: { command: "ls" } }));
+  t.trim(2); // 残るのは [m4, tool]
+
+  const change = t.apply(env({ kind: "toolResult", id: "tc1", ok: true, content: "done" }));
+  assert.deepEqual(change.touched, [1]);
+  const tool = t.items[1]!;
+  assert.equal(tool.kind === "tool" && tool.state, "ok");
+  assert.equal(t.items[0]!.kind === "assistant" && t.items[0]!.text, "m4");
+});
