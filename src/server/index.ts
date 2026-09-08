@@ -696,6 +696,8 @@ const controlApi = createControlApi({
   },
   // 承認/質問（PR-M5）。claude の --permission-prompt-tool → 制御MCP → ここ。
   // ボスが UI で答えるまで resolve しない（未応答は待ち続ける・自動拒否しない）。
+  // 「未応答 N 件」の再同期（孤児の破棄）。サーバ再起動なしで UI を実体へ戻す口。
+  resyncChatPending: () => (masterSession ? masterSession.resyncPending() : 0),
   requestChatPermission: async (req, signal) => {
     if (!masterSession) throw new Error('承認 UI は ui:"chat" の master が居るときだけ使えます');
     return masterSession.handlePermissionRequest(

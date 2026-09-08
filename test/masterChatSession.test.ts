@@ -584,6 +584,43 @@ test("answer() は brain へそのまま委譲し、pending は settled イベ�
   await h.session.stop();
 });
 
+test("同じ id の question が二重に来ても pending は 1 のまま・settled 1 回で 0 に戻る", async () => {
+  // pending をイベントの加減算で数えていると +2 −1 = 1 が残り、UI に幽霊カードが居座る。
+  const h = makeSession();
+  await h.session.start();
+  const brain = h.brains[0]!;
+  brain.emit({ kind: "question", id: "q#0", header: "H", question: "Q", options: [], multi: false });
+  brain.emit({ kind: "question", id: "q#0", header: "H", question: "Q", options: [], multi: false });
+  await waitEvents(h, h.events.length + 2);
+  assert.equal(h.session.pendingCount, 1, "同じ id は 1 件としてだけ数える");
+
+  brain.emit({ kind: "permissionSettled", id: "q#0", outcome: "discarded", answer: null });
+  await waitEvents(h, h.events.length + 1);
+  assert.equal(h.session.pendingCount, 0);
+  await h.session.stop();
+});
+
+test("resyncPending は台帳に無い孤児だけを discarded で畳む", async () => {
+  const h = makeSession();
+  await h.session.start();
+  const brain = h.brains[0]!;
+  await h.session.sendUserText("やって");
+  brain.emit({ kind: "question", id: "ghost#0", header: "H", question: "Q", options: [], multi: false });
+  await waitEvents(h, h.events.length + 1);
+  assert.equal(h.session.pendingCount, 1);
+  assert.equal(h.session.state, "waiting");
+
+  // FakeBrain は pendingPermissionIds を持たない＝ブローカ側の保留は 0（＝全部孤児）。
+  assert.equal(h.session.resyncPending(), 1);
+  assert.equal(h.session.pendingCount, 0);
+  assert.equal(h.session.state, "busy");
+  const last = h.events.at(-1)!.event;
+  assert.deepEqual(last, { kind: "permissionSettled", id: "ghost#0", outcome: "discarded", answer: null });
+  assert.match(h.notices.at(-1) ?? "", /孤立していた未応答の承認\/質問 1 件/);
+  assert.equal(h.session.resyncPending(), 0, "二度目は何も畳まない");
+  await h.session.stop();
+});
+
 test("exit のあとに破棄が来ても stopped を busy へ上書きしない", async () => {
   const h = makeSession();
   await h.session.start();

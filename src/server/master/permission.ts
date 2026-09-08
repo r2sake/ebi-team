@@ -142,6 +142,19 @@ export interface PermissionBrokerHandlers {
   onNotice(text: string): void;
 }
 
+/**
+ * 同じ reqId で待っている HTTP 呼び出し 1 本ぶん。
+ *
+ * 同一 tool_use_id の要求が 2 回届くことが実際にある（2026-09-08 の実事象。
+ * MCP 側の permission_prompt が 29ms 差で 2 回 `POST /control/chat-permission` を投げた）。
+ * 台帳は reqId ごとに 1 件だけ持ち、待ち手だけを束ねる。
+ */
+interface PendingWaiter {
+  settle(decision: MasterPermissionDecision): void;
+  /** この待ち手の HTTP 接続が切れたか（abort 済み）。 */
+  gone: boolean;
+}
+
 interface PendingRequest {
   /** 質問なら questions、承認なら null。 */
   questions: ParsedQuestion[] | null;
@@ -151,7 +164,8 @@ interface PendingRequest {
   answers: (MasterAnswer | null)[];
   /** 各スロットの UI 上の id（承認は [reqId]、質問は [reqId#0, …]）。 */
   slotIds: string[];
-  settle(decision: MasterPermissionDecision): void;
+  /** 決定を返す先（同一 reqId の重複要求ぶんだけ増える）。 */
+  waiters: PendingWaiter[];
   /** 既に決着済みか（多重 settle を防ぐ）。 */
   done: boolean;
 }
@@ -189,44 +203,35 @@ export class PermissionBroker {
     this.counter += 1;
     // tool_use_id があればそれを使う（UI のツールバブルと同じ id で並ぶ）。
     const reqId = req.toolUseId && req.toolUseId.length > 0 ? req.toolUseId : `perm-${this.counter}`;
-    const questions =
-      req.toolName === ASK_USER_QUESTION_TOOL ? parseAskUserQuestionInput(req.input) : null;
 
     return new Promise<MasterPermissionDecision>((resolve) => {
-      const slotIds = questions
-        ? questions.map((_, i) => `${reqId}#${i}`)
-        : [reqId];
+      const waiter: PendingWaiter = { settle: resolve, gone: false };
+
+      // 同じ reqId が既に保留中なら**新規登録しない**（UI へ二重に出さない）。
+      // 待ち手だけを足して、決定は両方の HTTP へ同じものを返す。
+      const known = this.requests.get(reqId);
+      if (known && !known.done) {
+        known.waiters.push(waiter);
+        this.bindAbort(reqId, known, waiter, signal);
+        return;
+      }
+
+      const questions =
+        req.toolName === ASK_USER_QUESTION_TOOL ? parseAskUserQuestionInput(req.input) : null;
+      const slotIds = questions ? questions.map((_, i) => `${reqId}#${i}`) : [reqId];
       const entry: PendingRequest = {
         questions,
         input: req.input,
         toolName: req.toolName,
         answers: slotIds.map(() => null),
         slotIds,
-        settle: resolve,
+        waiters: [waiter],
         done: false,
       };
       this.requests.set(reqId, entry);
       for (const id of slotIds) this.slotOwner.set(id, reqId);
 
-      if (signal) {
-        if (signal.aborted) {
-          this.finish(reqId, { behavior: "deny", message: "要求が取り消されました" }, "discarded", null);
-          return;
-        }
-        signal.addEventListener(
-          "abort",
-          () => {
-            if (entry.done) return;
-            this.finish(
-              reqId,
-              { behavior: "deny", message: "要求が取り消されました" },
-              "discarded",
-              null,
-            );
-          },
-          { once: true },
-        );
-      }
+      if (this.bindAbort(reqId, entry, waiter, signal)) return; // 既に切れていた
 
       if (questions) {
         questions.forEach((q, i) => {
@@ -242,6 +247,36 @@ export class PermissionBroker {
         this.handlers.onPermission({ id: reqId, toolName: req.toolName, input: req.input });
       }
     });
+  }
+
+  /**
+   * 待ち手 1 本の HTTP 切断を保留へ結びつける。
+   *
+   * **全部の待ち手が切れたときにだけ**保留を破棄する（1 本が諦めただけでボスの
+   * 回答待ちを畳むと、生きている方の要求も道連れになる）。
+   * 既に abort 済みで保留ごと畳んだ場合は true を返す。
+   */
+  private bindAbort(
+    reqId: string,
+    entry: PendingRequest,
+    waiter: PendingWaiter,
+    signal: AbortSignal | undefined,
+  ): boolean {
+    if (!signal) return false;
+    const onAbort = (): void => {
+      if (entry.done || waiter.gone) return;
+      waiter.gone = true;
+      // この待ち手には即座に返す（相手はもう聞いていないが Promise を宙に浮かせない）。
+      waiter.settle({ behavior: "deny", message: "要求が取り消されました" });
+      if (entry.waiters.some((w) => !w.gone)) return; // 他の接続はまだ生きている
+      this.finish(reqId, { behavior: "deny", message: "要求が取り消されました" }, "discarded", null);
+    };
+    if (signal.aborted) {
+      onAbort();
+      return entry.done || waiter.gone;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+    return false;
   }
 
   /**
@@ -275,7 +310,7 @@ export class PermissionBroker {
     if (entry.answers.some((a) => a == null)) return; // まだ残りの質問がある
     entry.done = true;
     this.requests.delete(reqId);
-    entry.settle(buildQuestionDecision(entry.input, entry.questions, entry.answers));
+    settleAll(entry, buildQuestionDecision(entry.input, entry.questions, entry.answers));
   }
 
   /**
@@ -308,6 +343,15 @@ export class PermissionBroker {
       if (!this.slotOwner.delete(id)) continue;
       this.handlers.onSettled({ id, outcome, answer });
     }
-    entry.settle(decision);
+    settleAll(entry, decision);
+  }
+}
+
+/** 同じ reqId で待っている全 HTTP 呼び出しへ同じ決定を返す。 */
+function settleAll(entry: PendingRequest, decision: MasterPermissionDecision): void {
+  for (const w of entry.waiters) {
+    if (w.gone) continue; // 既に切断で返してある
+    w.gone = true;
+    w.settle(decision);
   }
 }

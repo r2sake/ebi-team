@@ -219,6 +219,13 @@ export interface ControlDeps {
         signal: AbortSignal,
       ) => Promise<unknown>)
     | null;
+  /**
+   * 未応答の承認/質問を台帳へ再同期する（`POST /control/chat-pending-resync` の実体）。
+   *
+   * UI にだけ残った孤児（ブローカ側にはもう無い保留）を破棄して「未応答 N 件」を戻す。
+   * サーバ再起動 / 「新しい会話」を使わずに直すための逃げ道。畳んだ件数を返す。
+   */
+  resyncChatPending: (() => number) | null;
 }
 
 /** JSON レスポンスを返すヘルパー。 */
@@ -718,6 +725,18 @@ export function createControlApi(deps: ControlDeps) {
         );
         if (res.writableEnded) return true; // 既に切断済み
         sendJson(res, 200, decision);
+        return true;
+      }
+
+      // ---- POST /control/chat-pending-resync ----
+      // 「未応答 N 件」が実体（ブローカの台帳）とずれたときの復旧口。孤児だけを
+      // discarded で畳む。答えられる保留には触らない（勝手に拒否しない）。
+      if (pathname === "/control/chat-pending-resync" && method === "POST") {
+        if (!deps.resyncChatPending) {
+          sendJson(res, 404, { error: '再同期は ui:"chat" の master が居るときだけ使えます' });
+          return true;
+        }
+        sendJson(res, 200, { discarded: deps.resyncChatPending() });
         return true;
       }
 

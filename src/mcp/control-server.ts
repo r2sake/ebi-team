@@ -31,6 +31,7 @@ import { ALL_BACKEND_IDS } from "../server/backends/index.ts";
 import { loadRawCustomRoles } from "../server/config.ts";
 import { deliveryText } from "../shared/deliveryTag.ts";
 import { resolveConfigPath } from "./configPath.ts";
+import { postLongPoll } from "./longPoll.ts";
 
 const CONTROL_URL = (process.env.EBI_CONTROL_URL ?? "http://127.0.0.1:8787").replace(/\/$/, "");
 
@@ -295,12 +296,13 @@ server.tool(
     tool_use_id: z.string().optional().describe("対応する tool_use の id"),
   },
   async ({ tool_name, input, tool_use_id }, extra) => {
-    const r = await callControl(
-      "POST",
-      "/control/chat-permission",
-      { tool_name, input, tool_use_id },
-      extra?.signal,
-    );
+    // fetch（undici）は headersTimeout 300 秒で `fetch failed` になるため使わない。
+    // 承認待ちは無限に続きうるので node:http の long-poll で待つ（longPoll.ts 参照）。
+    const path = "/control/chat-permission";
+    const payload = { tool_name, input, tool_use_id };
+    const r =
+      (await postLongPoll(`${CONTROL_URL}${path}`, payload, extra?.signal)) ??
+      (await callControl("POST", path, payload, extra?.signal));
     if (!r.ok) {
       // 承認 UI へ到達できないときは**拒否**に倒す（黙って実行させない）。
       return textResult(
