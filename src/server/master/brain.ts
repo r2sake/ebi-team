@@ -171,6 +171,11 @@ export interface MasterBrain {
   ): Promise<MasterPermissionDecision>;
   /** 未応答の承認/質問の件数（UI のスティッキーバー用）。 */
   readonly pendingPermissions?: number;
+  /**
+   * 未応答の承認/質問の id 一覧（＝ブローカの台帳そのもの）。
+   * 「UI には残っているがブローカにはもう無い」孤児を洗い出す再同期に使う。
+   */
+  readonly pendingPermissionIds?: readonly string[];
   /** 実行中ターンの中断（会話は殺さない）。 */
   interrupt(): Promise<void>;
   /** 再開に必要な id（プロセス死亡後の resume 用に呼び出し側が永続化する）。 */

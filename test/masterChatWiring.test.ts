@@ -314,6 +314,7 @@ async function withControlApi(
     readChatAttachment: null,
     shareChatImage: deps.shareChatImage,
     requestChatPermission: null,
+    resyncChatPending: null,
   });
 
   const server = createServer(async (req, res) => {
