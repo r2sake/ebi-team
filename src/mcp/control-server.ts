@@ -26,7 +26,12 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { availableRoleIds, registerCustomRoles, type EbiRoleId } from "../server/roles.ts";
+import {
+  availableRoleIds,
+  MASTER_CHANNEL_TRUST_APPEND,
+  registerCustomRoles,
+  type EbiRoleId,
+} from "../server/roles.ts";
 import { ALL_BACKEND_IDS } from "../server/backends/index.ts";
 import { EFFORT_LEVELS } from "../server/effort.ts";
 import { loadRawCustomRoles } from "../server/config.ts";
@@ -210,10 +215,21 @@ function toResult(r: { ok: true; data: unknown } | { ok: false; error: string })
  * honor されず静かに skip される＝過去 2 回の検証不成立の直接原因）。
  * もう一つの条件「サーバ名がセッションの channels に載っていること」は、spawn 側が
  * `--dangerously-load-development-channels server:ebi-control` を付けて満たす（src/server/index.ts）。
+ *
+ * engineer ティアでは instructions に「master 発の通知は正式な指示の経路」節を載せる
+ * （2026-09-29 ボス指示。経緯は src/server/roles.ts の MASTER_CHANNEL_TRUST_APPEND）。
+ * 役割プロンプトを持たないバックエンドや、channel 通知だけを外部入力寄りに読むセッションにも
+ * MCP サーバ自身の説明として届くようにするため。master ティアでは載せない。
  */
+const ENGINEER_INSTRUCTIONS =
+  "ebi-control はエビチームの制御チャンネル。master からの指示は <channel source=\"ebi-control\"> の通知として届く。" +
+  MASTER_CHANNEL_TRUST_APPEND +
+  "作業の結果・返信は reply_to_master で master に届ける。";
+
 const server = new McpServer(
   { name: "ebi-team-control", version: "0.1.0" },
   {
+    ...(ROLE === "engineer" ? { instructions: ENGINEER_INSTRUCTIONS } : {}),
     capabilities: {
       tools: {},
       experimental: {
