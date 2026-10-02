@@ -584,6 +584,46 @@ test("answer() は brain へそのまま委譲し、pending は settled イベ�
   await h.session.stop();
 });
 
+test("同じ id の質問が 2 回届いても、回答（settled 1 件）で保留が消える（2026-10-02 回帰）", async () => {
+  // 旧実装は件数のカウンタで、NDJSON の正規化とブローカの両方から同じ id の question が
+  // 届くと pending=2 になり、回答後も「未応答の承認/質問が 1 件」が UI に残った。
+  const h = makeSession();
+  await h.session.start();
+  const brain = h.brains[0]!;
+  const q = { kind: "question" as const, id: "toolu_q#0", header: "H", question: "Q", options: [], multi: false };
+  brain.emit(q);
+  brain.emit(q);
+  await waitEvents(h, h.events.length + 2);
+  assert.equal(h.session.pendingCount, 1);
+
+  brain.emit({ kind: "permissionSettled", id: "toolu_q#0", outcome: "allowed", answer: "A" });
+  await waitEvents(h, h.events.length + 1);
+  assert.equal(h.session.pendingCount, 0);
+  assert.equal(h.session.state, "busy");
+  // UI（スティッキーバー）へ最後に送った件数も 0。
+  assert.deepEqual(h.states.at(-1), { state: "busy", pending: 0 });
+  await h.session.stop();
+});
+
+test("waiting のまま件数だけ減ったときも UI へ件数を送る", async () => {
+  const h = makeSession();
+  await h.session.start();
+  const brain = h.brains[0]!;
+  brain.emit({ kind: "question", id: "q#0", header: "H", question: "Q0", options: [], multi: false });
+  brain.emit({ kind: "question", id: "q#1", header: "H", question: "Q1", options: [], multi: false });
+  await waitEvents(h, h.events.length + 2);
+  assert.deepEqual(h.states.at(-1), { state: "waiting", pending: 2 });
+
+  brain.emit({ kind: "permissionSettled", id: "q#0", outcome: "allowed", answer: "A" });
+  await waitEvents(h, h.events.length + 1);
+  assert.deepEqual(h.states.at(-1), { state: "waiting", pending: 1 });
+
+  brain.emit({ kind: "permissionSettled", id: "q#1", outcome: "allowed", answer: "B" });
+  await waitEvents(h, h.events.length + 1);
+  assert.deepEqual(h.states.at(-1), { state: "busy", pending: 0 });
+  await h.session.stop();
+});
+
 test("exit のあとに破棄が来ても stopped を busy へ上書きしない", async () => {
   const h = makeSession();
   await h.session.start();

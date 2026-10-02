@@ -246,7 +246,13 @@ export class MasterSession {
   /** ring から落ちた古いイベントがあるか（chatSnapshot.hasMore 用）。 */
   private truncated = false;
   private stateValue: MasterChatState = "stopped";
-  private pending = 0;
+  /**
+   * 未応答の承認/質問の id。件数ではなく **id の集合**で持つ
+   *（同じ id の保留が 2 回届いても 1 件と数え、settled 1 件で確実に消えるようにする）。
+   */
+  private readonly pending = new Set<string>();
+  /** 直近に onState で UI へ送った件数（件数だけの変化を検知するため）。 */
+  private lastSentPending = 0;
   private lastSessionId: string | null = null;
   private lastModel: string | null = null;
   private startedAt = 0;
@@ -269,7 +275,7 @@ export class MasterSession {
   }
 
   get pendingCount(): number {
-    return this.pending;
+    return this.pending.size;
   }
 
   /** 会話としての累計コスト(USD)。プロセスを跨いで足す（`--resume` で 0 に戻るため）。 */
@@ -399,7 +405,7 @@ export class MasterSession {
         // PR-M6: usage を出す**前に**状態を落とす。contextGuard の「キリが良いか」判定は
         // registry の master status（= this.stateValue）を読むので、busy のまま usage を
         // 渡すと /clear 促し（quiescent 通知）が永久に発火しない。
-        this.setState(this.pending > 0 ? "waiting" : "idle");
+        this.setState(this.pending.size > 0 ? "waiting" : "idle");
         if (ev.usage) {
           this.handlers.onUsage(this.id, {
             model: this.lastModel ?? this.opts.model,
@@ -418,15 +424,17 @@ export class MasterSession {
       }
       case "permission":
       case "question": {
-        this.pending += 1;
+        this.pending.add(ev.id);
         this.setState("waiting");
+        this.notifyPendingChange();
         break;
       }
       case "permissionSettled": {
-        if (this.pending > 0) this.pending -= 1;
+        this.pending.delete(ev.id);
         // 保留が解けたらターンの実行へ戻る。**waiting のときだけ**動かす
         //（exit → discardAll の順で来たときに stopped を busy へ上書きしないため）。
-        if (this.stateValue === "waiting") this.setState(this.pending > 0 ? "waiting" : "busy");
+        if (this.stateValue === "waiting") this.setState(this.pending.size > 0 ? "waiting" : "busy");
+        this.notifyPendingChange();
         break;
       }
       case "notice": {
@@ -456,7 +464,7 @@ export class MasterSession {
   private onExit(code: number | null, signal: string | null): void {
     this.brain = null;
     this.pid = null;
-    this.pending = 0;
+    this.pending.clear();
     if (this.stopping) {
       this.setState("stopped");
       return;
@@ -646,7 +654,7 @@ export class MasterSession {
     }
     this.brain = null;
     this.pid = null;
-    this.pending = 0;
+    this.pending.clear();
     // resume 先を捨てる＝次の起動は新しいセッション。コスト累計も会話単位でリセットする。
     this.lastSessionId = null;
     this.consecutiveFailures = 0;
@@ -687,15 +695,26 @@ export class MasterSession {
 
   /** ターン開始。未応答の承認/質問があるときは waiting を優先する（UI のスティッキーバー用）。 */
   private markBusy(): void {
-    if (this.pending > 0) return;
+    if (this.pending.size > 0) return;
     this.setState("busy");
+  }
+
+  /**
+   * 状態は変わらず件数だけ変わったとき（waiting のまま 2 件 → 1 件など）にも UI へ件数を送る。
+   * setState は状態が同じだと何も送らないので、これが無いとスティッキーバーの件数が古いまま残る。
+   */
+  private notifyPendingChange(): void {
+    if (this.pending.size === this.lastSentPending) return;
+    this.lastSentPending = this.pending.size;
+    this.handlers.onState(this.id, this.stateValue, this.pending.size);
   }
 
   private setState(state: MasterChatState): void {
     if (this.stateValue === state) return;
     const wasBusy = this.stateValue === "busy";
     this.stateValue = state;
-    this.handlers.onState(this.id, state, this.pending);
+    this.lastSentPending = this.pending.size;
+    this.handlers.onState(this.id, state, this.pending.size);
     // registry の status（idle/busy）にも写す（contextGuard の quiescence 判定に効く）。
     if (wasBusy !== (state === "busy")) this.handlers.onRegistryChange();
   }

@@ -130,9 +130,6 @@ export function isReplayAckFor(raw: unknown, expectedText: string): boolean {
 /** ユーザー中断時に claude 自身が挿す内部マーカー（UI へ流さない）。 */
 const INTERRUPT_MARKER = "[Request interrupted by user]";
 
-/** AskUserQuestion のツール名（MCP 経由ではないので接尾辞一致で判定する）。 */
-const ASK_USER_QUESTION_TOOL = "AskUserQuestion";
-
 export interface NormalizerState {
   sessionId: string | null;
   model: string | null;
@@ -249,31 +246,10 @@ export class ClaudeStreamNormalizer {
   private onToolUse(block: Record<string, unknown>): MasterEvent[] {
     const id = String(block.id ?? "");
     const name = String(block.name ?? "");
-    if (name === ASK_USER_QUESTION_TOOL) {
-      const questions = isRecord(block.input) && Array.isArray(block.input.questions)
-        ? block.input.questions
-        : [];
-      const out: MasterEvent[] = [];
-      questions.forEach((q, i) => {
-        if (!isRecord(q)) return;
-        const options = Array.isArray(q.options)
-          ? q.options.filter(isRecord).map((o) => ({
-              label: String(o.label ?? ""),
-              ...(typeof o.description === "string" ? { description: o.description } : {}),
-            }))
-          : [];
-        out.push({
-          kind: "question",
-          id: `${id}#${i}`,
-          header: String(q.header ?? ""),
-          question: String(q.question ?? ""),
-          options,
-          multi: q.multiSelect === true,
-        });
-      });
-      // questions が空（形が想定外）なら通常のツール実行として出す（黙って落とさない）。
-      if (out.length > 0) return out;
-    }
+    // AskUserQuestion も**通常のツール実行として出す**。質問（question）イベントの供給源は
+    // PermissionBroker（--permission-prompt-tool 経由）だけにする。ここでも question を出すと、
+    // 同じ id（`<tool_use_id>#i`）の保留が 2 件立つのに settled は 1 件しか来ないので、
+    // ボスが答えたあとも「未応答の承認/質問が 1 件」が消えなくなる（2026-10-02 の不具合）。
     return [{ kind: "toolCall", id, name, input: block.input ?? null }];
   }
 
