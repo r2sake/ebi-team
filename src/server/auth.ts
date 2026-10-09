@@ -3,7 +3,8 @@
 // 設計方針（docs/plans/mobile-access-plan.md §3 準拠）:
 // - 環境変数 `EBI_AUTH_TOKEN` の共有シークレットで HTTP 入口・WS ハンドシェイク・
 //   非 loopback からの制御API を一括ゲートする。
-// - **二段判定**: loopback（127.0.0.1 / ::1）からのアクセスは常に無認証で通す。
+// - **二段判定**: loopback（127.0.0.1 / ::1）からのアクセスは無認証で通す。ただし Host が
+//   localhost / 127.0.0.1 / [::1] のときに限る（DNS リバインディング対策・isTrustedLocal）。
 //   これにより master 仲介の内部制御API 呼び（エビ間 MCP）や、母艦上のローカル利用
 //   （localhost:5173 / :8787）を認証で壊さない。
 // - **安全側デフォルト**: `EBI_AUTH_TOKEN` 未設定のときは、非 loopback からのアクセスを
@@ -33,6 +34,37 @@ export function loadAuthConfig(env: NodeJS.ProcessEnv = process.env): AuthConfig
 export function isLoopback(req: IncomingMessage): boolean {
   const addr = req.socket?.remoteAddress ?? "";
   return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
+}
+
+/** 無認証で通す loopback 接続に許す Host 名（ポートは問わない）。 */
+const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/**
+ * Host ヘッダが母艦ローカルの名前（localhost / 127.0.0.1 / [::1]、ポート付き可）か判定する。
+ * Host が無い・それ以外の名前（mac-mini・0.0.0.0・任意のドメイン等）は false。
+ */
+export function isLocalHostHeader(host: string | undefined): boolean {
+  if (typeof host !== "string" || host === "") return false;
+  try {
+    const u = new URL(`http://${host}`);
+    // URL が受け付けても Host にパスや userinfo が混ざっているものは弾く。
+    if (u.host.toLowerCase() !== host.toLowerCase()) return false;
+    return LOCAL_HOSTNAMES.has(u.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 無認証で通してよい「母艦ローカル」の接続か（DNS リバインディング対策）。
+ *
+ * 送信元が loopback でも、攻撃者のドメインを 127.0.0.1 に向け直されると、ブラウザは
+ * Origin と Host を攻撃者のドメインのまま loopback へ繋いでくる（Origin の判定も通ってしまう）。
+ * そこで「送信元が loopback」かつ「Host が localhost / 127.0.0.1 / [::1]」のときだけ無認証とし、
+ * それ以外の Host で来た loopback の接続は非 loopback と同じくトークン認証を求める（拒否はしない）。
+ */
+export function isTrustedLocal(req: IncomingMessage): boolean {
+  return isLoopback(req) && isLocalHostHeader(req.headers["host"]);
 }
 
 /**

@@ -82,7 +82,7 @@ import {
 import { startPtmxWatch } from "./ptmxWatch.ts";
 import {
   loadAuthConfig,
-  isLoopback,
+  isTrustedLocal,
   isSameOriginBrowser,
   checkRequestOrigin,
   authorize,
@@ -242,7 +242,9 @@ function controlMcpSpecFor(mcpRole: McpConfigRole, agentId: string): ControlMcpS
     args: server.args,
     cwd: root,
     env: {
-      EBI_CONTROL_URL: `http://${HOST}:${PORT}`,
+      // 0.0.0.0 / :: で待ち受けていても、内部の呼び出しは Host が 127.0.0.1 になる URL で繋ぐ
+      // （Host が localhost 等でない loopback 接続はトークン認証が要るため・isTrustedLocal）。
+      EBI_CONTROL_URL: `http://${HOST === "0.0.0.0" || HOST === "::" ? "127.0.0.1" : HOST}:${PORT}`,
       EBI_MCP_ROLE: mcpRole,
       EBI_ID: agentId,
       // channel 注入非対応の backend は PTY 注入で受けるため、購読ループは回さない。
@@ -767,7 +769,8 @@ function wantsHtml(req: IncomingMessage): boolean {
 const httpServer = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const urlPath = url.pathname;
-  const loopback = isLoopback(req);
+  // loopback でも Host が localhost 等でなければ無認証にしない（DNS リバインディング対策）。
+  const loopback = isTrustedLocal(req);
 
   // ---- ログイン導線（認証ゲートより前・常に到達可能）----
   // GET /login: トークン入力ページを返す。POST /login: 照合して Cookie を発行する。
@@ -875,7 +878,7 @@ const wss = new WebSocketServer({
   path: "/ws",
   verifyClient: (info, cb) => {
     const req = info.req;
-    const loopback = isLoopback(req);
+    const loopback = isTrustedLocal(req);
     const query = new URL(req.url ?? "/ws", "http://127.0.0.1").searchParams;
     const auth = authorize(req, loopback, authConfig, query);
     if (!auth.ok) {

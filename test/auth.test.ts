@@ -17,6 +17,8 @@ import {
   parseCookie,
   loadAuthConfig,
   checkRequestOrigin,
+  isLocalHostHeader,
+  isTrustedLocal,
   type AuthConfig,
 } from "../src/server/auth.ts";
 
@@ -182,4 +184,33 @@ test("checkRequestOrigin: Origin も Sec-Fetch-Site も無い Node のクライ�
   assert.deepEqual(checkRequestOrigin(hdr({ host: "127.0.0.1:8787" })), { ok: true });
   // Node の fetch は sec-fetch-mode だけ付ける（Sec-Fetch-Site は付けない）。
   assert.deepEqual(checkRequestOrigin(hdr({ host: "127.0.0.1:8787", "sec-fetch-mode": "cors" })), { ok: true });
+});
+
+// ===== isLocalHostHeader / isTrustedLocal（DNS リバインディング対策）=====
+test("isLocalHostHeader: localhost / 127.0.0.1 / [::1]（ポート付き可・大文字可）→ true", () => {
+  for (const h of ["localhost", "localhost:8787", "LOCALHOST:5173", "127.0.0.1", "127.0.0.1:8787", "[::1]", "[::1]:8787"]) {
+    assert.equal(isLocalHostHeader(h), true, h);
+  }
+});
+test("isLocalHostHeader: 別名・不正な Host → false", () => {
+  for (const h of [undefined, "", "evil.example:8787", "mac-mini:8787", "0.0.0.0:8787", "localhost.evil.example",
+    "127.0.0.2:8787", "localhost.:8787", "localhost@evil.example", "localhost/x", "::1"]) {
+    assert.equal(isLocalHostHeader(h), false, String(h));
+  }
+});
+test("isTrustedLocal: loopback かつ Host が localhost 等のときだけ true", () => {
+  assert.equal(isTrustedLocal(fakeReq({ remoteAddress: "127.0.0.1", headers: { host: "localhost:8787" } })), true);
+  assert.equal(isTrustedLocal(fakeReq({ remoteAddress: "::1", headers: { host: "[::1]:8787" } })), true);
+  // リバインドされたドメイン名で loopback に来た接続は無認証にしない。
+  assert.equal(isTrustedLocal(fakeReq({ remoteAddress: "127.0.0.1", headers: { host: "rebind.evil.example:8787" } })), false);
+  assert.equal(isTrustedLocal(fakeReq({ remoteAddress: "127.0.0.1", headers: {} })), false);
+  // 非 loopback は Host が localhost でも無認証にしない。
+  assert.equal(isTrustedLocal(fakeReq({ remoteAddress: "100.64.0.5", headers: { host: "localhost:8787" } })), false);
+});
+test("authorize + isTrustedLocal: 別名 Host の loopback はトークンがあれば通り、無ければ拒否", () => {
+  const evil = fakeReq({ remoteAddress: "127.0.0.1", headers: { host: "rebind.evil.example:8787" } });
+  assert.deepEqual(authorize(evil, isTrustedLocal(evil), TOKEN), { ok: false, reason: "invalid-token" });
+  assert.deepEqual(authorize(evil, isTrustedLocal(evil), NO_TOKEN), { ok: false, reason: "no-token-config" });
+  const withToken = fakeReq({ remoteAddress: "127.0.0.1", headers: { host: "mac-mini:8787", authorization: "Bearer s3cret-token" } });
+  assert.equal(authorize(withToken, isTrustedLocal(withToken), TOKEN).ok, true);
 });
