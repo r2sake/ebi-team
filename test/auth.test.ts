@@ -16,6 +16,7 @@ import {
   tokenMatches,
   parseCookie,
   loadAuthConfig,
+  checkRequestOrigin,
   type AuthConfig,
 } from "../src/server/auth.ts";
 
@@ -133,4 +134,52 @@ test("loadAuthConfig: 空白のみ → token null", () => {
 });
 test("loadAuthConfig: 値あり → trim して採用", () => {
   assert.equal(loadAuthConfig({ EBI_AUTH_TOKEN: " tok " } as NodeJS.ProcessEnv).token, "tok");
+});
+
+// ===== checkRequestOrigin（CSWSH / CSRF 対策：別サイトのページからの WS・制御API を弾く）=====
+
+function hdr(h: Record<string, string>): Pick<IncomingMessage, "headers"> {
+  return { headers: h } as Pick<IncomingMessage, "headers">;
+}
+
+test("checkRequestOrigin: 同一オリジンのブラウザは通す（直・Vite proxy・Tailscale 経由）", () => {
+  assert.deepEqual(checkRequestOrigin(hdr({ origin: "http://localhost:8787", host: "localhost:8787" })), { ok: true });
+  assert.deepEqual(checkRequestOrigin(hdr({ origin: "http://localhost:5173", host: "localhost:5173" })), { ok: true });
+  assert.deepEqual(checkRequestOrigin(hdr({ origin: "http://mac-mini:8787", host: "mac-mini:8787" })), { ok: true });
+  assert.deepEqual(checkRequestOrigin(hdr({ origin: "http://100.64.0.1:8787", host: "100.64.0.1:8787" })), { ok: true });
+  // 同一オリジンの GET（Origin なし・Sec-Fetch-Site: same-origin）や直打ち（none）も通す。
+  assert.deepEqual(checkRequestOrigin(hdr({ host: "localhost:8787", "sec-fetch-site": "same-origin" })), { ok: true });
+  assert.deepEqual(checkRequestOrigin(hdr({ host: "localhost:8787", "sec-fetch-site": "none" })), { ok: true });
+});
+
+test("checkRequestOrigin: 別サイトの Origin は弾く（別ドメイン・同ホスト別ポート・null）", () => {
+  const bad = { ok: false, reason: "cross-origin" };
+  assert.deepEqual(checkRequestOrigin(hdr({ origin: "https://evil.example", host: "127.0.0.1:8787" })), bad);
+  assert.deepEqual(checkRequestOrigin(hdr({ origin: "http://localhost:3000", host: "localhost:8787" })), bad);
+  assert.deepEqual(checkRequestOrigin(hdr({ origin: "http://127.0.0.1:8787", host: "localhost:8787" })), bad);
+  assert.deepEqual(checkRequestOrigin(hdr({ origin: "null", host: "127.0.0.1:8787" })), bad);
+  assert.deepEqual(checkRequestOrigin(hdr({ origin: "file://", host: "127.0.0.1:8787" })), bad);
+  // Origin があれば Sec-Fetch-Site より Origin を優先する（same-origin を名乗っても Origin が違えば弾く）。
+  assert.deepEqual(
+    checkRequestOrigin(hdr({ origin: "https://evil.example", host: "127.0.0.1:8787", "sec-fetch-site": "same-origin" })),
+    bad,
+  );
+});
+
+test("checkRequestOrigin: Origin の無い別サイトの GET（<img src> 等）は Sec-Fetch-Site で弾く", () => {
+  assert.deepEqual(
+    checkRequestOrigin(hdr({ host: "127.0.0.1:8787", "sec-fetch-site": "cross-site" })),
+    { ok: false, reason: "cross-site" },
+  );
+  // localhost の別ポートは same-site 扱いになるので、same-site も弾く。
+  assert.deepEqual(
+    checkRequestOrigin(hdr({ host: "localhost:8787", "sec-fetch-site": "same-site" })),
+    { ok: false, reason: "cross-site" },
+  );
+});
+
+test("checkRequestOrigin: Origin も Sec-Fetch-Site も無い Node のクライアントは通す（認証は authorize 側）", () => {
+  assert.deepEqual(checkRequestOrigin(hdr({ host: "127.0.0.1:8787" })), { ok: true });
+  // Node の fetch は sec-fetch-mode だけ付ける（Sec-Fetch-Site は付けない）。
+  assert.deepEqual(checkRequestOrigin(hdr({ host: "127.0.0.1:8787", "sec-fetch-mode": "cors" })), { ok: true });
 });

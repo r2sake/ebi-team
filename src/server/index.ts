@@ -84,6 +84,7 @@ import {
   loadAuthConfig,
   isLoopback,
   isSameOriginBrowser,
+  checkRequestOrigin,
   authorize,
   tokenMatches,
   buildAuthCookie,
@@ -833,6 +834,18 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
+  // 制御API は別サイトのページからの呼び出し（CSRF・<img src> での GET）を弾く。
+  // Origin も Sec-Fetch-Site も付けない Node のクライアント（ebi-control MCP 等）は従来どおり通る。
+  if (urlPath.startsWith("/control/")) {
+    const verdict = checkRequestOrigin(req);
+    if (!verdict.ok) {
+      console.warn(`[ebi-team] 制御API を拒否（${verdict.reason}）: ${req.method} ${urlPath} origin=${req.headers["origin"] ?? "-"}`);
+      res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: "forbidden origin" }));
+      return;
+    }
+  }
+
   // 制御API（/control/*）を最優先で処理する。該当すれば静的配信へは進まない。
   if (await controlApi(req, res, urlPath, url.searchParams)) return;
   let filePath = join(CLIENT_DIST, normalize(urlPath === "/" ? "/index.html" : urlPath));
@@ -856,6 +869,7 @@ const httpServer = createServer(async (req, res) => {
 // ===== WebSocket =====
 // HTTP 入口と同じ二段判定でハンドシェイクをゲートする。ここを塞がないと WS だけ
 // 素通りしてしまう（plan §7-2）。token は Cookie ebi_auth / ?token= から拾う。
+// あわせて Origin を見て、別サイトのページからの接続を弾く（checkRequestOrigin）。
 const wss = new WebSocketServer({
   server: httpServer,
   path: "/ws",
@@ -864,11 +878,19 @@ const wss = new WebSocketServer({
     const loopback = isLoopback(req);
     const query = new URL(req.url ?? "/ws", "http://127.0.0.1").searchParams;
     const auth = authorize(req, loopback, authConfig, query);
-    if (auth.ok) {
-      cb(true);
-    } else {
+    if (!auth.ok) {
       cb(false, 401, "Unauthorized");
+      return;
     }
+    // 別サイトのページからの接続（CSWSH）を弾く。通すと spawn・入力・kill まで乗っ取られる。
+    // Origin の無い接続（ブラウザ以外）は上のトークン認証に任せる。
+    const verdict = checkRequestOrigin(req);
+    if (!verdict.ok) {
+      console.warn(`[ebi-team] WS 接続を拒否（${verdict.reason}）: origin=${req.headers["origin"] ?? "-"}`);
+      cb(false, 403, "Forbidden");
+      return;
+    }
+    cb(true);
   },
 });
 

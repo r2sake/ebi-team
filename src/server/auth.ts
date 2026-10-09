@@ -57,6 +57,35 @@ export function isSameOriginBrowser(req: Pick<IncomingMessage, "headers">): bool
   }
 }
 
+/**
+ * 別サイトのページから来たリクエストを弾く判定（CSWSH / CSRF 対策）。WS ハンドシェイクと /control/* で使う。
+ *
+ * loopback の無認証や Cookie の自動付与は「ブラウザが別サイトのページの代わりに繋ぐ」ことでも
+ * 成り立ってしまうため、トークン認証とは別に「どのページから来たか」を見る。
+ * - Origin がある → Host と一致する（同一オリジンのページ）ときだけ通す。"null" は弾く。
+ *   ブラウザは WS ハンドシェイクと別オリジンへの POST に必ず Origin を付ける。
+ * - Origin が無い → Sec-Fetch-Site を見る。`cross-site` / `same-site`（同じホストの別ポートも
+ *   same-site 扱い）は弾き、`same-origin` / `none`（直打ち・ブックマーク）だけ通す。
+ *   `<img src>` などの別サイトからの GET は Origin を付けないので、ここで止める。
+ * - どちらも無い → ブラウザ以外（エビの MCP ブリッジ・statusLine の報告・curl 等）。
+ *   Web ページからは作れない接続なので、従来どおりトークン認証（loopback は無認証）に任せる。
+ */
+export type OriginVerdict =
+  | { ok: true }
+  | { ok: false; reason: "cross-origin" | "cross-site" };
+
+export function checkRequestOrigin(req: Pick<IncomingMessage, "headers">): OriginVerdict {
+  const origin = req.headers["origin"];
+  if (typeof origin === "string") {
+    return isSameOriginBrowser(req) ? { ok: true } : { ok: false, reason: "cross-origin" };
+  }
+  const site = req.headers["sec-fetch-site"];
+  if (typeof site === "string" && site !== "same-origin" && site !== "none") {
+    return { ok: false, reason: "cross-site" };
+  }
+  return { ok: true };
+}
+
 /** 認証判定の結果。ok=false のとき reason で理由を区別する。 */
 export type AuthOutcome =
   | { ok: true }
