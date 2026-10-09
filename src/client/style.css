@@ -877,6 +877,132 @@ button:hover { filter: brightness(1.07); }
   .fp-panel { max-width: 100%; height: 100%; max-height: 100%; }
 }
 
+/* ===== ファイル編集ダイアログ（env などを書き換える）=====
+   外枠は .file-picker / .fp-* を流用し、中身だけ fe-* で足す。 */
+.fe-panel { max-width: 720px; }
+.fe-body {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  flex: 1 1 auto;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.fe-body .fe-path-form { padding: 0; border-bottom: none; }
+.fe-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+.fe-actions:empty { display: none; }
+.fe-btn {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 14px;
+  min-height: 40px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.fe-btn.primary { background: var(--accent); color: #21130c; border-color: transparent; font-weight: 700; }
+.fe-btn.danger { color: #e05b5b; margin-right: auto; }
+.fe-btn:disabled { opacity: 0.55; cursor: default; }
+.fe-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text);
+  word-break: break-all;
+}
+.fe-info { display: flex; flex-direction: column; gap: 6px; }
+.fe-badges { display: flex; flex-wrap: wrap; gap: 6px; }
+.fe-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.fe-badge.new { color: #5bbf7a; border-color: #5bbf7a; }
+.fe-badge.secret { color: #e0b05b; border-color: #e0b05b; }
+.fe-request { font-size: 12px; color: var(--muted); }
+.fe-note { font-size: 13px; color: var(--text); white-space: pre-wrap; }
+.fe-hint { font-size: 12px; color: var(--muted); line-height: 1.6; }
+.fe-warn { font-size: 13px; color: #e0b05b; }
+.fe-done-line { font-size: 13px; color: var(--text); word-break: break-all; }
+.fe-opts { display: flex; flex-wrap: wrap; gap: 14px; }
+.fe-check { font-size: 13px; color: var(--text); cursor: pointer; }
+.fe-check input { vertical-align: middle; }
+.fe-text {
+  width: 100%;
+  min-height: 240px;
+  resize: vertical;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 14px; /* 狭幅は下で 16px（iOS 自動ズーム抑止） */
+  line-height: 1.5;
+}
+/* 伏せ字（Chrome/Safari/Firefox が対応する -webkit-text-security）。 */
+.fe-text.masked { -webkit-text-security: disc; }
+.fe-keys { display: flex; flex-direction: column; gap: 10px; }
+.fe-key-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 10px;
+  align-items: center;
+}
+.fe-key-label {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+.fe-key-state { font-size: 11px; color: var(--muted); justify-self: end; }
+.fe-key-state.unset { color: #e0b05b; }
+.fe-key-input {
+  grid-column: 1 / -1;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 16px; /* iOS 自動ズーム抑止 */
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.fe-dirs { display: flex; flex-direction: column; gap: 4px; }
+.fe-diff {
+  margin: 0;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 0;
+  overflow-x: auto;
+  font-size: 12px;
+  line-height: 1.5;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.fe-diff-line { padding: 0 10px; white-space: pre; }
+.fe-diff-line.op-add { background: rgba(91, 191, 122, 0.15); color: #7fd99a; }
+.fe-diff-line.op-del { background: rgba(224, 91, 91, 0.15); color: #ef8f8f; }
+.fe-diff-line.op-skip { color: var(--muted); font-style: italic; }
+@media (max-width: 768px) {
+  .fe-text { font-size: 16px; }
+}
+.chat-file-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  word-break: break-all;
+}
+
 /* ===== master チャット（ui:"chat"）パネル =====
    xterm を使わない DOM チャット。ログは通常のブロックスクロール、入力欄は下端固定。
    設計書 §5.1〜§5.3（PR-M3）。 */

@@ -227,6 +227,22 @@ export interface ControlDeps {
         signal: AbortSignal,
       ) => Promise<unknown>)
     | null;
+  /**
+   * ファイル編集の入力依頼（`POST /control/file-edit-request` の実体）。
+   *
+   * master の request_file_edit から呼ばれ、チャットに入力カードを出して**すぐ返る**
+   *（ボスの入力は待たない。保存/見送りの結果は後から master へ通知される）。
+   * 本文や値を受け取る口ではない（受けるのはパス・鍵名・メモだけ）。
+   * パスが許可ルート外・鍵名が不正なら throw（400）。chat master が居ない構成では null（404）。
+   */
+  requestFileEdit:
+    | ((input: { path: unknown; keys?: unknown; note?: unknown; from?: unknown }) => Promise<{
+        requestId: string;
+        path: string;
+        exists: boolean;
+        keys: string[];
+      }>)
+    | null;
 }
 
 /** JSON レスポンスを返すヘルパー。 */
@@ -728,6 +744,33 @@ export function createControlApi(deps: ControlDeps) {
         );
         if (res.writableEnded) return true; // 既に切断済み
         sendJson(res, 200, decision);
+        return true;
+      }
+
+      // ---- POST /control/file-edit-request ----
+      // master 専用 MCP `request_file_edit` からのブリッジ。チャットに入力カードを出してすぐ返る。
+      // ここでは本文も値も受け取らない（書き込みはボスのブラウザからの WS `fileEditSave` だけ）。
+      if (pathname === "/control/file-edit-request" && method === "POST") {
+        if (!deps.requestFileEdit) {
+          sendJson(res, 404, { error: 'ファイル編集の依頼は ui:"chat" の master が居るときだけ使えます' });
+          return true;
+        }
+        const body = await readJsonBody(req);
+        try {
+          const r = await deps.requestFileEdit({
+            path: body.path,
+            keys: body.keys,
+            note: body.note,
+            from: body.from,
+          });
+          sendJson(res, 200, {
+            ...r,
+            status: "pending",
+            note: "ボスのチャットに入力欄を出しました。保存または見送りの結果は後から通知します（値は届きません）",
+          });
+        } catch (err) {
+          sendJson(res, 400, { error: (err as Error).message });
+        }
         return true;
       }
 

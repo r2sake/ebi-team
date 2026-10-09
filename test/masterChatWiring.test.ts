@@ -314,6 +314,7 @@ async function withControlApi(
     readChatAttachment: null,
     shareChatImage: deps.shareChatImage,
     requestChatPermission: null,
+    requestFileEdit: null,
   });
 
   const server = createServer(async (req, res) => {

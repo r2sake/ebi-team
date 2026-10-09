@@ -586,6 +586,36 @@ export class MasterSession {
     this.emitChat({ kind: "image", images: [...images] });
   }
 
+  /**
+   * master の request_file_edit による入力依頼をトランスクリプトへ載せる。
+   * shareImage と同じ「ワイヤ側にしか無い kind」。載るのは鍵名・パス・メモだけで値は無い。
+   */
+  showFileEditRequest(req: {
+    id: string;
+    path: string;
+    keys: readonly string[];
+    note: string | null;
+    from: string;
+  }): void {
+    this.emitChat({
+      kind: "fileEditRequest",
+      id: req.id,
+      path: req.path,
+      keys: [...req.keys],
+      note: req.note,
+      from: req.from,
+    });
+  }
+
+  /** ファイル編集依頼の決着をトランスクリプトへ載せる（カードの入力欄を畳む）。 */
+  settleFileEditRequest(
+    id: string,
+    outcome: "saved" | "cancelled" | "discarded",
+    summary: string | null,
+  ): void {
+    this.emitChat({ kind: "fileEditSettled", id, outcome, summary });
+  }
+
   /** 実行中ターンの中断（WS `chatStop`）。会話は殺さない。 */
   async interrupt(): Promise<void> {
     await this.brain?.interrupt();

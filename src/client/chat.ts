@@ -8,6 +8,7 @@ import type {
 import {
   ChatTranscript,
   collectImages,
+  fileEditSettledLabel,
   firstUnsettledPending,
   formatBytes,
   formatContextPct,
@@ -32,6 +33,19 @@ import {
   type HeaderRateLimits,
 } from "./chatModel.ts";
 import { renderMarkdownInto } from "./viewer.ts";
+import type { FileEditRequestInfo } from "./fileEditor.ts";
+
+/** ファイル編集の導線（main.ts が FileEditorDialog と WS へ配線する）。 */
+export interface FileEditHooks {
+  /** 自由編集（パス入力から）。 */
+  open(): void;
+  /** master の依頼カードから開く。 */
+  openRequest(req: FileEditRequestInfo): void;
+  /** 依頼を見送る。 */
+  cancelRequest(requestId: string): void;
+}
+
+const NO_FILE_EDIT_HOOKS: FileEditHooks = { open: () => {}, openRequest: () => {}, cancelRequest: () => {} };
 
 /**
  * master チャットパネル（ui:"chat" の master をメイン領域に出す 1 枚）。
@@ -103,6 +117,8 @@ export class ChatPanel {
   private lightboxUi: LightboxUi | null = null;
   /** ライトボックスを開く直前にフォーカスしていた要素（閉じたら戻す）。 */
   private lightboxOpener: HTMLElement | null = null;
+  /** ファイル編集の導線（setFileEditHooks で差し込む）。 */
+  private fileEdit: FileEditHooks = NO_FILE_EDIT_HOOKS;
 
   constructor(
     private readonly el: HTMLElement,
@@ -141,7 +157,13 @@ export class ChatPanel {
       this.updateStats();
       this.onNew(this.masterId);
     });
-    this.head.append(title, this.stateBadge, this.statsEl, this.newBtn);
+    const editBtn = document.createElement("button");
+    editBtn.className = "chat-new chat-edit-file";
+    editBtn.textContent = "📝";
+    editBtn.title = "ファイルを編集（env など。許可ルート配下のみ）";
+    editBtn.setAttribute("aria-label", "ファイルを編集");
+    editBtn.addEventListener("click", () => this.fileEdit.open());
+    this.head.append(title, this.stateBadge, this.statsEl, editBtn, this.newBtn);
 
     // ---- ログ ----
     this.logEl = div("chat-log");
@@ -202,6 +224,11 @@ export class ChatPanel {
     this.history = new InputHistory(safeLocalStorage());
     this.history.load();
     this.syncControls();
+  }
+
+  /** ファイル編集の導線を差し込む（ヘッダの 📝 と、依頼カードのボタン）。 */
+  setFileEditHooks(hooks: FileEditHooks): void {
+    this.fileEdit = hooks;
   }
 
   /** chat モードの master が居るか（居なければ main.ts は従来の PTY ペインを出す）。 */
@@ -787,6 +814,7 @@ export class ChatPanel {
         onJump: (seq) => this.jumpToSeq(seq),
         hasSeq: (seq) => this.hasSeq(seq),
       },
+      this.fileEdit,
     );
     const prev = this.rendered[index];
     if (prev) {
@@ -837,6 +865,7 @@ function buildItem(
   onAnswer: (requestId: string, answer: { allow?: boolean; choice?: string[]; text?: string }) => void,
   onOpenImage: OpenImage = () => {},
   reply: ReplyHooks = NO_REPLY_HOOKS,
+  fileEdit: FileEditHooks = NO_FILE_EDIT_HOOKS,
 ): HTMLElement {
   switch (item.kind) {
     case "user": {
@@ -946,6 +975,53 @@ function buildItem(
         bubble.appendChild(permissionActions(item.requestId, onAnswer));
       } else {
         bubble.appendChild(questionForm(item, onAnswer));
+      }
+      row.appendChild(bubble);
+      return row;
+    }
+    case "fileEdit": {
+      // master の request_file_edit による入力依頼。値はここには無い（入力はダイアログで行う）。
+      const row = bubbleRow("assistant");
+      const bubble = div(`chat-bubble pending file-edit${item.settled ? ` settled-${item.settled}` : ""}`);
+      bubble.append(meta(`📝 入力の依頼（${item.from}）`, item.ts));
+      const t = div("chat-pending-title");
+      t.textContent = item.keys.length > 0 ? `鍵を入れてください: ${item.keys.join(", ")}` : "ファイルを編集してください";
+      const p = div("chat-pending-detail chat-file-path");
+      p.textContent = item.path;
+      bubble.append(t, p);
+      if (item.note) {
+        const n = div("chat-pending-detail");
+        n.textContent = item.note;
+        bubble.appendChild(n);
+      }
+      if (item.settled) {
+        const done = div("chat-pending-settled");
+        done.textContent = fileEditSettledLabel(item.settled, item.summary);
+        bubble.appendChild(done);
+      } else {
+        const actions = div("chat-pending-actions");
+        const openBtn = document.createElement("button");
+        openBtn.className = "chat-pending-btn allow";
+        openBtn.textContent = "✏️ 入力する";
+        openBtn.addEventListener("click", () =>
+          fileEdit.openRequest({
+            requestId: item.requestId,
+            path: item.path,
+            keys: [...item.keys],
+            note: item.note,
+            from: item.from,
+          }),
+        );
+        const skipBtn = document.createElement("button");
+        skipBtn.className = "chat-pending-btn deny";
+        skipBtn.textContent = "見送る";
+        skipBtn.addEventListener("click", () => {
+          if (!window.confirm("この依頼を見送ります（master には「見送った」と伝わります）。よろしいですか？")) return;
+          for (const el of actions.querySelectorAll("button")) el.disabled = true;
+          fileEdit.cancelRequest(item.requestId);
+        });
+        actions.append(openBtn, skipBtn);
+        bubble.appendChild(actions);
       }
       row.appendChild(bubble);
       return row;

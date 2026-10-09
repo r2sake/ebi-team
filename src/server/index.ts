@@ -73,10 +73,17 @@ import { UsageStore } from "./usageStore.ts";
 import { configureUsageHistory, usageHistoryPath } from "./usageHistory.ts";
 import { ContextGuard, contextGuardConfigFromEnv, type GuardNotice } from "./contextGuard.ts";
 import { ViewerRegistry } from "./viewerRegistry.ts";
+import {
+  FileEditConflictError,
+  FileEditError,
+  FileEditor,
+  FileEditRequests,
+} from "./fileEditor.ts";
 import { startPtmxWatch } from "./ptmxWatch.ts";
 import {
   loadAuthConfig,
   isLoopback,
+  isSameOriginBrowser,
   authorize,
   tokenMatches,
   buildAuthCookie,
@@ -95,6 +102,8 @@ import {
   type SubscribeMessage,
   type UnsubscribeMessage,
   type ChatHistoryMessage,
+  type FileEditOpenMessage,
+  type FileEditSaveMessage,
 } from "../shared/protocol.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -288,6 +297,30 @@ const usageStore = new UsageStore();
 // viewers.json（open 中の viewer の永続化先）。再起動後に同じタブを復元するために使う。
 const VIEWERS_PATH = process.env.EBI_VIEWERS_PATH ?? join(process.cwd(), ".ebi-team", "viewers.json");
 const viewerRegistry = new ViewerRegistry({ storePath: VIEWERS_PATH });
+
+// ファイル編集（ボスが UI からファイル＝主に env を書き換える）。
+// 書き込みの記録（いつ・どのファイルを・誰が。値は残さない）は `.ebi-team/file-edits.jsonl`。
+const FILE_EDIT_LOG_PATH =
+  process.env.EBI_FILE_EDIT_LOG_PATH ?? join(process.cwd(), ".ebi-team", "file-edits.jsonl");
+const fileEditor = new FileEditor({ auditPath: FILE_EDIT_LOG_PATH });
+// master の request_file_edit の依頼台帳。カードの表示と決着は chat master のトランスクリプトへ、
+// 保存/見送りの結果（値は含まない）は依頼した送り手へ逆方向通知で返す。
+const fileEditRequests = new FileEditRequests(fileEditor, {
+  onRequest: (req) => masterSession?.showFileEditRequest(req),
+  onSettled: (req, outcome, summary, notify) => {
+    masterSession?.settleFileEditRequest(req.id, outcome, summary);
+    if (!notify) return;
+    const to = req.from && registryHasTarget(req.from) ? req.from : (masterSession?.id ?? "master");
+    void registry
+      .reverseInject("file-editor", to, `[file-edit ${req.id}] ${summary}`, "reply")
+      .catch((err) => console.warn("[file-edit] 結果の通知に失敗:", (err as Error).message));
+  },
+});
+
+/** 逆方向通知の宛先として届くか（PTY エビ or chat master）。 */
+function registryHasTarget(id: string): boolean {
+  return registry.has(id) || masterSession?.id === id;
+}
 
 // ===== 接続中の WebSocket クライアント集合 =====
 const clients = new Set<WebSocket>();
@@ -706,6 +739,13 @@ const controlApi = createControlApi({
     session.shareImage([image]);
     return image;
   },
+  // ファイル編集の入力依頼（master の request_file_edit）。チャットにカードを出してすぐ返る。
+  // 受けるのはパス・鍵名・メモだけで、本文や値を書き込む口はここには無い。
+  requestFileEdit: async (input) => {
+    if (!masterSession) throw new Error('ファイル編集の依頼は ui:"chat" の master が居るときだけ使えます');
+    const { request, exists } = await fileEditRequests.create(input);
+    return { requestId: request.id, path: request.path, exists, keys: request.keys };
+  },
   // 承認/質問（PR-M5）。claude の --permission-prompt-tool → 制御MCP → ここ。
   // ボスが UI で答えるまで resolve しない（未応答は待ち続ける・自動拒否しない）。
   requestChatPermission: async (req, signal) => {
@@ -832,8 +872,14 @@ const wss = new WebSocketServer({
   },
 });
 
-wss.on("connection", (ws) => {
+// 接続ごとの「同一オリジンのブラウザから来たか」。ファイル編集はこれが true の接続だけに許す
+// （ブラウザは WS に必ず Origin を付ける。エビの素の WS クライアントや、別サイトのページからの
+//  接続＝ CSWSH ではファイルを書かせない）。
+const browserConnections = new WeakSet<WebSocket>();
+
+wss.on("connection", (ws, req) => {
   clients.add(ws);
+  if (isSameOriginBrowser(req)) browserConnections.add(ws);
   // 接続直後にサーバ能力（監督が有効か）を送る。クライアントはこれで要約 UI の出し分けをする。
   send(ws, { type: "capabilities", supervisor: supervisor.enabled });
   // master が ui:"chat" なら、registry より**先に** state と直近の会話を送る。
@@ -1061,10 +1107,115 @@ function handleClientMessage(ws: WebSocket, msg: ClientMessage): void {
       handleChatHistory(ws, msg);
       break;
     }
+    case "fileEditOpen": {
+      void handleFileEditOpen(ws, msg);
+      break;
+    }
+    case "fileEditSave": {
+      void handleFileEditSave(ws, msg);
+      break;
+    }
+    case "fileEditCancel": {
+      if (!browserConnections.has(ws)) {
+        send(ws, { type: "error", text: "ファイル編集はブラウザの UI からだけ使えます" });
+        break;
+      }
+      fileEditRequests.cancel(msg.requestId);
+      break;
+    }
     default: {
       send(ws, { type: "error", text: "未知の message type です" });
     }
   }
+}
+
+// ===== ファイル編集（WS）=====
+// 本文は**要求した接続にだけ**返す（broadcast・notice・ログに載せない）。エラー文にも本文は入らない。
+
+/** ファイル編集を許す接続か（同一オリジンのブラウザだけ）。違えば error を返して false。 */
+function fileEditAllowed(ws: WebSocket): boolean {
+  if (browserConnections.has(ws)) return true;
+  send(ws, { type: "error", text: "ファイル編集はブラウザの UI からだけ使えます" });
+  return false;
+}
+
+/**
+ * 依頼 id 付きの操作で、依頼がまだ有効かとパスが一致するかを確かめる。
+ * 依頼が無い（サーバ再起動で消えた等）ときはカードを畳んで null。
+ */
+function fileEditRequestFor(requestId: string | undefined): { ok: true; path: string | null } | { ok: false; error: string } {
+  if (requestId === undefined) return { ok: true, path: null };
+  const req = fileEditRequests.get(requestId);
+  if (!req) {
+    fileEditRequests.forgetUnknown(requestId);
+    return { ok: false, error: "依頼は無効です（サーバ再起動などで破棄されました）" };
+  }
+  return { ok: true, path: req.path };
+}
+
+async function handleFileEditOpen(ws: WebSocket, msg: FileEditOpenMessage): Promise<void> {
+  if (!fileEditAllowed(ws)) return;
+  const base = { type: "fileEditLoaded" as const, path: String(msg.path ?? ""), ...(msg.requestId ? { requestId: msg.requestId } : {}) };
+  const req = fileEditRequestFor(msg.requestId);
+  if (!req.ok) {
+    send(ws, { ...base, error: req.error });
+    return;
+  }
+  try {
+    const file = await fileEditor.load(msg.path);
+    if (req.path && file.path !== req.path) {
+      send(ws, { ...base, error: "依頼と違うファイルは開けません" });
+      return;
+    }
+    send(ws, { ...base, file });
+  } catch (err) {
+    send(ws, { ...base, error: fileEditErrorText(err) });
+  }
+}
+
+async function handleFileEditSave(ws: WebSocket, msg: FileEditSaveMessage): Promise<void> {
+  if (!fileEditAllowed(ws)) return;
+  const base = { type: "fileEditSaved" as const, path: String(msg.path ?? ""), ...(msg.requestId ? { requestId: msg.requestId } : {}) };
+  const req = fileEditRequestFor(msg.requestId);
+  if (!req.ok) {
+    send(ws, { ...base, error: req.error });
+    return;
+  }
+  try {
+    if (req.path) {
+      // 依頼のパス以外へは書かせない（カードから開いた画面で別ファイルへ保存させない）。
+      const target = await fileEditor.resolve(msg.path);
+      if (target.realPath !== req.path) {
+        send(ws, { ...base, error: "依頼と違うファイルには保存できません" });
+        return;
+      }
+    }
+    const saved = await fileEditor.save({
+      path: msg.path,
+      content: msg.content,
+      baseHash: typeof msg.baseHash === "string" ? msg.baseHash : null,
+      createDirs: msg.createDirs === true,
+      backup: msg.backup === true,
+      actor: msg.requestId ? `boss-ui:request:${msg.requestId}` : "boss-ui",
+      requestedBy: msg.requestId ? (fileEditRequests.get(msg.requestId)?.from ?? null) : null,
+    });
+    send(ws, { ...base, saved });
+    if (msg.requestId) fileEditRequests.markSaved(msg.requestId, saved);
+  } catch (err) {
+    send(ws, {
+      ...base,
+      error: fileEditErrorText(err),
+      ...(err instanceof FileEditConflictError ? { conflict: true } : {}),
+    });
+  }
+}
+
+/** ファイル編集の失敗を UI 向けの 1 行にする（想定外の例外は errno 程度に留める）。 */
+function fileEditErrorText(err: unknown): string {
+  if (err instanceof FileEditError) return err.message;
+  const e = err as NodeJS.ErrnoException;
+  if (e?.code === "EACCES" || e?.code === "EPERM") return `権限がありません（${e.code}）`;
+  return `失敗しました: ${e?.code ?? (e?.message || "不明なエラー")}`;
 }
 
 /**

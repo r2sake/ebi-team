@@ -258,6 +258,45 @@ export interface OpenViewerMessage {
   title?: string;
 }
 
+/**
+ * ファイル編集画面で 1 ファイルを開く（クライアント → サーバ）。
+ * サーバは許可ルート（EBI_EDIT_ROOTS）配下に限定して検証し、**要求した接続にだけ**
+ * `fileEditLoaded` で本文を返す（broadcast しない・チャットのログにも載せない）。
+ */
+export interface FileEditOpenMessage {
+  type: "fileEditOpen";
+  /** 開くファイルの絶対パス（`~` 可）。無ければ新規作成として開く。 */
+  path: string;
+  /** master の request_file_edit の依頼から開いたときの依頼 id。 */
+  requestId?: string;
+}
+
+/**
+ * ファイル編集画面での保存（クライアント → サーバ）。
+ * content は**要求した接続とサーバの間だけ**を流れる（ログ・会話履歴・master には渡さない）。
+ */
+export interface FileEditSaveMessage {
+  type: "fileEditSave";
+  path: string;
+  content: string;
+  /**
+   * 開いたときの本文の sha256（`FileEditView.baseHash`）。新規作成は null。
+   * サーバの現物と食い違えば保存しない（開いた後に他所で書き換わった＝上書き事故の防止）。
+   */
+  baseHash: string | null;
+  /** 親フォルダが無いとき作ってよいか（ボスが確認した印）。 */
+  createDirs: boolean;
+  /** 上書き前に控え（`<file>.bak-YYYYMMDD-HHMMSS`）を残すか。 */
+  backup: boolean;
+  requestId?: string;
+}
+
+/** master の request_file_edit の依頼を断る（クライアント → サーバ）。 */
+export interface FileEditCancelMessage {
+  type: "fileEditCancel";
+  requestId: string;
+}
+
 export type ClientMessage =
   | SpawnMessage
   | KillMessage
@@ -275,7 +314,10 @@ export type ClientMessage =
   | ChatAnswerMessage
   | ChatStopMessage
   | ChatNewMessage
-  | ChatHistoryMessage;
+  | ChatHistoryMessage
+  | FileEditOpenMessage
+  | FileEditSaveMessage
+  | FileEditCancelMessage;
 
 // ===== サーバ → クライアント =====
 
@@ -447,7 +489,64 @@ export type ServerMessage =
   | DirListingMessage
   | ChatEventMessage
   | ChatSnapshotMessage
-  | ChatStateMessage;
+  | ChatStateMessage
+  | FileEditLoadedMessage
+  | FileEditSavedMessage;
+
+// ===== ファイル編集（ボスが UI からファイルを書き換える）=====
+//
+// 本文（秘密の値を含みうる）は **fileEditOpen / fileEditSave を送った接続とサーバの間だけ**を流れる。
+// broadcast・チャットのトランスクリプト・JSONL・master への通知のどれにも載せない。
+
+/** 編集画面に渡す 1 ファイル分。 */
+export interface FileEditView {
+  /** 書き込み先の絶対パス（シンボリックリンクは解決済み）。 */
+  path: string;
+  /** 既にあるファイルか（false なら新規作成）。 */
+  exists: boolean;
+  /** 現在の本文（新規は null）。 */
+  content: string | null;
+  /** 現在の本文の sha256（新規は null）。保存時にそのまま返す。 */
+  baseHash: string | null;
+  /** 秘密を含みそうなファイルか（.env / *.key 等。UI は既定で伏せ字にする）。 */
+  secret: boolean;
+  /** 作る必要がある親フォルダ（浅い順の絶対パス）。空なら親はある。 */
+  missingDirs: string[];
+  /** 現在のサイズ（バイト・新規は 0）。 */
+  size: number;
+}
+
+/** 保存の結果（本文は含めない）。 */
+export interface FileEditSaveSummary {
+  path: string;
+  action: "create" | "update";
+  bytes: number;
+  /** 残した控えの絶対パス（残さなかった・新規作成は null）。 */
+  backupPath: string | null;
+  /** 新しく作った親フォルダ。 */
+  createdDirs: string[];
+}
+
+/** `fileEditOpen` への応答（要求した接続にだけ送る）。 */
+export interface FileEditLoadedMessage {
+  type: "fileEditLoaded";
+  /** 要求したパス（応答の突き合わせ用）。 */
+  path: string;
+  requestId?: string;
+  file?: FileEditView;
+  error?: string;
+}
+
+/** `fileEditSave` への応答（要求した接続にだけ送る）。 */
+export interface FileEditSavedMessage {
+  type: "fileEditSaved";
+  path: string;
+  requestId?: string;
+  saved?: FileEditSaveSummary;
+  error?: string;
+  /** 開いた後に他所で書き換わっていたため保存しなかった（開き直しを促す）。 */
+  conflict?: boolean;
+}
 
 // ===== master チャット UI（ui:"chat"）のプロトコル =====
 //
@@ -601,6 +700,27 @@ export type MasterChatEvent =
       answer: string | null;
     }
   | { kind: "notice"; level: "info" | "warn" | "error"; text: string }
+  /**
+   * master の request_file_edit による「このファイルにこの鍵を入れてください」の依頼。
+   * チャットに入力カードを出す。**値は載らない**（鍵名・パス・メモだけ）。
+   */
+  | {
+      kind: "fileEditRequest";
+      id: string;
+      path: string;
+      /** 入れてほしい鍵名（空なら本文を自由に編集する依頼）。 */
+      keys: string[];
+      note: string | null;
+      /** 依頼した送り手（MCP ブリッジの EBI_ID）。 */
+      from: string;
+    }
+  /** ファイル編集依頼の決着（保存した / 断った / 破棄された）。summary に値は入れない。 */
+  | {
+      kind: "fileEditSettled";
+      id: string;
+      outcome: "saved" | "cancelled" | "discarded";
+      summary: string | null;
+    }
   /**
    * 「新しい会話」（WS `chatNew`）で文脈をリセットした区切り。
    *

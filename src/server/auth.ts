@@ -35,6 +35,28 @@ export function isLoopback(req: IncomingMessage): boolean {
   return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
 }
 
+/**
+ * 同一オリジンのブラウザからの接続か（WS ハンドシェイクの Origin と Host が一致するか）。
+ *
+ * ブラウザは WS 接続に必ず Origin を付け、ページのスクリプトからは書き換えられない。
+ * - Origin が無い → ブラウザ以外（エビの素の WS クライアント等）なので false
+ * - Origin のホストが Host と違う → 別サイトのページからの接続（CSWSH）なので false
+ * ファイル編集のように「ボスの UI 操作だけに許したい」操作のゲートに使う。
+ * dev（Vite proxy）では Origin も Host も `localhost:5173` のまま届くので一致する。
+ */
+export function isSameOriginBrowser(req: Pick<IncomingMessage, "headers">): boolean {
+  const origin = req.headers["origin"];
+  const host = req.headers["host"];
+  if (typeof origin !== "string" || typeof host !== "string" || origin === "null") return false;
+  try {
+    const u = new URL(origin);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+    return u.host.toLowerCase() === host.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
 /** 認証判定の結果。ok=false のとき reason で理由を区別する。 */
 export type AuthOutcome =
   | { ok: true }

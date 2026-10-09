@@ -556,6 +556,38 @@ server.tool(
   },
 );
 
+// ---- request_file_edit: ボスにファイル（主に env）の入力を頼む（master 専用）----
+// 値はボスが UI で入れて保存する。このツールにも結果通知にも値は一切載らない。
+server.tool(
+  "request_file_edit",
+  "ボスのチャット欄に『このファイルにこの鍵を入れてください』という入力欄を出す（API トークン等を " +
+    "env ファイルへ置いてもらうとき用）。値はボスが UI で入力して保存し、**値そのものは master に届かない**。" +
+    "このツールはすぐ返り（status: pending）、ボスが保存/見送りしたら [file-edit <id>] の通知で結果だけが届く。" +
+    "パスはフルパス（~ 可）で、許可ルート（既定 $HOME/workspace と $HOME/.config・EBI_EDIT_ROOTS で設定）配下のみ。" +
+    "ファイルや親フォルダが無ければ新規作成になる（フォルダ作成と上書きはボスが画面で確認する）。" +
+    "ボスに値をチャットで送ってもらう代わりに必ずこれを使う。",
+  {
+    path: z.string().describe("書き込むファイルのフルパス（例: ~/.config/webgame-guide/prd.env）"),
+    keys: z
+      .array(z.string())
+      .optional()
+      .describe("入れてほしい鍵名（例: [\"CLOUDFLARE_API_TOKEN\"]）。省略するとファイル全体を自由に編集する依頼になる"),
+    note: z
+      .string()
+      .optional()
+      .describe("ボスへの一言（何に使う値か・どこで取得するか等）。値そのものは書かない"),
+  },
+  async ({ path, keys, note }) => {
+    const r = await callControl("POST", "/control/file-edit-request", {
+      path,
+      keys,
+      note,
+      from: process.env.EBI_ID ?? "master",
+    });
+    return toResult(r);
+  },
+);
+
 // ---- ask_supervisor: target エビの状況要約を回収して返す（バッチC 本実装）----
 server.tool(
   "ask_supervisor",

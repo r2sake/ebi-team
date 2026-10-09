@@ -3,6 +3,7 @@ import { Dashboard } from "./dashboard.ts";
 import { Viewer } from "./viewer.ts";
 import { FilePicker } from "./filePicker.ts";
 import { ChatPanel } from "./chat.ts";
+import { FileEditorDialog } from "./fileEditor.ts";
 import {
   type ClientMessage,
   type ServerMessage,
@@ -85,6 +86,17 @@ const filePicker = new FilePicker(
   (path) => sendMsg({ type: "listDir", path }),
   (path, title) => sendMsg({ type: "openViewer", path, title }),
 );
+
+// ファイル編集ダイアログ（ボスが UI からファイル＝主に env を書き換える）。
+// 本文は WS の fileEditOpen / fileEditSave でこの接続とサーバの間だけを流れる。
+const fileEditor = new FileEditorDialog(document.getElementById("file-editor") as HTMLElement, (msg) =>
+  sendMsg(msg),
+);
+chatPanel.setFileEditHooks({
+  open: () => fileEditor.open(),
+  openRequest: (req) => fileEditor.openRequest(req),
+  cancelRequest: (requestId) => sendMsg({ type: "fileEditCancel", requestId }),
+});
 
 // 表示順: dashboard → master → supervisor → dynamic。同種は元の順を維持（Array.sort は V8 で安定）。
 // 種別ソートにすることで、固定エビが自動再起動で末尾に来ても順序が崩れない。
@@ -280,6 +292,12 @@ function handleServerMessage(msg: ServerMessage): void {
     case "chatEvent":
       chatPanel.applyEvent({ seq: msg.seq, ts: msg.ts, event: msg.event });
       break;
+    case "fileEditLoaded":
+      fileEditor.handleLoaded(msg);
+      break;
+    case "fileEditSaved":
+      fileEditor.handleSaved(msg);
+      break;
     case "dirListing":
       // ファイルピッカーのディレクトリ列挙応答。error なら理由をモーダル内に表示。
       if (msg.error) filePicker.setError(msg.error);
@@ -441,6 +459,19 @@ function renderRegistry(): void {
     const td = document.createElement("td");
     td.colSpan = 6;
     td.textContent = "📂 ファイルを開く";
+    tr.appendChild(td);
+    registryBody.appendChild(tr);
+  }
+
+  // 「📝 ファイルを編集」合成エントリ。クリックで編集ダイアログ（パス入力から）を開く。
+  {
+    const tr = document.createElement("tr");
+    tr.className = "agent-row open-file-row";
+    tr.title = "許可ルート配下のファイル（env など）を書き換える";
+    tr.addEventListener("click", () => fileEditor.open());
+    const td = document.createElement("td");
+    td.colSpan = 6;
+    td.textContent = "📝 ファイルを編集";
     tr.appendChild(td);
     registryBody.appendChild(tr);
   }
