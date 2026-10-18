@@ -8,6 +8,7 @@ import type {
 import {
   ChatTranscript,
   collectImages,
+  enterAction,
   fileEditSettledLabel,
   firstUnsettledPending,
   formatBytes,
@@ -15,6 +16,7 @@ import {
   formatCost,
   headerMetrics,
   InputHistory,
+  inputPlaceholder,
   LARGE_PASTE_CHARS,
   MAX_CHAT_ITEMS,
   NO_RATE_LIMITS,
@@ -34,6 +36,14 @@ import {
 } from "./chatModel.ts";
 import { renderMarkdownInto } from "./viewer.ts";
 import type { FileEditRequestInfo } from "./fileEditor.ts";
+
+/**
+ * タッチ端末（スマホ・タブレット）か。主たるポインタが指（pointer: coarse）なら真。
+ * PC（マウス・トラックパッド。タッチ対応ノート PC も主ポインタは fine）は偽。
+ */
+function isTouchDevice(): boolean {
+  return window.matchMedia?.("(pointer: coarse)").matches ?? false;
+}
 
 /** ファイル編集の導線（main.ts が FileEditorDialog と WS へ配線する）。 */
 export interface FileEditHooks {
@@ -97,6 +107,8 @@ export class ChatPanel {
   /** items と 1:1 で並ぶ描画済み要素（増分更新のため index で引く）。 */
   private readonly rendered: HTMLElement[] = [];
   private state: MasterChatState = "stopped";
+  /** IME で変換中か（compositionstart〜compositionend）。 */
+  private composing = false;
   private pending = 0;
   private visible = false;
   /** 最下部に張り付いているか（false のとき新着で勝手にスクロールしない）。 */
@@ -184,8 +196,11 @@ export class ChatPanel {
     this.input = document.createElement("textarea");
     this.input.className = "chat-input";
     this.input.rows = 1;
-    this.input.placeholder = "master に話しかける（Enter で送信 / Shift+Enter で改行）";
+    this.input.placeholder = inputPlaceholder(this.state, isTouchDevice());
     this.input.addEventListener("keydown", (e) => this.onKeyDown(e));
+    // IME の変換中フラグ（keydown の isComposing が付かないブラウザ向けの保険）。
+    this.input.addEventListener("compositionstart", () => (this.composing = true));
+    this.input.addEventListener("compositionend", () => (this.composing = false));
     this.input.addEventListener("input", () => this.autoGrow());
     this.input.addEventListener("paste", (e) => this.onPaste(e));
     // ドロップは入力欄だけでなくパネル全体で受ける（ログ側に落としても添付できる）。
@@ -295,14 +310,15 @@ export class ChatPanel {
 
   /** 入力欄へフォーカス（広幅のみ。狭幅は勝手にソフトキーボードを出さない）。 */
   focusInput(): void {
-    if (window.matchMedia?.("(pointer: coarse)").matches) return;
+    if (isTouchDevice()) return;
     this.input.focus();
   }
 
   // ===== 内部 =====
 
   private onKeyDown(e: KeyboardEvent): void {
-    if (e.isComposing) return; // IME 変換中のキーはすべて変換操作（履歴も送信も動かさない）。
+    // IME 変換中のキーはすべて変換操作（履歴も送信も動かさない）。確定の Enter も keyCode 229 で来る。
+    if (e.isComposing || e.keyCode === 229 || this.composing) return;
     // ↑/↓ の入力履歴。複数行を編集しているときの行移動を邪魔しないよう、
     // ↑ は「キャレットが先頭」、↓ は「キャレットが末尾」のときだけ履歴として振る舞う。
     if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.shiftKey && !e.altKey && !e.metaKey) {
@@ -328,8 +344,16 @@ export class ChatPanel {
       }
       return;
     }
-    // Enter 送信 / Shift+Enter 改行。
-    if (e.key !== "Enter" || e.shiftKey) return;
+    // PC は Enter 送信 / Shift+Enter 改行。タッチ端末は Enter 改行（送信はボタンだけ）。
+    const action = enterAction({
+      key: e.key,
+      shiftKey: e.shiftKey,
+      isComposing: e.isComposing,
+      keyCode: e.keyCode,
+      composing: this.composing,
+      touch: isTouchDevice(),
+    });
+    if (action !== "send") return;
     e.preventDefault();
     this.onSendClick();
   }
@@ -494,11 +518,7 @@ export class ChatPanel {
     this.sendBtn.disabled = blocked;
     this.stopBtn.disabled = !stopEnabled(this.state);
     this.input.disabled = blocked;
-    this.input.placeholder = blocked
-      ? "master（chat）が起動していません…"
-      : this.state === "busy"
-        ? "実行中でも送れます（Enter で送信 / 中断は ⏹）"
-        : "master に話しかける（Enter で送信 / Shift+Enter で改行）";
+    this.input.placeholder = inputPlaceholder(this.state, isTouchDevice());
     this.newBtn.disabled = this.state === "starting";
     if (this.pending > 0) {
       this.pendingBar.hidden = false;

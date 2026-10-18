@@ -950,3 +950,33 @@ export function headerMetrics(stats: ChatStats, rl: HeaderRateLimits): HeaderMet
   ];
 }
 
+
+/**
+ * 入力欄で押されたキーが「送信」か「何もしない（既定動作に任せる）」かを決める。
+ * - IME の変換中・変換確定の Enter（isComposing / keyCode 229 / composition 中）は送信しない（PC・スマホ共通）。
+ * - タッチ端末（touch=true）では Enter は改行。送信は送信ボタンだけ
+ *   （スマホのソフトキーボードは Enter＝確定/改行で、Shift+Enter が打てないため）。
+ * - それ以外（PC）は Enter で送信 / Shift+Enter で改行。
+ */
+export function enterAction(k: {
+  key: string;
+  shiftKey: boolean;
+  isComposing: boolean;
+  keyCode: number;
+  composing: boolean;
+  touch: boolean;
+}): "send" | "default" {
+  if (k.key !== "Enter") return "default";
+  if (k.isComposing || k.keyCode === 229 || k.composing) return "default";
+  if (k.touch || k.shiftKey) return "default";
+  return "send";
+}
+
+/** 入力欄の案内文。タッチ端末では Enter が改行なので送信の説明を出さない（短くして 1 行に収める）。 */
+export function inputPlaceholder(state: string, touch: boolean): string {
+  if (!sendEnabled(state)) return "master（chat）が起動していません…";
+  if (touch) return state === "busy" ? "実行中でも送れます" : "master に話しかける";
+  return state === "busy"
+    ? "実行中でも送れます（Enter で送信 / 中断は ⏹）"
+    : "master に話しかける（Enter で送信 / Shift+Enter で改行）";
+}
