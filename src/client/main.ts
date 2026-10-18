@@ -697,6 +697,25 @@ window.addEventListener("resize", () => {
   if (activeId) panes.get(activeId)?.refit();
 });
 
+// ===== スマホ: 画面の高さを「実際に見えている高さ」に合わせる =====
+// 100vh / 100dvh だけだと、ブラウザ下部のツールバーやソフトキーボードの裏に
+// 下端のチャット入力欄が潜ることがある（interactive-widget 未対応のブラウザ等）。
+// 狭幅のときだけ visualViewport の高さを --app-h に入れ、body の高さに使う（style.css）。
+// ピンチズーム中（scale≠1）は見えている高さが縮むだけなので追従しない。広幅（PC）では触らない。
+function syncAppHeight(): void {
+  const vv = window.visualViewport;
+  const narrow = window.matchMedia("(max-width: 768px)").matches;
+  if (!vv || !narrow) {
+    document.body.style.removeProperty("--app-h");
+    return;
+  }
+  if (Math.abs(vv.scale - 1) > 0.01) return;
+  document.body.style.setProperty("--app-h", `${Math.round(vv.height)}px`);
+}
+syncAppHeight();
+window.visualViewport?.addEventListener("resize", syncAppHeight);
+window.addEventListener("resize", syncAppHeight);
+
 // ===== スマホ: サイドバー（registry ドロワー）開閉 =====
 function setDrawer(open: boolean): void {
   sidebar.classList.toggle("open", open);

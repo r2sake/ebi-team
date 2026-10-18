@@ -24,6 +24,10 @@ body {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  /* スマホの 100vh は「アドレスバー等を畳んだときの最大の高さ」なので、
+     ブラウザ下部のツールバーやソフトキーボードの裏に下端（チャット入力欄）が潜る。
+     実際に見えている高さ（dvh）を使う。PC では 100vh と同じ値。 */
+  height: 100dvh;
 }
 
 .topbar {
@@ -642,6 +646,10 @@ button:hover { filter: brightness(1.07); }
 
 /* ===== 狭幅（スマホ）レイアウト ===== */
 @media (max-width: 768px) {
+  /* 狭幅では main.ts が visualViewport の高さを --app-h に入れる
+     （dvh / interactive-widget に未対応のブラウザでもキーボードの上に入力欄を出すため）。 */
+  body { height: var(--app-h, 100dvh); }
+
   .sidebar-toggle { display: inline-block; }
 
   .topbar {
