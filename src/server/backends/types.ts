@@ -242,6 +242,14 @@ export interface BackendTraits {
    * null / 未指定なら監視しない（claude / gemini は未指定＝挙動不変）。
    */
   readonly ackFailureWatch?: AckFailureWatchSpec | null;
+  /**
+   * busy（作業中）のエビへ master の注入を**溜めずにその場で**書いてよいか（任意項目・未指定＝false）。
+   * true の backend は、作業中の TUI に打った 1 行が「いま走っているターン」へ差し込まれる
+   * （codex の steer。codex-cli 0.156.1 で実測: sleep 中に送った訂正が同じターン内で反映された）。
+   * false の backend は従来どおり injectQueue に積み、idle 復帰時に flush する。
+   * claude は channel（notification）経路で作業中にも届くため対象外（PTY 側は挙動不変）。
+   */
+  readonly steerWhileBusy?: boolean;
   /** 起動前チェックの宣言。 */
   readonly preflight: BackendPreflightSpec;
   /**

@@ -131,6 +131,33 @@ export function killProcessGroupSignal(
  */
 export type InjectState = "sent" | "queued" | "suppressed";
 
+/** busy 中でもその場で書いてよい送信元（作業中の訂正を待たせたくないのは master の指示）。 */
+const STEER_SENDERS: ReadonlySet<string> = new Set(["master"]);
+
+/**
+ * busy のエビへの注入を、溜めずに作業中のターンへ差し込むかの判定（純関数）。
+ * - backend が steerWhileBusy を持つ（codex）こと。env EBI_BUSY_STEER=off で従来動作へ戻せる。
+ * - ready 前は差し込まない（入力欄が無い／役割プロンプトより先に書くと混ざる）。
+ * - 送信元が master のときだけ（他のエビからの通知は従来どおり idle 復帰まで待つ）。
+ * - 先に溜まっている注入があるときは追い越さない（順序を保つため、そのまま後ろに積む）。
+ * - guard 付き（notify フォールバック由来の重複抑止つき）はキューでの再照合が要るので対象外。
+ */
+export function shouldSteerWhileBusy(input: {
+  steerWhileBusy: boolean;
+  ready: boolean;
+  from: string;
+  queueLength: number;
+  guarded: boolean;
+}): boolean {
+  return (
+    input.steerWhileBusy &&
+    input.ready &&
+    STEER_SENDERS.has(input.from) &&
+    input.queueLength === 0 &&
+    !input.guarded
+  );
+}
+
 /**
  * 注入直前に「同じメッセージが channel 経由で既にセッションへ描画されていないか」を照合するための印。
  *
@@ -416,6 +443,8 @@ export class Agent {
   readonly backend: BackendId;
   /** kill 時にプロセスグループごと落とすか（backend のトレイト。gemini のみ true）。 */
   private readonly killProcessGroup: boolean;
+  /** busy 中でも master の注入をその場で書く backend か（BackendTraits.steerWhileBusy）。 */
+  private readonly steerWhileBusy: boolean;
   /**
    * 「入力受付（プロンプト表示）」を示す出力パターン（backend のトレイト。null なら従来判定）。
    * これを持つ backend は、パターンを一度も見ていない間は ready へ昇格しない。
@@ -591,6 +620,8 @@ export class Agent {
       : resolveBackendOrDefault(launch.command);
     this.backend = backend.id;
     this.killProcessGroup = backend.killProcessGroup;
+    this.steerWhileBusy =
+      (backend.steerWhileBusy ?? false) && process.env.EBI_BUSY_STEER !== "off";
     this.readyPattern = backend.readyPattern ?? null;
     this.fatalPatterns = backend.fatalPatterns ?? [];
     this.ackWatchSpec = resolveAckWatchSpec(backend.ackFailureWatch ?? null, launch.ackWatchMs);
@@ -1094,6 +1125,8 @@ export class Agent {
 
   /**
    * 送信元タグ付き注入。idle なら即送信、busy ならキューへ。
+   * 例外: steerWhileBusy の backend（codex）で送信元が master なら、busy でも即送信する
+   * （作業中のターンへ差し込む。判定は shouldSteerWhileBusy）。
    * 戻り値で「今 stdin へ送った（sent）／busy で滞留した（queued）」を区別する。
    * 滞留は idle 復帰まで相手の目に触れないため、呼び出し側はこれを confirmed と区別する。
    * フォーマット: 本文 `[from:<from>#<msgId>] <message>` を書き、少し待ってから Enter を別 write で
@@ -1114,6 +1147,20 @@ export class Agent {
         return "suppressed";
       }
       void this.enqueueWrite(body);
+      return "sent";
+    }
+    if (
+      shouldSteerWhileBusy({
+        steerWhileBusy: this.steerWhileBusy,
+        ready: this.hasBeenReady,
+        from,
+        queueLength: this.injectQueue.length,
+        guarded: guard !== undefined,
+      })
+    ) {
+      // 作業中のターンへ差し込む（codex の steer）。今 stdin へ書くので "sent"。
+      void this.enqueueWrite(body);
+      this.handlers.onNotice(this.id, "busy 中だが master の注入を作業中のターンへ差し込みました");
       return "sent";
     }
     this.injectQueue.push({ body, guard });
