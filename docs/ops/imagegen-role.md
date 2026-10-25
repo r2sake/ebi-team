@@ -51,7 +51,7 @@ npm run imagegen:check -- job /path/to/job.yaml
 | 保存先 | ebi-team の `tmp/images/<job_id>/`（`.gitignore` 済み）。**採否を見てから** master / engineer が対象リポジトリの assets へ配る |
 | 1 ジョブの上限 | **6 枚**（`count` の合計）。超える分は `status: skipped` / `error_code: OVER_LIMIT` |
 | 作り直し | 同じ依頼 YAML に `regenerate: [id, ...]` を足して**再投入**する。その id だけが作り直され、他は触られない |
-| 加工 | リサイズ（`sips -Z` の長辺合わせ）と PNG→WebP（`cwebp -q 90`）**だけ**。減色・トリム・切り抜き・背景除去は禁止 |
+| 加工 | リサイズ（`sips -Z` の長辺合わせ）と PNG→WebP（`cwebp -q 90`）**だけ**。減色・トリム・切り抜き・背景除去は禁止（例外は §2.1 の透過の手順だけ。2026-10-25 ボス裁定） |
 | 待ち時間の目安 | 90 s × 枚数 ＋ 120 s（2 枚の実測 171.7 s） |
 
 報告は `reply_to_master` 1 回・`imagegen_result: v1` の YAML 1 ブロック。`path` は絶対パスなので、
@@ -59,6 +59,38 @@ master は **`chat_image({path, title?, caption?})` でそのままボスのチ�
 （クリックで拡大表示。`open_viewer` は md/txt のレビューや原寸比較のときに使う）。
 納品先 `tmp/images/<job_id>/` は ebi-team リポジトリ配下＝ viewer の許可ルート（既定 `$HOME/workspace`）内なので条件を満たす。
 **ジョブ側で `dest_root` を許可ルートの外（`/tmp` 等）に向けると `chat_image` も `open_viewer` も 400 で弾かれる**ので注意。
+
+### 2.1 透過・一覧・採用のまとめ（2026-10-25 追加）
+
+ボス裁定（2026-10-25）:「6枚制限はそのまま、指示通りにいかなかったら諦めてボスに依頼で」。
+役割プロンプトの 9〜11 項がこの手順。有料の API（gpt-image-1.5）には切り替えない。
+
+**透過は、依頼に「透過（背景なし）」と書く。マゼンタ背景を指定しない。**
+組み込みの image_gen は「背景は完全な透明（transparent background）」と頼むと alpha 付きの PNG を返す
+（2026-10-25 実測 2/2: 光るオーブのグロー・紫の宝石と紫の光も、そのまま半透明で出た。
+出力は 1275x1234 のように正方形からずれることがある）。
+
+1. 透過を頼まれた画像は、エビがプロンプトの末尾に透明背景の指示を足して生成する。`hasAlpha: yes` ならそのまま納品する。
+2. alpha が付かなかったときと、master が背景色（マゼンタ等）を指定したときは、背景色の名前が付いた版を残す。そのうえで
+   `scripts/imagegen-alpha.py` で横に `<名前>_alpha.png` を足す。中身は codex 同梱の `remove_chroma_key.py` と、機械チェック
+   （外周の残り・マゼンタの残り・半透明の多さ・**被写体の中の穴**）。チェックに落ちた画像は `_alpha` を作らず、
+   note に「ボスに透過を依頼」と書く。
+   - クロマキーは**紫・ピンクの被写体に弱い**。2026-10-25 のマゼンタ版 14 枚のうち 12 枚が「被写体の中が透けた」で落ちた
+     （紫の宝石・鎌の刃の紫の反射・オーブの光の輪）。だから透過は 1. で頼むのが本線。
+3. エビは `contact.png` を目で見て、グロー・半透明・髪の毛先が崩れた `_alpha` を `_alpha_rejected` に改名し、ボスへ回す。
+
+| 道具 | 使う人 | 使い方 |
+|---|---|---|
+| `npm run imagegen:alpha -- <png...>` | imagegen エビ | マゼンタ版の横に `_alpha.png`。1 画像 1 行の JSON（ok / reason）を出す。1 枚 7 秒前後 |
+| `npm run imagegen:contact -- <dir>` | imagegen エビ／master | `<dir>/contact.png`。全部の案をファイル名のラベル付きで 4 列に並べる。透過版は市松模様の背景 |
+| `npm run imagegen:pick -- --to <内容> <batch dir> <id...> [<batch dir> <id...>]` | master（手元） | `tmp/images/<YYYYMMDD>_<内容>_透過用/` へコピーし、contact.png を作り、Finder で開く |
+
+- 報告 YAML の追加項目: `gen_count`（image_gen を呼んだ回数）、`contact`（一覧の絶対パス）、各要素の `alpha_path`。
+  master は `contact` を `chat_image` で 1 回送れば、ボスが案 A／B を一度に比べられる。
+- `imagegen:pick` の id は「拡張子を除いたファイル名が id そのもの、または `id_` で始まるもの」に当たる
+  （`ring-1` → `ring-1_magenta.png` と `ring-1_alpha.png`。`ring-10` には当たらない。`_rejected` は除く）。
+  採用フォルダにしたいときは `--suffix 採用` を付ける。`--no-open` で Finder を開かない。
+  imagegen エビは codex のサンドボックスの中にいて `open` を実行できないので、pick は master の側で動かす。
 
 ## 3. 失敗したとき
 

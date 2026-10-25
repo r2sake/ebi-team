@@ -324,6 +324,8 @@ export interface ImagegenResultItem {
   readonly id: string;
   readonly status: ImagegenStatus;
   readonly path: string | null;
+  /** マゼンタ背景の版から抜いた透過版（scripts/imagegen-alpha.py）。抜けなかったときは null。 */
+  readonly alphaPath: string | null;
   readonly pixels: string | null;
   readonly bytes: number | null;
   readonly format: string | null;
@@ -337,6 +339,10 @@ export interface ImagegenResult {
   readonly summary: string;
   readonly results: readonly ImagegenResultItem[];
   readonly genSeconds: number | null;
+  /** このジョブで image_gen を呼んだ回数（作り直し・失敗も含む）。生成の枠の減り方を見るため。 */
+  readonly genCount: number | null;
+  /** 全部の案を 1 枚に並べた一覧（scripts/imagegen-contact.py）。master は chat_image で 1 回送る。 */
+  readonly contact: string | null;
 }
 
 /** 報告 YAML を検証して正規化する（master が受け取った本文を機械照合するための口）。 */
@@ -353,6 +359,18 @@ export function parseImagegenResult(text: string): ImagegenResult {
     issues.push(`gen_seconds は数値にすること: ${genSecondsRaw}`);
   }
 
+  const genCountRaw = optionalString(root, "gen_count", issues);
+  let genCount: number | null = null;
+  if (genCountRaw !== null) {
+    const n = Number(genCountRaw);
+    if (!Number.isInteger(n) || n < 0) issues.push(`gen_count は 0 以上の整数にすること: ${genCountRaw}`);
+    else genCount = n;
+  }
+  const contact = optionalString(root, "contact", issues);
+  if (contact !== null && !contact.startsWith("/")) {
+    issues.push(`contact は絶対パスで書くこと: ${contact}`);
+  }
+
   const rawResults = root.get("results");
   const results: ImagegenResultItem[] = [];
   if (!Array.isArray(rawResults) || rawResults.length === 0) {
@@ -365,7 +383,7 @@ export function parseImagegenResult(text: string): ImagegenResult {
   }
 
   if (issues.length > 0) throw new ImagegenValidationError(issues);
-  return { jobId, summary, results, genSeconds: genSeconds === null ? null : genSeconds };
+  return { jobId, summary, results, genSeconds: genSeconds === null ? null : genSeconds, genCount, contact };
 }
 
 function normalizeResultItem(raw: unknown, index: number, issues: string[]): ImagegenResultItem | null {
@@ -386,6 +404,10 @@ function normalizeResultItem(raw: unknown, index: number, issues: string[]): Ima
   if (status === "ok" && (path === null || !path.startsWith("/"))) {
     // master が open_viewer にそのまま渡せるよう絶対パス固定。
     issues.push(`${at}.path は絶対パスで書くこと（status: ok では必須）`);
+  }
+  const alphaPath = optionalString(raw, "alpha_path", issues, at);
+  if (alphaPath !== null && !alphaPath.startsWith("/")) {
+    issues.push(`${at}.alpha_path は絶対パスで書くこと: ${alphaPath}`);
   }
   const pixels = optionalString(raw, "pixels", issues, at);
   if (status === "ok" && (pixels === null || !SIZE_RE.test(pixels))) {
@@ -416,7 +438,7 @@ function normalizeResultItem(raw: unknown, index: number, issues: string[]): Ima
   const note = optionalString(raw, "note", issues, at);
 
   if (issues.length !== before) return null;
-  return { id, status, path, pixels, bytes, format, tool, errorCode, note };
+  return { id, status, path, alphaPath, pixels, bytes, format, tool, errorCode, note };
 }
 
 // ===== 最小 YAML パーサ（本様式が使う部分集合だけ） =====
