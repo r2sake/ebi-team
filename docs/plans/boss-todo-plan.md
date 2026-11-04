@@ -78,6 +78,7 @@ interface TodoItem {
   options: TodoOption[];   // 選択肢（0〜6 件。質問以外は空でよい）
   recommended: string | null; // 推奨する選択肢の label（options にあるものに限る）
   createdAt: number;       // 作った時刻（epoch ms）
+  chatSeq: number | null;  // つながるチャットの発言の seq（2026-11-04 追加・§4.4）。古い TODO は null
 }
 
 interface TodoFile { version: 1; nextNo: number; items: TodoItem[] }
@@ -105,7 +106,7 @@ interface TodoFile { version: 1; nextNo: number; items: TodoItem[] }
 
 | ツール | 引数 | 返り値 | 制御 API |
 |---|---|---|---|
-| `todo_add` | `title, detail, kind, ebi?, project?, options?, recommended?` | `{ no }` | `POST /control/todo-add` |
+| `todo_add` | `title, detail, kind, ebi?, project?, options?, recommended?, chat_seq?` | `{ no, item }` | `POST /control/todo-add` |
 | `todo_list` | なし | 未解決の一覧（`no / kind / title / ebi / project / createdAt` だけ。詳細は含めない＝トークン節約） | `GET /control/todos` |
 | `todo_get` | `no` | 1 件の全部（detail・options・recommended まで）。無ければ「解決済み or 未発行」 | `GET /control/todo?no=N` |
 | `todo_resolve` | `no` | `{ ok }`。台帳から消し、UI の一覧から即座に消える | `POST /control/todo-resolve` |
@@ -150,6 +151,15 @@ interface TodoFile { version: 1; nextNo: number; items: TodoItem[] }
 - 消すのは「回答した瞬間」にする。master が受け取ったかどうかは待たない。
   `sendUserText` が `accepted:false`（master が止まっている）を返したときだけ消さずに残し、パネルにエラーを出す。答えが宙に浮かないようにするため。
 - master が PTY（`ui:"chat"` でない）構成のとき、(a) の送り先は master への `inject` に切り替える。今の構成は chat なので、この経路は試験だけにする。
+
+### 4.4 TODO からチャットの発言へ飛ぶ（2026-11-04 追加・ops/plan-ui-todo-link-scroll-20261104.md）
+- ボスの要件:「サムネが確認したくても TODO からだと追えない。TODO にチャットのリンクを足してワンクリックで確認したい」。
+- `chat_image` の応答に、その画像の発言の `seq` を足した。`todo_add` に任意の引数 `chat_seq` を足し、その seq を `TodoItem.chatSeq` に保存する。
+  省くと追加した時点のチャットの最新 seq が入る（chat master が居ない構成では null）。明示の `chat_seq` は 1〜最新 seq だけを受け付け、それ以外は 400。
+  master ティアの instructions に「chat_image で見せたものを TODO にするときは、返った seq を todo_add の chat_seq に渡す」を足した。
+- seq は単調に増え、「新しい会話」にしても戻らない（`MasterSession.latestSeq()`）。todos.json に `chatSeq` を足しても `version: 1` のまま読める（無い・壊れた値は null）。
+- TODO パネルの各行の右端に「💬 チャットで見る」を出す（`chatSeq` が null なら出さない）。押すとパネルを閉じてチャットへ切り替え、その発言を中央に出して 2.5 秒強調する。
+  画面に無い発言（新しい会話にした・400 件より前）なら、パネルを閉じずに行の下へ「この発言はもうチャットの画面に残っていません」と出す。
 
 ---
 

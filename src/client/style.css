@@ -1626,6 +1626,25 @@ button:hover { filter: brightness(1.07); }
   cursor: pointer;
   font: inherit;
 }
+/* 行: 件名のボタン＋右端の「💬 チャットで見る」。 */
+.todo-line { display: flex; align-items: flex-start; }
+.todo-line .todo-summary { flex: 1 1 auto; min-width: 0; }
+.todo-chat-link {
+  flex: 0 0 auto;
+  margin: 8px 10px 0 0;
+  padding: 4px 10px;
+  min-height: 30px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.todo-chat-link:hover { border-color: var(--accent); }
+.todo-chat-missing { padding: 0 12px 10px; color: var(--muted); font-size: 12px; }
 .todo-no { grid-area: no; color: var(--accent); font-weight: 700; font-variant-numeric: tabular-nums; }
 .todo-kind { grid-area: kind; }
 .todo-item-title { grid-area: title; word-break: break-word; }

@@ -32,8 +32,10 @@ import {
 import { createControlApi } from "../src/server/control.ts";
 import { Registry } from "../src/server/registry.ts";
 import {
+  CHAT_LINK_MISSING_TEXT,
   ageLabel,
   canSendAnswer,
+  chatLinkSeq,
   showsDoneButton,
   todoBreakdown,
   todoButtonText,
@@ -222,6 +224,66 @@ test("表示: ボタンの文言・内訳・経過時間・メタ・ボタンの
   assert.equal(canSendAnswer("A", ""), true);
 });
 
+// ===== チャットとのつながり（chatSeq）=====
+
+test("chatSeq: 明示の chat_seq を優先し、無ければ追加した時点の最新 seq が入る", async () => {
+  let latest: number | null = 10;
+  const board = new TodoBoard({ storePath: null, chatSeqNow: () => latest });
+  assert.equal((await board.add(Q, { chatSeq: 4 })).chatSeq, 4);
+  assert.equal((await board.add(Q)).chatSeq, 10);
+  latest = 12;
+  assert.equal((await board.add(Q, { chatSeq: undefined })).chatSeq, 12);
+  assert.equal((await board.add(Q, { chatSeq: 12 })).chatSeq, 12); // 最新ちょうどは受ける
+  // chat master が居ない構成（最新が null）・依存を渡さない構成では null。
+  latest = null;
+  assert.equal((await board.add(Q)).chatSeq, null);
+  assert.equal((await new TodoBoard({ storePath: null }).add(Q)).chatSeq, null);
+});
+
+test("chatSeq: 範囲外・型違いの chat_seq は TodoError（台帳は増えない）", async () => {
+  const board = new TodoBoard({ storePath: null, chatSeqNow: () => 10 });
+  for (const bad of [0, -1, 11, 1.5, "3", true]) {
+    await assert.rejects(board.add(Q, { chatSeq: bad }), TodoError, String(bad));
+  }
+  await assert.rejects(new TodoBoard({ storePath: null }).add(Q, { chatSeq: 1 }), TodoError);
+  assert.equal(board.size, 0);
+  assert.equal(board.nextNo, 1);
+});
+
+test("chatSeq: todos.json を往復しても残る・古いファイル（chatSeq 無し）や壊れた値は null", async () => {
+  const { path, cleanup } = await makeStore();
+  try {
+    const board = new TodoBoard({ storePath: path, chatSeqNow: () => 7 });
+    await board.add(Q, { chatSeq: 5 });
+    await board.add({ title: "自動", kind: "action" });
+    const again = new TodoBoard({ storePath: path });
+    await again.restore();
+    assert.deepEqual(again.list().map((it) => it.chatSeq), [5, 7]);
+  } finally {
+    await cleanup();
+  }
+  const parsed = parseTodoFile(
+    JSON.stringify({
+      version: 1,
+      nextNo: 4,
+      items: [
+        { no: 1, createdAt: 1, title: "古い", kind: "action" },
+        { no: 2, createdAt: 1, title: "壊れた", kind: "action", chatSeq: "x" },
+        { no: 3, createdAt: 1, title: "負", kind: "action", chatSeq: -2 },
+      ],
+    }),
+  );
+  assert.deepEqual(parsed!.items.map((it) => it.chatSeq), [null, null, null]);
+});
+
+test("chatLinkSeq: つながっている TODO だけボタンを出す", () => {
+  assert.equal(chatLinkSeq({ chatSeq: 3 }), 3);
+  assert.equal(chatLinkSeq({ chatSeq: null }), null);
+  // 古いサーバから届いた（欄が無い）TODO でも落ちない。
+  assert.equal(chatLinkSeq({} as Pick<TodoItem, "chatSeq">), null);
+  assert.ok(CHAT_LINK_MISSING_TEXT.includes("残っていません"));
+});
+
 // ===== 制御API =====
 
 async function withTodoApi<T>(board: TodoBoard | null, fn: (base: string) => Promise<T>): Promise<T> {
@@ -271,6 +333,7 @@ test("制御API: add → list（詳細なし）→ get → resolve → get は�
     const add = await call(base, "POST", "/control/todo-add", Q);
     assert.equal(add.status, 200);
     assert.equal(add.json.no, 1);
+    assert.equal((add.json.item as TodoItem).chatSeq, null);
 
     const list = await call(base, "GET", "/control/todos");
     assert.equal(list.status, 200);
@@ -299,6 +362,8 @@ test("制御API: add → list（詳細なし）→ get → resolve → get は�
 test("制御API: 検証失敗は 400・台帳が無ければ 404", async () => {
   await withTodoApi(new TodoBoard({ storePath: null }), async (base) => {
     assert.equal((await call(base, "POST", "/control/todo-add", { title: "x", kind: "memo" })).status, 400);
+    // chat_seq はチャットの最新 seq まで（ここでは chat master が居ない＝どれも 400）。
+    assert.equal((await call(base, "POST", "/control/todo-add", { ...Q, chat_seq: 1 })).status, 400);
     assert.equal((await call(base, "GET", "/control/todo?no=abc")).status, 400);
     assert.equal((await call(base, "POST", "/control/todo-resolve", { no: "1" })).status, 400);
   });

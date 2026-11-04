@@ -464,6 +464,10 @@ test("新しい会話: resume 無しで起動し直し、コスト累計と pend
   assert.equal(h.events.filter((e) => e.event.kind === "cleared").length, 1);
   const snap = h.session.snapshot();
   assert.ok(snap.events.some((e) => e.event.kind === "cleared"));
+  // seq は新しい会話にしても戻らない（TODO の chatSeq が別の発言を指さない）。
+  const last = h.events[h.events.length - 1]!.seq;
+  assert.equal(h.session.latestSeq(), last);
+  assert.ok(last >= 3);
 });
 
 test("新しい会話の直後も送信できる（新プロセスの stdin へ載る）", async () => {
@@ -669,7 +673,7 @@ test("shareImage: seq を進めてイベントを流し、snapshot に含まれ�
   const h = makeSession();
   await h.session.start();
   const before = h.events.length;
-  h.session.shareImage([
+  const seq = h.session.shareImage([
     {
       name: "chat-20260905-101010-abcdef12.png",
       url: "/control/chat-attachment?name=chat-20260905-101010-abcdef12.png",
@@ -691,6 +695,9 @@ test("shareImage: seq を進めてイベントを流し、snapshot に含まれ�
   assert.equal(JSON.stringify(envelope!.event).includes("base64"), false);
   // seq は既存イベントの続き（単調増加）。
   assert.equal(envelope!.seq, (h.events[before - 1]?.seq ?? 0) + 1);
+  // 振った seq を返す（chat_image の戻り値 → todo_add の chat_seq）。latestSeq もそこを指す。
+  assert.equal(seq, envelope!.seq);
+  assert.equal(h.session.latestSeq(), envelope!.seq);
 
   const snap = h.session.snapshot();
   assert.ok(
@@ -704,7 +711,7 @@ test("shareImage: 空配列では何も流さない", async () => {
   const h = makeSession();
   await h.session.start();
   const before = h.events.length;
-  h.session.shareImage([]);
+  assert.equal(h.session.shareImage([]), null);
   assert.equal(h.events.length, before);
   await h.session.stop();
 });

@@ -51,3 +51,13 @@ export function showsDoneButton(item: Pick<TodoItem, "kind">): boolean {
 export function canSendAnswer(choice: string | null, text: string): boolean {
   return !!choice || text.trim() !== "";
 }
+
+/** 「💬 チャットで見る」を出すか（チャットの発言とつながっている TODO だけ）。 */
+export function chatLinkSeq(item: Pick<TodoItem, "chatSeq">): number | null {
+  const seq = item.chatSeq;
+  return typeof seq === "number" && Number.isInteger(seq) && seq >= 1 ? seq : null;
+}
+
+/** 飛ぶ先の発言がチャットの画面に無いときの文言。 */
+export const CHAT_LINK_MISSING_TEXT =
+  "この発言はもうチャットの画面に残っていません（新しい会話にしたか、400 件より前です）";

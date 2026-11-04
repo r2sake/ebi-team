@@ -94,10 +94,17 @@ const fileEditor = new FileEditorDialog(document.getElementById("file-editor") a
   sendMsg(msg),
 );
 // ボスの TODO パネル（トップバーの「📋 TODO n」から開く）。一覧は WS `todos`、回答は WS `todoAnswer`。
+// 「💬 チャットで見る」: チャットへ切り替えて、その TODO を載せたときの発言へ飛ぶ。
 const todoPanel = new TodoPanel(
   document.getElementById("todo-btn") as HTMLButtonElement,
   document.getElementById("todo-panel") as HTMLElement,
   (msg) => sendMsg(msg),
+  (seq) => {
+    const id = chatMasterId();
+    if (id === null || !chatPanel.hasSeq(seq)) return false;
+    setActive(id);
+    return chatPanel.revealSeq(seq);
+  },
 );
 chatPanel.setFileEditHooks({
   open: () => fileEditor.open(),

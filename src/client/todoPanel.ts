@@ -1,9 +1,11 @@
 import type { ClientMessage, TodoAnswerResultMessage, TodoItem } from "../shared/protocol.ts";
 import { renderMarkdownInto } from "./viewer.ts";
 import {
+  CHAT_LINK_MISSING_TEXT,
   TODO_KIND_LABEL,
   ageLabel,
   canSendAnswer,
+  chatLinkSeq,
   showsDoneButton,
   todoBreakdown,
   todoButtonText,
@@ -39,11 +41,15 @@ export class TodoPanel {
   private readonly drafts = new Map<number, Draft>();
   private listEl!: HTMLElement;
   private opened = false;
+  /** 「チャットで見る」を押したが飛ぶ先が画面に無かった TODO の番号。 */
+  private readonly chatMissing = new Set<number>();
 
   constructor(
     private readonly button: HTMLButtonElement,
     private readonly el: HTMLElement,
     private readonly sendMsg: (msg: ClientMessage) => void,
+    /** チャットへ切り替えて seq の発言へ飛ぶ。画面に無ければ false。 */
+    private readonly onRevealChat: (seq: number) => boolean,
   ) {
     this.build();
     this.button.addEventListener("click", () => (this.opened ? this.close() : this.open()));
@@ -60,6 +66,7 @@ export class TodoPanel {
       this.drafts.delete(no);
     }
     if (this.openNo !== null && !alive.has(this.openNo)) this.openNo = null;
+    for (const no of [...this.chatMissing]) if (!alive.has(no)) this.chatMissing.delete(no);
     this.updateButton();
     if (this.opened) this.render();
   }
@@ -158,9 +165,38 @@ export class TodoPanel {
       this.openNo = isOpen ? null : item.no;
       this.render();
     });
-    row.appendChild(summary);
+    // 行の右端に「💬 チャットで見る」（一覧から 1 回で飛べる）。button の中に button は置けないので横に並べる。
+    const line = div("todo-line");
+    line.appendChild(summary);
+    const chatBtn = this.chatLinkButton(item);
+    if (chatBtn) line.appendChild(chatBtn);
+    row.appendChild(line);
+    if (this.chatMissing.has(item.no)) row.appendChild(div("todo-chat-missing", CHAT_LINK_MISSING_TEXT));
     if (isOpen) row.appendChild(this.renderDetail(item));
     return row;
+  }
+
+  /** 「💬 チャットで見る」ボタン（チャットとつながっていない TODO では null）。 */
+  private chatLinkButton(item: TodoItem): HTMLButtonElement | null {
+    const seq = chatLinkSeq(item);
+    if (seq === null) return null;
+    const b = document.createElement("button");
+    b.className = "todo-chat-link";
+    b.textContent = "💬 チャットで見る";
+    b.title = `この TODO を載せたときのチャットの発言（master#${seq}）へ移ります`;
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (this.onRevealChat(seq)) {
+        // チャットへ切り替わった。モーダルを閉じて飛んだ先を見せる。
+        this.chatMissing.delete(item.no);
+        this.close();
+        return;
+      }
+      // 画面に無い（新しい会話にした・400 件より前）。パネルは閉じずに行の下へ理由を出す。
+      this.chatMissing.add(item.no);
+      this.render();
+    });
+    return b;
   }
 
   private renderDetail(item: TodoItem): HTMLElement {
@@ -258,9 +294,10 @@ export class TodoPanel {
   }
 }
 
-function div(className: string): HTMLDivElement {
+function div(className: string, text?: string): HTMLDivElement {
   const el = document.createElement("div");
   el.className = className;
+  if (text !== undefined) el.textContent = text;
   return el;
 }
 

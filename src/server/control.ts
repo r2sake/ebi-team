@@ -214,7 +214,7 @@ export interface ControlDeps {
     path: string,
     title?: string,
     caption?: string,
-  ) => Promise<ChatImage | null>;
+  ) => Promise<(ChatImage & { seq?: number }) | null>;
   /**
    * 承認 / 質問の受け口（`POST /control/chat-permission` の実体・PR-M5）。
    *
@@ -873,7 +873,7 @@ export function createControlApi(deps: ControlDeps) {
         if (pathname === "/control/todo-add" && method === "POST") {
           const body = await readJsonBody(req);
           try {
-            const item = await todos.add(body);
+            const item = await todos.add(body, { chatSeq: body.chat_seq });
             sendJson(res, 200, { no: item.no, item });
           } catch (err) {
             sendJson(res, err instanceof TodoError ? 400 : 500, { error: (err as Error).message });

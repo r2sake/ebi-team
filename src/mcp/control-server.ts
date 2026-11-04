@@ -238,7 +238,8 @@ export const MASTER_TODO_RULES =
   "ボスが『TODO の N 番』と言ったら、話す前に todo_get(N) で詳細を確かめる。" +
   "ボスがチャットで答えた・済ませたら、その答えで動く前に todo_resolve(N) で消す。" +
   "ボスが UI から答えると `[TODO #N への回答] …` / `[TODO #N 対応済み] …` が届き、その TODO はもう消えている（todo_resolve は不要）。" +
-  "ボスに『TODO に入れて』と頼まれたときも todo_add で載せる。";
+  "ボスに『TODO に入れて』と頼まれたときも todo_add で載せる。" +
+  "chat_image で見せたものを TODO にするときは、chat_image が返した seq を todo_add の chat_seq に渡す。";
 
 const server = new McpServer(
   { name: "ebi-team-control", version: "0.1.0" },
@@ -555,7 +556,8 @@ server.tool(
     "画像はチャットの添付保管庫へコピーされるので、元ファイルが tmp 掃除で消えても履歴に残る。" +
     "パスは許可ルート（既定 $HOME/workspace・EBI_VIEWER_ROOTS で設定）配下の " +
     ".png/.jpg/.jpeg/.webp/.gif のみ（それ以外は 400）。" +
-    'チャット UI の master（ui:"chat"）が居ない構成では自動で open_viewer にフォールバックする。',
+    'チャット UI の master（ui:"chat"）が居ない構成では自動で open_viewer にフォールバックする。' +
+    "チャットに出したときは、その発言の seq が返る（TODO にするときは todo_add の chat_seq に渡す）。",
   {
     path: z
       .string()
@@ -648,6 +650,15 @@ server.tool(
       .optional()
       .describe("選択肢（6 個まで）。ボスは UI でボタンを押して答えられる"),
     recommended: z.string().optional().describe("推奨する選択肢の label（options にあるもの）"),
+    chat_seq: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        "つなぐチャットの発言の seq（chat_image が返した seq）。ボスが TODO からワンクリックでその発言へ飛べる。" +
+          "省略すると追加した時点の最新の発言につなぐ",
+      ),
   },
   async (args) => toResult(await callControl("POST", "/control/todo-add", args)),
 );

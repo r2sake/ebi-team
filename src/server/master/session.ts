@@ -581,9 +581,16 @@ export class MasterSession {
    * WS broadcast は既存経路に乗るので、**再起動後の snapshot 復元も追加実装ゼロ**で効く。
    * JSONL に載るのは basename と表示メタだけ（base64 は載らない＝ログが肥大しない）。
    */
-  shareImage(images: readonly ChatImage[]): void {
-    if (images.length === 0) return;
+  shareImage(images: readonly ChatImage[]): number | null {
+    if (images.length === 0) return null;
     this.emitChat({ kind: "image", images: [...images] });
+    // 振った seq を返す（chat_image の戻り値 → todo_add の chat_seq で TODO からその発言へ飛べる）。
+    return this.seq;
+  }
+
+  /** 最後に振ったチャットの seq（まだ何も無ければ null）。「新しい会話」にしても戻らない。 */
+  latestSeq(): number | null {
+    return this.seq > 0 ? this.seq : null;
   }
 
   /**

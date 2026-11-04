@@ -579,16 +579,31 @@ export class ChatPanel {
    * 表示中のトランスクリプトに無い（＝ログにしか残っていない）ときは何もしない。
    */
   private jumpToSeq(seq: number): void {
-    const index = this.transcript.items.findIndex((it) => it.seq === seq);
-    const el = index >= 0 ? this.rendered[index] : null;
-    if (!el) return;
-    el.scrollIntoView({ block: "center" });
-    el.classList.add("flash");
-    window.setTimeout(() => el.classList.remove("flash"), 1200);
+    this.revealSeq(seq, 1200);
   }
 
-  /** 返信ボタン / 引用チップから引ける「その seq が今の画面に居るか」。 */
-  private hasSeq(seq: number): boolean {
+  /**
+   * seq の発言を画面の中央へ出して強調する（TODO の「💬 チャットで見る」から・main.ts）。
+   * 表示に切り替えた直後は setVisible() が一番下への追従を予約しているので、それを取り消してから
+   * 飛ぶ（そのままだと飛んだ直後に一番下へ戻される）。画面に無ければ false。
+   */
+  revealSeq(seq: number, flashMs = 2500): boolean {
+    const index = this.transcript.items.findIndex((it) => it.seq === seq);
+    const el = index >= 0 ? this.rendered[index] : null;
+    if (!el) return false;
+    if (this.scrollRaf !== 0) {
+      cancelFrame(this.scrollRaf);
+      this.scrollRaf = 0;
+    }
+    this.stuckToBottom = false;
+    el.scrollIntoView({ block: "center" });
+    el.classList.add("flash");
+    window.setTimeout(() => el.classList.remove("flash"), flashMs);
+    return true;
+  }
+
+  /** 返信ボタン / 引用チップ / TODO から引ける「その seq が今の画面に居るか」。 */
+  hasSeq(seq: number): boolean {
     return this.transcript.items.some((it) => it.seq === seq);
   }
 
@@ -1345,4 +1360,10 @@ function safeLocalStorage(): Storage | null {
 function requestFrame(fn: () => void): number {
   if (typeof window.requestAnimationFrame === "function") return window.requestAnimationFrame(fn);
   return window.setTimeout(fn, 16);
+}
+
+/** requestFrame() の予約を取り消す。 */
+function cancelFrame(handle: number): void {
+  if (typeof window.cancelAnimationFrame === "function") window.cancelAnimationFrame(handle);
+  else window.clearTimeout(handle);
 }

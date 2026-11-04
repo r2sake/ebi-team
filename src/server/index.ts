@@ -328,6 +328,8 @@ const TODOS_PATH = process.env.EBI_TODOS_PATH ?? join(process.cwd(), ".ebi-team"
 const todoBoard = new TodoBoard({
   storePath: TODOS_PATH,
   onChange: (items) => broadcast({ type: "todos", items }),
+  // TODO からチャットの発言へ飛ぶための seq（chat master が居ない構成では null）。
+  chatSeqNow: () => masterSession?.latestSeq() ?? null,
 });
 
 /** 逆方向通知の宛先として届くか（PTY エビ or chat master）。 */
@@ -749,8 +751,8 @@ const controlApi = createControlApi({
         save: (bytes, mediaType) => chatAttachments.save(bytes, mediaType),
       },
     );
-    session.shareImage([image]);
-    return image;
+    const seq = session.shareImage([image]);
+    return seq === null ? image : { ...image, seq };
   },
   // ファイル編集の入力依頼（master の request_file_edit）。チャットにカードを出してすぐ返る。
   // 受けるのはパス・鍵名・メモだけで、本文や値を書き込む口はここには無い。

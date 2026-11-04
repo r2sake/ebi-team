@@ -529,6 +529,12 @@ export interface TodoItem {
   recommended: string | null;
   /** 作った時刻（epoch ms）。 */
   createdAt: number;
+  /**
+   * master のチャットの発言（seq）とのつながり。TODO パネルの「💬 チャットで見る」で飛ぶ先。
+   * todo_add の chat_seq（chat_image が返す seq）、無ければ追加した時点の最新 seq。
+   * chat master が居ない構成・つながりを持たない古い TODO では null。
+   */
+  chatSeq: number | null;
 }
 
 /** 未解決の TODO の全件（サーバ → クライアント）。接続直後と変化のたびに送る。 */

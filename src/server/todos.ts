@@ -77,7 +77,7 @@ function cleanOptional(v: unknown, max: number): string | null {
  * todo_add の入力を検証して TodoItem の中身（no / createdAt 以外）にする純関数。
  * 不正なら TodoError。長すぎるものは切り詰める（弾かない）。
  */
-export function normalizeTodoInput(input: TodoInput): Omit<TodoItem, "no" | "createdAt"> {
+export function normalizeTodoInput(input: TodoInput): Omit<TodoItem, "no" | "createdAt" | "chatSeq"> {
   const title = cleanText(input.title, TODO_LIMITS.title, false);
   if (!title) throw new TodoError("title（件名）は必須です");
   const detail = cleanText(input.detail ?? "", TODO_LIMITS.detail, true);
@@ -122,8 +122,10 @@ function parseStoredItem(raw: unknown): TodoItem | null {
   const r = raw as Record<string, unknown>;
   if (typeof r.no !== "number" || !Number.isInteger(r.no) || r.no < 1) return null;
   if (typeof r.createdAt !== "number" || !Number.isFinite(r.createdAt)) return null;
+  // chatSeq はつながりを持たない古いファイルでは無い。正の整数のときだけ使う（壊れていても null で読み続ける）。
+  const chatSeq = typeof r.chatSeq === "number" && Number.isInteger(r.chatSeq) && r.chatSeq >= 1 ? r.chatSeq : null;
   try {
-    return { no: r.no, createdAt: r.createdAt, ...normalizeTodoInput(r as TodoInput) };
+    return { no: r.no, createdAt: r.createdAt, ...normalizeTodoInput(r as TodoInput), chatSeq };
   } catch {
     return null;
   }
@@ -156,6 +158,8 @@ export function parseTodoFile(text: string): TodoFile | null {
 export interface TodoBoardOptions {
   /** 保存先（null なら書かない）。 */
   storePath: string | null;
+  /** master のチャットの最新 seq（chat_seq の自動の値と範囲チェックに使う。無ければ null）。 */
+  chatSeqNow?: () => number | null;
   /** 変化のたびに呼ぶ（WS `todos` の broadcast 用）。 */
   onChange?: (items: TodoItem[]) => void;
   now?: () => number;
@@ -221,14 +225,31 @@ export class TodoBoard {
     return { found: false, status: Number.isInteger(no) && no >= 1 && no < this.next ? "resolved" : "unknown" };
   }
 
-  /** 追加する（検証失敗は TodoError）。保存まで待って返す。 */
-  async add(input: TodoInput): Promise<TodoItem> {
+  /**
+   * 追加する（検証失敗は TodoError）。保存まで待って返す。
+   * opts.chatSeq（todo_add の chat_seq）があればそれを、無ければチャットの最新 seq をつなぐ。
+   */
+  async add(input: TodoInput, opts: { chatSeq?: unknown } = {}): Promise<TodoItem> {
     const body = normalizeTodoInput(input);
-    const item: TodoItem = { no: this.next, createdAt: this.now(), ...body };
+    const chatSeq = this.resolveChatSeq(opts.chatSeq);
+    const item: TodoItem = { no: this.next, createdAt: this.now(), ...body, chatSeq };
     this.next += 1;
     this.items.push(item);
     await this.changed();
     return { ...item, options: item.options.map((o) => ({ ...o })) };
+  }
+
+  /** chat_seq を確かめる。明示なら 1〜最新の seq だけ受け付ける（未来の番号は TodoError）。 */
+  private resolveChatSeq(raw: unknown): number | null {
+    const latest = this.opts.chatSeqNow?.() ?? null;
+    if (raw === undefined || raw === null) return latest;
+    if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) {
+      throw new TodoError(`chat_seq は 1 以上の整数です: ${String(raw)}`);
+    }
+    if (latest === null || raw > latest) {
+      throw new TodoError(`chat_seq ${raw} のチャットの発言はありません（最新は ${latest ?? "なし"}）`);
+    }
+    return raw;
   }
 
   /** 解決＝台帳から消す。無ければ null。保存まで待って返す。 */

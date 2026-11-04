@@ -8,7 +8,9 @@
 //       ボスの発話として届き、TODO は消える（WS `todos` が空になる）。todo_get は「解決済み」
 //   (5) チャットで答えた想定: MCP todo_resolve → WS `todos` から消える
 //   (6) 「✓ 対応した」→ `[TODO #N 対応済み] …` が届いて消える
-//   (7) サーバを再起動しても未解決の TODO と次の番号が戻る（番号は使い回さない）
+//   (7) サーバを再起動しても未解決の TODO と次の番号が戻る（番号は使い回さない）・chatSeq も戻る
+//   (8) chat_image が seq を返し、todo_add の chat_seq でその発言につながる（WS todos の chatSeq）。
+//       chat_seq を省くと最新の seq が入る。最新より先の chat_seq は弾かれる
 //
 // 実行:
 //   node scripts/e2e-todo.mjs
@@ -285,7 +287,9 @@ try {
   const after = await openWsRetry(true);
   clients.push(after);
   const restored = await waitFor(() => lastTodos(after));
-  if (restored?.length === 1 && restored[0].no === no4) ok(`再起動後も未解決の #${no4} が WS todos に戻る`);
+  if (restored?.length === 1 && restored[0].no === no4 && Number.isInteger(restored[0].chatSeq)) {
+    ok(`再起動後も未解決の #${no4} が WS todos に戻る（chatSeq=${restored[0].chatSeq}）`);
+  }
   else fail(`再起動後の todos が不正: ${JSON.stringify(restored)}`);
   await waitFor(() => after.state.states.find((s) => s.state === "idle"), 60_000);
   mcp = await connectMcp("master");
@@ -293,6 +297,25 @@ try {
   const no5 = Number(/"no": (\d+)/.exec(text(a5))?.[1]);
   if (no5 === no4 + 1) ok(`再起動後の番号は続きから（#${no5}）`);
   else fail(`再起動後の番号が不正: ${no5}`);
+
+  // ---- (8) TODO → チャットの発言（chat_image の seq → todo_add の chat_seq）----
+  const png = join(tmpDir, "thumb.png");
+  writeFileSync(png, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64"));
+  const shared = await mcp.callTool({ name: "chat_image", arguments: { path: png, title: "サムネ案" } });
+  const imgSeq = Number(/"seq": (\d+)/.exec(text(shared))?.[1]);
+  if (!shared.isError && Number.isInteger(imgSeq) && imgSeq > 0) ok(`chat_image が発言の seq を返す（${imgSeq}）`);
+  else fail(`chat_image の seq が不正: ${text(shared)}`);
+  const linked = await mcp.callTool({ name: "todo_add", arguments: { title: "サムネを選ぶ", kind: "question", chat_seq: imgSeq } });
+  const noL = Number(/"no": (\d+)/.exec(text(linked))?.[1]);
+  const shownL = await waitFor(() => lastTodos(after)?.find((t) => t.no === noL));
+  if (!linked.isError && shownL?.chatSeq === imgSeq) ok(`todo_add の chat_seq が WS todos の chatSeq に載る（#${noL} → ${imgSeq}）`);
+  else fail(`chat_seq が載らない: ${text(linked)} / ${JSON.stringify(shownL)}`);
+  const autoRow = lastTodos(after)?.find((t) => t.no === no5);
+  if (Number.isInteger(autoRow?.chatSeq)) ok(`chat_seq を省くと追加時点の最新 seq が入る（#${no5} → ${autoRow.chatSeq}）`);
+  else fail(`自動の chatSeq が不正: ${JSON.stringify(autoRow)}`);
+  const future = await mcp.callTool({ name: "todo_add", arguments: { title: "未来", kind: "action", chat_seq: imgSeq + 100000 } });
+  if (future.isError) ok("最新より先の chat_seq は todo_add で弾かれる");
+  else fail(`未来の chat_seq が通った: ${text(future)}`);
 } catch (err) {
   fail(`例外: ${err.stack ?? err}`);
 } finally {
