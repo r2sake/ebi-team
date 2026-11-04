@@ -8,7 +8,7 @@
 // - config が無い場合は固定エビ無し（空配列）として扱い、起動は継続する（任意機能）。
 
 import { readFile } from "node:fs/promises";
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { isAbsolute, resolve, dirname } from "node:path";
 import { homedir } from "node:os";
 import type { AgentKind } from "../shared/protocol.ts";
@@ -72,6 +72,12 @@ interface RawFixedEbi {
   permissionMode?: unknown;
   args?: unknown;
   appendSystemPrompt?: unknown;
+  /**
+   * appendSystemPrompt の本文をファイルから読む場合のパス（appendSystemPrompt と同時指定は不可）。
+   * cwd と同じく $EBI_TEAM / $HOME / ~ を展開し、相対パスは config のあるディレクトリ基準。
+   * 中身はそのまま（置換・trim なし）使う。読めなければ cwd 不在と同じく起動時エラー。
+   */
+  appendSystemPromptFile?: unknown;
   /** テスト用にバイナリを差し替えたい場合（既定は claude / EBI_COMMAND）。 */
   command?: unknown;
   /**
@@ -450,6 +456,28 @@ function asStringArray(v: unknown): string[] {
 }
 
 /**
+ * appendSystemPrompt（直書き）/ appendSystemPromptFile（ファイル参照）から本文を決める。
+ * 長い指示文を別ファイルの 1 か所で管理し、config へ写し直す手間とズレを無くすための口。
+ * 両方指定は曖昧なので明示エラー。ファイルが読めないときは cwd 不在と同じく throw する
+ *（指示文抜きで起動させない＝境界エビの安全指示が黙って欠ける事故を作らない）。
+ */
+function resolveAppendSystemPrompt(raw: RawFixedEbi, configDir: string, id: string): string | undefined {
+  const inline = asString(raw.appendSystemPrompt);
+  const fileRaw = asString(raw.appendSystemPromptFile);
+  if (fileRaw === undefined) return inline;
+  if (inline !== undefined) {
+    throw new Error(`固定エビ "${id}" は appendSystemPrompt と appendSystemPromptFile を同時に指定できません`);
+  }
+  const expanded = expandEnv(fileRaw, configDir);
+  const abs = isAbsolute(expanded) ? expanded : resolve(configDir, expanded);
+  try {
+    return readFileSync(abs, "utf8");
+  } catch (err) {
+    throw new Error(`固定エビ "${id}" の appendSystemPromptFile を読めません: ${abs}（${(err as Error).message}）`);
+  }
+}
+
+/**
  * 1 件の生定義を検証・正規化して FixedEbiSpec を返す。
  * 起動引数（args）の組み立て順:
  *   [--model M]? [--permission-mode P]? [--append-system-prompt S]? ...任意 args
@@ -507,7 +535,7 @@ function normalizeOne(
   }
   const brain = (brainRaw ?? DEFAULT_MASTER_BRAIN_ID) as MasterBrainId;
 
-  const appendSystemPrompt = asString(raw.appendSystemPrompt);
+  const appendSystemPrompt = resolveAppendSystemPrompt(raw, configDir, id);
   // args は $EBI_TEAM / $HOME / ~ を展開する（--mcp-config の絶対パス指定を machine 非依存に）。
   const extraArgs = asStringArray(raw.args).map((a) => expandEnv(a, configDir));
 
