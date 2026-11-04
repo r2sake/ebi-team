@@ -10,6 +10,7 @@ import {
   collectImages,
   enterAction,
   fileEditSettledLabel,
+  isAtBottom,
   firstUnsettledPending,
   formatBytes,
   formatContextPct,
@@ -253,10 +254,12 @@ export class ChatPanel {
 
   /** 表示/非表示（master-detail の 1 枚として）。 */
   setVisible(visible: boolean): void {
+    const wasVisible = this.visible;
     this.visible = visible;
     this.el.hidden = !visible;
-    // 表示に切り替えた瞬間は最下部へ寄せる（隠れている間の新着を見せる）。
-    if (visible) this.scrollToBottom(true);
+    // 隠れていた → 表示に切り替えた瞬間だけ最下部へ寄せる（隠れている間の新着を見せる）。
+    // 表示中に呼ばれ直す（registry 受信のたびの applyVisibility）ときは、読んでいる位置を動かさない。
+    if (visible && !wasVisible) this.scrollToBottom(true);
   }
 
   /** WS `chatState`。chat モードの master が居ることの判定材料も兼ねる。 */
@@ -590,9 +593,8 @@ export class ChatPanel {
   }
 
   private onScroll(): void {
-    // 「最下部にいる」判定は 32px の遊びを持たせる（§5.3）。
-    const atBottom =
-      this.logEl.scrollTop + this.logEl.clientHeight >= this.logEl.scrollHeight - 32;
+    // 「最下部にいる」判定の遊びは 2px だけ（少しでも上へ動かしたら追従を切る・BOTTOM_SLACK_PX）。
+    const atBottom = isAtBottom(this.logEl.scrollTop, this.logEl.clientHeight, this.logEl.scrollHeight);
     this.stuckToBottom = atBottom;
     if (atBottom) {
       this.unseen = 0;

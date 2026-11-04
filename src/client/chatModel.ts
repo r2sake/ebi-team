@@ -980,3 +980,19 @@ export function inputPlaceholder(state: string, touch: boolean): string {
     ? "実行中でも送れます（Enter で送信 / 中断は ⏹）"
     : "master に話しかける（Enter で送信 / Shift+Enter で改行）";
 }
+
+/**
+ * 「最下部にいる」とみなす遊び（px）。0 にしないのは、拡大率や HiDPI で scrollTop が小数になり、
+ * 一番下にいても 0.5〜1px ずれることがあるため。少しでも上へ動かしたら追従を切る（ボス要件）。
+ */
+export const BOTTOM_SLACK_PX = 2;
+
+/** スクロール位置が最下部か（中身が画面より短いときも true）。 */
+export function isAtBottom(
+  scrollTop: number,
+  clientHeight: number,
+  scrollHeight: number,
+  slack: number = BOTTOM_SLACK_PX,
+): boolean {
+  return scrollTop + clientHeight >= scrollHeight - slack;
+}
