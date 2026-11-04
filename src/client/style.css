@@ -1530,3 +1530,173 @@ button:hover { filter: brightness(1.07); }
   .chat-lightbox { padding: 8px; }
   .chat-lightbox-stage, .chat-lightbox-img { max-height: 72vh; }
 }
+
+/* ===== ボスの TODO（トップバーの 📋 と、右から出るパネル）===== */
+.todo-btn {
+  /* h1 のすぐ右に寄せる（右側の余白は margin-right:auto が吸う）。 */
+  margin: 0 auto 0 12px;
+  background: var(--panel-2);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.todo-btn.has-items {
+  color: #21130c;
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 700;
+}
+
+.todo-panel {
+  position: fixed;
+  inset: 0;
+  z-index: 90; /* サイドバードロワーより前・ファイル編集ダイアログ(100)より後ろ */
+}
+.todo-panel[hidden] { display: none; }
+.todo-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+}
+.todo-sheet {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(480px, 100%);
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.5);
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.todo-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.todo-title { font-weight: 700; }
+.todo-close {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 18px;
+  cursor: pointer;
+  min-width: 36px;
+  min-height: 32px;
+}
+.todo-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 8px;
+}
+.todo-empty {
+  color: var(--muted);
+  font-size: 13px;
+  padding: 24px 12px;
+  text-align: center;
+  line-height: 1.6;
+}
+.todo-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 8px;
+  background: var(--panel-2);
+}
+.todo-item.open { border-color: var(--accent); }
+.todo-summary {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  grid-template-areas: "no kind title" ". . meta";
+  gap: 2px 8px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--text);
+  padding: 10px 12px;
+  cursor: pointer;
+  font: inherit;
+}
+.todo-no { grid-area: no; color: var(--accent); font-weight: 700; font-variant-numeric: tabular-nums; }
+.todo-kind { grid-area: kind; }
+.todo-item-title { grid-area: title; word-break: break-word; }
+.todo-meta { grid-area: meta; color: var(--muted); font-size: 12px; }
+.todo-detail {
+  padding: 0 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.todo-md { font-size: 13px; line-height: 1.6; word-break: break-word; }
+.todo-md p { margin: 0.4em 0; }
+.todo-md ul, .todo-md ol { margin: 0.4em 0; padding-left: 1.4em; }
+.todo-md a { color: var(--accent); }
+.todo-md code { background: var(--bg); padding: 0 4px; border-radius: 4px; }
+.todo-md pre { background: var(--bg); padding: 8px; border-radius: 6px; overflow-x: auto; }
+.todo-md h1, .todo-md h2, .todo-md h3, .todo-md h4 { font-size: 1em; margin: 0.6em 0 0.3em; }
+.todo-options { display: flex; flex-direction: column; gap: 6px; }
+.todo-option {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  text-align: left;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  cursor: pointer;
+  font: inherit;
+}
+.todo-option.selected { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.todo-option-label { font-weight: 600; }
+.todo-option-desc { flex-basis: 100%; color: var(--muted); font-size: 12px; }
+.todo-recommended {
+  font-size: 11px;
+  color: #21130c;
+  background: var(--idle);
+  border-radius: 999px;
+  padding: 0 8px;
+}
+.todo-text {
+  width: 100%;
+  resize: vertical;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+}
+.todo-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.todo-btn-send, .todo-btn-done {
+  border-radius: 6px;
+  padding: 6px 14px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  min-height: 34px;
+}
+.todo-btn-send { background: var(--accent); color: #21130c; border: 1px solid var(--accent); font-weight: 700; }
+.todo-btn-done { background: var(--panel); color: var(--text); border: 1px solid var(--border); }
+.todo-btn-send:disabled, .todo-btn-done:disabled { opacity: 0.45; cursor: default; }
+.todo-hint { color: var(--muted); font-size: 11px; }
+.todo-error { color: #e05b5b; font-size: 12px; }
+
+@media (max-width: 768px) {
+  /* 狭幅ではロゴの右・ハンバーガーの左に置き、パネルは全画面のシートにする。 */
+  .todo-btn { order: 0; margin: 0 auto 0 8px; min-height: 32px; }
+  .todo-sheet { width: 100%; border-left: none; }
+  .todo-text { font-size: 16px; } /* iOS の自動ズーム抑止 */
+}

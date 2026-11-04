@@ -4,6 +4,7 @@ import { Viewer } from "./viewer.ts";
 import { FilePicker } from "./filePicker.ts";
 import { ChatPanel } from "./chat.ts";
 import { FileEditorDialog } from "./fileEditor.ts";
+import { TodoPanel } from "./todoPanel.ts";
 import {
   type ClientMessage,
   type ServerMessage,
@@ -91,6 +92,12 @@ const filePicker = new FilePicker(
 // 本文は WS の fileEditOpen / fileEditSave でこの接続とサーバの間だけを流れる。
 const fileEditor = new FileEditorDialog(document.getElementById("file-editor") as HTMLElement, (msg) =>
   sendMsg(msg),
+);
+// ボスの TODO パネル（トップバーの「📋 TODO n」から開く）。一覧は WS `todos`、回答は WS `todoAnswer`。
+const todoPanel = new TodoPanel(
+  document.getElementById("todo-btn") as HTMLButtonElement,
+  document.getElementById("todo-panel") as HTMLElement,
+  (msg) => sendMsg(msg),
 );
 chatPanel.setFileEditHooks({
   open: () => fileEditor.open(),
@@ -297,6 +304,12 @@ function handleServerMessage(msg: ServerMessage): void {
       break;
     case "fileEditSaved":
       fileEditor.handleSaved(msg);
+      break;
+    case "todos":
+      todoPanel.update(msg.items);
+      break;
+    case "todoAnswerResult":
+      todoPanel.handleResult(msg);
       break;
     case "dirListing":
       // ファイルピッカーのディレクトリ列挙応答。error なら理由をモーダル内に表示。

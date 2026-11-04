@@ -318,6 +318,16 @@ Slack / Discord などの外部チャンネルに常駐する「待機・秘書�
 - 本文は保存を操作した接続とサーバの間だけを流れ、チャットの会話ログ・notice・master への通知には載りません。保存後は内容を再表示しません。
 - 書き込みの記録は `.ebi-team/file-edits.jsonl`（`EBI_FILE_EDIT_LOG_PATH`）に「いつ・どのファイル・誰（`boss-ui` / `boss-ui:request:<id>`）・控え」だけを残します。値は残しません。
 
+### ボスの TODO（todo_add / todo_resolve）
+
+チャットで裁定をやりとりすると流れて探しにくいので、**ボスがやらなければならないこと**（質問への回答・権限の許可・ボスの手作業）だけを載せる一覧があります。メモや進捗の記録には使いません。設計は `docs/plans/boss-todo-plan.md`。
+
+- **開く**: トップバーの「📋 TODO n」（n は未解決の件数）を押すと、右から一覧が出ます（スマホでは全画面）。行を押すと詳細（Markdown）・選択肢（推奨バッジ付き）・補足の入力欄が開きます。
+- **答える**: 選択肢か補足を入れて「回答して送る」、許可・作業なら「✓ 対応した」。master のチャットに `[TODO #N への回答] …` / `[TODO #N 対応済み] …` がボスの発話として届き、その TODO は消えます。master が止まっていて送れないときは消さずに残します。チャットで「12 番は B で」と答えても構いません（master が `todo_resolve` で消します）。
+- **載せる**: master 専用ツール `todo_add({ title, detail?, kind, ebi?, project?, options?, recommended? })`。`kind` は `question`（質問）/ `permission`（権限の許可）/ `action`（作業）。UI に追加ボタンは無く、ボスが「TODO に入れて」と言ったときも master が載せます。ほかに `todo_list`（詳細なし）/ `todo_get(no)`（詳細まで）/ `todo_resolve(no)`。作業エビの MCP には出ません。
+- **番号**: 通し番号で使い回しません。「新しい会話」やサーバの再起動でもリセットしないので、「TODO の N 番」が別の TODO と混ざりません。消えた番号を `todo_get` すると「解決済み」が返ります。
+- **保存先**: `.ebi-team/todos.json`（`EBI_TODOS_PATH`）。未解決のものと次の番号だけを持ち、解決したものの履歴は残しません（UI から答えたものはチャットログに残ります）。
+
 ### master コンテキスト枯渇ガード (context-guard)
 
 統括役（master）のコンテキスト使用率を監視し、**自動 compact に食われて PM 文脈（配下エビの状況・進行中の依頼）が消える前に「促す」**仕組みです。既定で ON。

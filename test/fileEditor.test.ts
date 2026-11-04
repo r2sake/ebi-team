@@ -439,6 +439,7 @@ async function postFileEditRequest(
     shareChatImage: async () => null,
     requestChatPermission: null,
     requestFileEdit,
+    todos: null,
   });
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
