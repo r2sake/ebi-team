@@ -117,7 +117,7 @@ cp ebi-team.config.example.json ebi-team.config.json
 | `permissionMode` | Claude Code の権限モード（`acceptEdits` など） |
 | `args` | 追加の起動引数 |
 | `appendSystemPrompt` | **ここが人格・カスタムロールの定義点です。** そのエージェントの性格や役割、振る舞いのルールをシステムプロンプトとして注入します |
-| `appendSystemPromptFile` | `appendSystemPrompt` の本文をファイルから読みます（長い指示文を別ファイルの 1 か所で管理したいとき）。`cwd` と同じく `$HOME` / `~` / `$EBI_TEAM` を展開し、相対パスは config 基準。中身はそのまま使います。`appendSystemPrompt` との同時指定はエラー、ファイルが読めないときは `cwd` 不在と同じく固定エビ config の読み込みエラー（固定エビは起動せず、動的エビのみで継続）になります |
+| `appendSystemPromptFile` | `appendSystemPrompt` の本文をファイルから読みます（長い指示文を別ファイルの 1 か所で管理したいとき）。`cwd` と同じく `$HOME` / `~` / `$EBI_TEAM` を展開し、相対パスは config 基準。中身はそのまま使います。`appendSystemPrompt` との同時指定はエラー、ファイルが読めないときは `cwd` 不在と同じく、その固定エビ 1 体だけが起動対象から外れます（サーバのログに id と理由を警告として出し、ほかの固定エビは起動します） |
 
 つまり、コード側は誰にとっても同じ「箱」のままにしておき、**自分らしいエージェントの人格や役割分担は `ebi-team.config.json` の `appendSystemPrompt` に書く**、という運用を想定しています。
 

@@ -458,8 +458,9 @@ function asStringArray(v: unknown): string[] {
 /**
  * appendSystemPrompt（直書き）/ appendSystemPromptFile（ファイル参照）から本文を決める。
  * 長い指示文を別ファイルの 1 か所で管理し、config へ写し直す手間とズレを無くすための口。
- * 両方指定は曖昧なので明示エラー。ファイルが読めないときは cwd 不在と同じく throw する
- *（指示文抜きで起動させない＝境界エビの安全指示が黙って欠ける事故を作らない）。
+ * 両方指定は曖昧なので明示エラー。ファイルが読めないときは cwd 不在と同じく throw し、
+ * その固定エビ 1 体だけを起動対象から外す（指示文抜きで起動させない＝境界エビの安全指示が
+ * 黙って欠ける事故を作らない。ほかの固定エビは loadFixedEbiReport が起こす）。
  */
 function resolveAppendSystemPrompt(raw: RawFixedEbi, configDir: string, id: string): string | undefined {
   const inline = asString(raw.appendSystemPrompt);
@@ -614,36 +615,66 @@ function normalizeOne(
   };
 }
 
+/** 読み込みで外した固定エビ 1 体ぶんの記録（id が読めないときは "#<配列の位置>"）。 */
+export interface SkippedFixedEbi {
+  id: string;
+  reason: string;
+}
+
 /**
- * config ファイルを読み込み、固定エビ定義を正規化して返す。
- * - ファイルが無ければ空配列（固定エビ無し）。
- * - JSON 不正・スキーマ不正は throw（呼び出し側で警告ログにして起動継続するか判断）。
+ * config ファイルを読み込み、固定エビ定義を正規化して返す（1 体ずつ fail-soft）。
+ * - ファイルが無ければ空（固定エビ無し）。
+ * - JSON 不正・fixedEbi が配列でない・effortByModel 不正は全体の問題なので throw。
+ * - 1 体ぶんの検証・正規化エラー（cwd 不在・appendSystemPromptFile が読めない・kind 不正 等）は
+ *   その 1 体だけを specs から外し、skipped に id と理由を積む（ほかの固定エビは起こす）。
+ * - id 重複は後から出た方を外す（先に書かれた定義を正とする）。
  */
-export async function loadFixedEbi(
+export async function loadFixedEbiReport(
   configPath: string,
   defaults: ConfigDefaults,
-): Promise<FixedEbiSpec[]> {
+): Promise<{ specs: FixedEbiSpec[]; skipped: SkippedFixedEbi[] }> {
   const parsed = await readRawConfig(configPath);
   if (parsed === null) {
     // ファイル無し＝固定エビ機能を使わない。エラーにしない。
-    return [];
+    return { specs: [], skipped: [] };
   }
 
   const list = parsed.fixedEbi;
-  if (list === undefined) return [];
+  if (list === undefined) return { specs: [], skipped: [] };
   if (!Array.isArray(list)) {
     throw new Error(`${configPath} の fixedEbi は配列である必要があります`);
   }
 
   const configDir = dirname(configPath);
   const effortByModel = normalizeEffortByModel(parsed.effortByModel);
-  const specs = list.map((raw) => normalizeOne(raw as RawFixedEbi, configDir, defaults, effortByModel));
-
-  // id 重複チェック。
+  const specs: FixedEbiSpec[] = [];
+  const skipped: SkippedFixedEbi[] = [];
   const seen = new Set<string>();
-  for (const s of specs) {
-    if (seen.has(s.id)) throw new Error(`固定エビの id が重複しています: ${s.id}`);
-    seen.add(s.id);
-  }
+  list.forEach((raw, i) => {
+    const rawId = asString((raw as RawFixedEbi | null)?.id);
+    const label = rawId || `#${i}`;
+    try {
+      const spec = normalizeOne(raw as RawFixedEbi, configDir, defaults, effortByModel);
+      if (seen.has(spec.id)) throw new Error(`固定エビの id が重複しています: ${spec.id}`);
+      seen.add(spec.id);
+      specs.push(spec);
+    } catch (err) {
+      skipped.push({ id: label, reason: (err as Error).message });
+    }
+  });
+  return { specs, skipped };
+}
+
+/**
+ * 固定エビ定義を厳格に読む（1 体でも外れる定義があれば、その理由で throw）。
+ * サーバの起動経路は loadFixedEbiReport を使う（1 体の不備で全体を止めない）。
+ * こちらは定義の検証をまとめて確かめたいとき用。
+ */
+export async function loadFixedEbi(
+  configPath: string,
+  defaults: ConfigDefaults,
+): Promise<FixedEbiSpec[]> {
+  const { specs, skipped } = await loadFixedEbiReport(configPath, defaults);
+  if (skipped.length > 0) throw new Error(skipped[0].reason);
   return specs;
 }

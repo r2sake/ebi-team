@@ -35,7 +35,7 @@ import {
 import { addWorktree, removeWorktree } from "./git.ts";
 import { Supervisor } from "./supervisor.ts";
 import {
-  loadFixedEbi,
+  loadFixedEbiReport,
   supervisorEngineFrom,
   loadRawCustomRoles,
   loadDevChannelsAllowlist,
@@ -1920,10 +1920,15 @@ async function handleSummarize(ws: WebSocket, id: string): Promise<void> {
  * 固定エビ config を読み、自動起動する。
  * config が無ければ何もしない。読み込み/検証失敗時は警告のみで起動は継続する
  * （動的エビ運用は config 無しでも成立するため、サーバごと落とさない）。
+ * 1 体ぶんの定義不備はその 1 体だけ外して警告し、ほかの固定エビは起動する。
  */
 async function startFixedEbi(): Promise<void> {
   try {
-    const raw = await loadFixedEbi(CONFIG_PATH, { command: COMMAND, backend: BACKEND_ID });
+    // 1 体ぶんの不備（cwd 不在・指示文ファイルが読めない等）はその 1 体だけ外し、ほかは起こす。
+    const { specs: raw, skipped } = await loadFixedEbiReport(CONFIG_PATH, { command: COMMAND, backend: BACKEND_ID });
+    for (const s of skipped) {
+      console.warn(`[ebi-team] 固定エビ ${s.id} を起動対象から外しました: ${s.reason}`);
+    }
     // master には役割別 MCP config を spawn 直前に自動付与する（config への手書きを不要にし、
     // dev / 本番のファイル名差分をサーバ側で吸収する）。args に明示があればそちらを優先。
     // master は backend=claude に固定する（config/env で他 backend を既定にしても統括系は落とさない）。
@@ -2061,7 +2066,8 @@ async function loadAndApplyEffortByModel(): Promise<void> {
  */
 async function loadAndApplySupervisorEngine(): Promise<void> {
   try {
-    const specs = await loadFixedEbi(CONFIG_PATH, { command: COMMAND, backend: BACKEND_ID });
+    // 外した固定エビの警告は startFixedEbi 側で出す（ここでは二重に出さない）。
+    const { specs } = await loadFixedEbiReport(CONFIG_PATH, { command: COMMAND, backend: BACKEND_ID });
     const engine = supervisorEngineFrom(specs);
     if (!engine || engine.backend === DEFAULT_BACKEND_ID) return;
     supervisor = new Supervisor({ backend: engine.backend, model: engine.model });
