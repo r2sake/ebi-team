@@ -317,7 +317,8 @@ export type ClientMessage =
   | ChatHistoryMessage
   | FileEditOpenMessage
   | FileEditSaveMessage
-  | FileEditCancelMessage;
+  | FileEditCancelMessage
+  | TodoAnswerMessage;
 
 // ===== サーバ → クライアント =====
 
@@ -491,7 +492,65 @@ export type ServerMessage =
   | ChatSnapshotMessage
   | ChatStateMessage
   | FileEditLoadedMessage
-  | FileEditSavedMessage;
+  | FileEditSavedMessage
+  | TodosMessage
+  | TodoAnswerResultMessage;
+
+// ===== ボスの TODO（ボスがやらなければならないこと）=====
+//
+// 追加・解決は master の MCP（todo_add / todo_resolve）から、回答はボスの UI（todoAnswer）から。
+// 番号 no は通し番号で使い回さない（消えた番号が別の TODO と混ざらない）。設計: docs/plans/boss-todo-plan.md
+
+/** TODO の種類（質問 / 権限の許可 / 作業＝ボスの手作業）。 */
+export type TodoKind = "question" | "permission" | "action";
+
+/** 質問の選択肢 1 つ。 */
+export interface TodoOption {
+  label: string;
+  description?: string;
+}
+
+/** TODO 1 件。 */
+export interface TodoItem {
+  /** 通し番号（「N番」）。消しても使い回さない。 */
+  no: number;
+  /** 件名（1 行）。 */
+  title: string;
+  /** 詳細（Markdown）。 */
+  detail: string;
+  kind: TodoKind;
+  /** どのエビか（無ければ null）。 */
+  ebi: string | null;
+  /** どの案件か（自由文字列・無ければ null）。 */
+  project: string | null;
+  /** 選択肢（質問以外は空でよい）。 */
+  options: TodoOption[];
+  /** 推奨する選択肢の label（options にあるものだけ）。 */
+  recommended: string | null;
+  /** 作った時刻（epoch ms）。 */
+  createdAt: number;
+}
+
+/** 未解決の TODO の全件（サーバ → クライアント）。接続直後と変化のたびに送る。 */
+export interface TodosMessage {
+  type: "todos";
+  items: TodoItem[];
+}
+
+/**
+ * ボスが UI から TODO に答える（クライアント → サーバ）。
+ * サーバは答えを master へ `[TODO #N への回答] …` として流し、受け付けられたら台帳から消す。
+ * - choice: 選んだ選択肢の label
+ * - text:   自由入力（補足）
+ * - done:   true なら「✓ 対応した」（選択肢の無い作業・許可向け）
+ */
+export interface TodoAnswerMessage {
+  type: "todoAnswer";
+  no: number;
+  choice?: string;
+  text?: string;
+  done?: boolean;
+}
 
 // ===== ファイル編集（ボスが UI からファイルを書き換える）=====
 //
@@ -842,4 +901,12 @@ export interface ChatStateMessage {
   state: MasterChatState;
   /** 未応答の承認/質問の件数（「待機 N 件」ではない。busy 中の投入はキューされない）。 */
   pending: number;
+}
+
+/** todoAnswer の結果（サーバ → 送った接続だけ）。ok=false のとき TODO は消えずに残る。 */
+export interface TodoAnswerResultMessage {
+  type: "todoAnswerResult";
+  no: number;
+  ok: boolean;
+  error?: string;
 }

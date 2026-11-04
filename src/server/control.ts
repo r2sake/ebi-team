@@ -18,6 +18,7 @@ import {
   type ChatImage,
   type ViewerRecord,
 } from "../shared/protocol.ts";
+import { TodoError, type TodoBoard } from "./todos.ts";
 import {
   ALLOWED_ATTACH_TYPES,
   maxBytesFor,
@@ -243,6 +244,11 @@ export interface ControlDeps {
         keys: string[];
       }>)
     | null;
+  /**
+   * ボスの TODO 台帳（`/control/todos` `/control/todo` `/control/todo-add` `/control/todo-resolve` の実体）。
+   * master 専用 MCP の todo_* から呼ばれる。null なら 404。
+   */
+  todos: Pick<TodoBoard, "list" | "lookup" | "add" | "resolve"> | null;
 }
 
 /** JSON レスポンスを返すヘルパー。 */
@@ -821,6 +827,81 @@ export function createControlApi(deps: ControlDeps) {
         });
         res.end(file.bytes);
         return true;
+      }
+
+      // ---- ボスの TODO（master 専用 MCP todo_* のブリッジ）----
+      // 追加・解決は master の MCP から。ボスの UI からの回答は WS todoAnswer（index.ts）。
+      if (pathname.startsWith("/control/todo")) {
+        const todos = deps.todos;
+        if (!todos) {
+          sendJson(res, 404, { error: "TODO 台帳は無効です" });
+          return true;
+        }
+        // ---- GET /control/todos: 未解決の一覧（詳細は含めない＝トークン節約）----
+        if (pathname === "/control/todos" && method === "GET") {
+          const items = todos.list().map(({ no, kind, title, ebi, project, createdAt }) => ({
+            no,
+            kind,
+            title,
+            ebi,
+            project,
+            createdAt,
+          }));
+          sendJson(res, 200, { count: items.length, items });
+          return true;
+        }
+        // ---- GET /control/todo?no=N: 1 件の全部 ----
+        if (pathname === "/control/todo" && method === "GET") {
+          const no = Number(query.get("no"));
+          if (!Number.isInteger(no) || no < 1) {
+            sendJson(res, 400, { error: "no（1 以上の整数）は必須です" });
+            return true;
+          }
+          const r = todos.lookup(no);
+          if (r.found) sendJson(res, 200, { item: r.item });
+          else
+            sendJson(res, 404, {
+              error:
+                r.status === "resolved"
+                  ? `TODO #${no} は解決済みです（台帳から消えています）`
+                  : `TODO #${no} はまだ発行されていない番号です`,
+              status: r.status,
+            });
+          return true;
+        }
+        // ---- POST /control/todo-add ----
+        if (pathname === "/control/todo-add" && method === "POST") {
+          const body = await readJsonBody(req);
+          try {
+            const item = await todos.add(body);
+            sendJson(res, 200, { no: item.no, item });
+          } catch (err) {
+            sendJson(res, err instanceof TodoError ? 400 : 500, { error: (err as Error).message });
+          }
+          return true;
+        }
+        // ---- POST /control/todo-resolve {no} ----
+        if (pathname === "/control/todo-resolve" && method === "POST") {
+          const body = await readJsonBody(req);
+          const no = body.no;
+          if (typeof no !== "number" || !Number.isInteger(no) || no < 1) {
+            sendJson(res, 400, { error: "no（1 以上の整数）は必須です" });
+            return true;
+          }
+          const item = await todos.resolve(no);
+          if (!item) {
+            const r = todos.lookup(no);
+            sendJson(res, 404, {
+              error:
+                !r.found && r.status === "resolved"
+                  ? `TODO #${no} はもう解決済みです`
+                  : `TODO #${no} はありません`,
+            });
+            return true;
+          }
+          sendJson(res, 200, { ok: true, no: item.no, title: item.title });
+          return true;
+        }
       }
 
       // 該当なし。

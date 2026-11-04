@@ -226,10 +226,26 @@ const ENGINEER_INSTRUCTIONS =
   MASTER_CHANNEL_TRUST_APPEND +
   "作業の結果・返信は reply_to_master で master に届ける。";
 
+/**
+ * master ティアの instructions（ボスの TODO の使い方の決まり）。
+ * master のシステムプロンプトは gitignore 済みの config にあるため、決まりはこちらに載せる
+ * （設計: docs/plans/boss-todo-plan.md §3）。
+ */
+export const MASTER_TODO_RULES =
+  "【ボスの TODO】todo_add / todo_list / todo_get / todo_resolve は、ボスが ebi-team を使う上で" +
+  "やらなければならないこと（質問への回答・権限の許可・ボスの手作業）だけを載せる台帳。" +
+  "メモ・備忘・進捗の記録には使わない。ボスに裁定や作業を頼むときは todo_add で載せ、チャットには『TODO #N』と番号を添える。" +
+  "ボスが『TODO の N 番』と言ったら、話す前に todo_get(N) で詳細を確かめる。" +
+  "ボスがチャットで答えた・済ませたら、その答えで動く前に todo_resolve(N) で消す。" +
+  "ボスが UI から答えると `[TODO #N への回答] …` / `[TODO #N 対応済み] …` が届き、その TODO はもう消えている（todo_resolve は不要）。" +
+  "ボスに『TODO に入れて』と頼まれたときも todo_add で載せる。";
+
 const server = new McpServer(
   { name: "ebi-team-control", version: "0.1.0" },
   {
-    ...(ROLE === "engineer" ? { instructions: ENGINEER_INSTRUCTIONS } : {}),
+    ...(ROLE === "engineer"
+      ? { instructions: ENGINEER_INSTRUCTIONS }
+      : { instructions: `ebi-control はエビチームの制御チャンネル（master 用）。${MASTER_TODO_RULES}` }),
     capabilities: {
       tools: {},
       experimental: {
@@ -606,6 +622,57 @@ server.tool(
     // 要約テキストをそのままツール結果として返す（master の手元に状況サマリが返る）。
     return textResult(`${target_id} の要約:\n${text}`);
   },
+);
+
+// ---- ボスの TODO（master 専用。追加できるのは master だけ）----
+// 設計: docs/plans/boss-todo-plan.md。台帳はサーバの .ebi-team/todos.json（再起動で消えない）。
+// 番号は通し番号で使い回さない。UI のトップバー「📋 TODO」から一覧が開き、ボスはそこからも答えられる。
+const TODO_KIND = z.enum(["question", "permission", "action"]);
+
+server.tool(
+  "todo_add",
+  "ボスの TODO に 1 件載せる（ボスがやらなければならないこと＝質問への回答・権限の許可・ボスの手作業だけ。" +
+    "メモ・備忘・進捗の記録には使わない）。番号 no が返るので、チャットでは『TODO #N』と添える。" +
+    "ボスの UI のトップバー「📋 TODO」の一覧に出る。",
+  {
+    title: z.string().describe("件名（1 行・120 字まで）。一覧で見て何をすればいいか分かる文"),
+    detail: z
+      .string()
+      .optional()
+      .describe("詳細（Markdown・4000 字まで）。背景・判断材料・影響。ボスがこれだけ読んで決められるように書く"),
+    kind: TODO_KIND.describe("種類: question（質問・裁定）/ permission（権限の許可）/ action（ボスの手作業）"),
+    ebi: z.string().optional().describe("どのエビの件か（例: engineer-3）"),
+    project: z.string().optional().describe("どの案件か（例: kakeba）"),
+    options: z
+      .array(z.object({ label: z.string(), description: z.string().optional() }))
+      .optional()
+      .describe("選択肢（6 個まで）。ボスは UI でボタンを押して答えられる"),
+    recommended: z.string().optional().describe("推奨する選択肢の label（options にあるもの）"),
+  },
+  async (args) => toResult(await callControl("POST", "/control/todo-add", args)),
+);
+
+server.tool(
+  "todo_list",
+  "ボスの TODO（未解決）の一覧を返す（番号・種類・件名・エビ・案件・作った時刻。詳細は含まない＝ todo_get で引く）。",
+  {},
+  async () => toResult(await callControl("GET", "/control/todos")),
+);
+
+server.tool(
+  "todo_get",
+  "ボスの TODO の N 番を詳細まで返す（詳細・選択肢・推奨）。ボスが『TODO の N 番』と言ったら、話す前にこれで確かめる。" +
+    "消えた番号は「解決済み」、まだ振っていない番号は「未発行」と返る。",
+  { no: z.number().int().positive().describe("TODO の番号") },
+  async ({ no }) => toResult(await callControl("GET", `/control/todo?no=${no}`)),
+);
+
+server.tool(
+  "todo_resolve",
+  "ボスの TODO の N 番を解決済みにして消す（ボスがチャットで答えた・済ませたとき）。" +
+    "ボスが UI から答えた TODO は既に消えているので呼ばなくてよい。",
+  { no: z.number().int().positive().describe("TODO の番号") },
+  async ({ no }) => toResult(await callControl("POST", "/control/todo-resolve", { no })),
 );
 } // end if (ROLE === "master")
 

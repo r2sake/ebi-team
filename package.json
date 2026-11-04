@@ -40,6 +40,7 @@
     "e2e:viewer": "node --import tsx scripts/e2e-viewer.mjs",
     "e2e:origin-guard": "node scripts/e2e-origin-guard.mjs",
     "e2e:file-editor": "node scripts/e2e-file-editor.mjs",
+    "e2e:todo": "node scripts/e2e-todo.mjs",
     "e2e:dns-rebind": "node scripts/e2e-dns-rebind.mjs",
     "e2e:viewer-persist": "node scripts/e2e-viewer-persist.mjs",
     "e2e:imagegen": "node --import tsx scripts/e2e-imagegen.mjs",

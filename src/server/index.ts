@@ -73,6 +73,7 @@ import { UsageStore } from "./usageStore.ts";
 import { configureUsageHistory, usageHistoryPath } from "./usageHistory.ts";
 import { ContextGuard, contextGuardConfigFromEnv, type GuardNotice } from "./contextGuard.ts";
 import { ViewerRegistry } from "./viewerRegistry.ts";
+import { TodoBoard, answerTodo } from "./todos.ts";
 import {
   FileEditConflictError,
   FileEditError,
@@ -103,6 +104,7 @@ import {
   type SubscribeMessage,
   type UnsubscribeMessage,
   type ChatHistoryMessage,
+  type TodoAnswerMessage,
   type FileEditOpenMessage,
   type FileEditSaveMessage,
 } from "../shared/protocol.ts";
@@ -318,6 +320,14 @@ const fileEditRequests = new FileEditRequests(fileEditor, {
       .reverseInject("file-editor", to, `[file-edit ${req.id}] ${summary}`, "reply")
       .catch((err) => console.warn("[file-edit] 結果の通知に失敗:", (err as Error).message));
   },
+});
+
+// ボスの TODO 台帳（ボスがやらなければならないこと）。追加・解決は master の MCP todo_*、
+// 回答はボスの UI（WS todoAnswer）。保存先は `.ebi-team/todos.json`（env EBI_TODOS_PATH で変更可）。
+const TODOS_PATH = process.env.EBI_TODOS_PATH ?? join(process.cwd(), ".ebi-team", "todos.json");
+const todoBoard = new TodoBoard({
+  storePath: TODOS_PATH,
+  onChange: (items) => broadcast({ type: "todos", items }),
 });
 
 /** 逆方向通知の宛先として届くか（PTY エビ or chat master）。 */
@@ -749,6 +759,8 @@ const controlApi = createControlApi({
     const { request, exists } = await fileEditRequests.create(input);
     return { requestId: request.id, path: request.path, exists, keys: request.keys };
   },
+  // ボスの TODO（master 専用 MCP todo_*）。変化は onChange で WS `todos` に流れる。
+  todos: todoBoard,
   // 承認/質問（PR-M5）。claude の --permission-prompt-tool → 制御MCP → ここ。
   // ボスが UI で答えるまで resolve しない（未応答は待ち続ける・自動拒否しない）。
   requestChatPermission: async (req, signal) => {
@@ -917,6 +929,8 @@ wss.on("connection", (ws, req) => {
   send(ws, usageStore.snapshot());
   // 接続直後に現在の viewer 一覧も送る（再接続時に開いている viewer を復元するため）。
   send(ws, { type: "viewers", viewers: viewerRegistry.list() });
+  // 接続直後に未解決の TODO も送る（トップバーの件数とパネルの一覧）。
+  send(ws, { type: "todos", items: todoBoard.list() });
   // 接続前に broadcast された notice を古い順に replay する（replay:true・当時の ts 付き）。
   // 起動直後に固定エビが crashloop 停止しても、後からブラウザを開いた人が気づけるようにする。
   for (const n of noticeBuffer.list()) {
@@ -1140,6 +1154,10 @@ function handleClientMessage(ws: WebSocket, msg: ClientMessage): void {
       void handleFileEditSave(ws, msg);
       break;
     }
+    case "todoAnswer": {
+      void handleTodoAnswer(ws, msg);
+      break;
+    }
     case "fileEditCancel": {
       if (!browserConnections.has(ws)) {
         send(ws, { type: "error", text: "ファイル編集はブラウザの UI からだけ使えます" });
@@ -1152,6 +1170,39 @@ function handleClientMessage(ws: WebSocket, msg: ClientMessage): void {
       send(ws, { type: "error", text: "未知の message type です" });
     }
   }
+}
+
+// ===== ボスの TODO（WS）=====
+
+/**
+ * ボスが UI から TODO に答えた。答えを master へ `[TODO #N への回答] …` として流し、
+ * 受け付けられたら台帳から消す（WS `todos` で全画面から消える）。送れなければ残す。
+ * 回答は同一オリジンのブラウザからだけ受ける（ファイル編集と同じ線引き）。
+ */
+async function handleTodoAnswer(ws: WebSocket, msg: TodoAnswerMessage): Promise<void> {
+  const no = Number(msg.no);
+  if (!browserConnections.has(ws)) {
+    send(ws, { type: "todoAnswerResult", no, ok: false, error: "TODO への回答はブラウザの UI からだけ使えます" });
+    return;
+  }
+  const r = await answerTodo(
+    todoBoard,
+    no,
+    {
+      ...(typeof msg.choice === "string" ? { choice: msg.choice } : {}),
+      ...(typeof msg.text === "string" ? { text: msg.text } : {}),
+      ...(msg.done === true ? { done: true } : {}),
+    },
+    async (text) => {
+      // chat の master ならボスの発話として流す（チャットにも残る）。PTY の master なら注入する。
+      if (masterSession) return masterSession.sendUserText(text);
+      const out = await registry.resolveAndInject("master", "boss", text);
+      return out.delivered.includes("master")
+        ? { accepted: true }
+        : { accepted: false, reason: out.rejected[0]?.reason ?? "master が見つかりません" };
+    },
+  );
+  send(ws, r.ok ? { type: "todoAnswerResult", no, ok: true } : { type: "todoAnswerResult", no, ok: false, error: r.error });
 }
 
 // ===== ファイル編集（WS）=====
@@ -2029,6 +2080,9 @@ await loadAndApplySupervisorEngine();
 
 // 前回終了時に開いていた viewer を復元する（fail-soft: 個別エントリの失敗は warn して掃除）。
 const viewerRestore = await viewerRegistry.restore();
+// 未解決の TODO を復元する（壊れていれば退避して空で始める）。
+const todoRestore = await todoBoard.restore();
+if (todoRestore.restored > 0) console.log(`[ebi-team] TODO 復元: ${todoRestore.restored} 件（次の番号 #${todoBoard.nextNo}）`);
 
 // ===== 起動 / 終了処理 =====
 httpServer.listen(PORT, HOST, () => {
