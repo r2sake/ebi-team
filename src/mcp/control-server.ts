@@ -232,7 +232,8 @@ const ENGINEER_INSTRUCTIONS =
  * （設計: docs/plans/boss-todo-plan.md §3）。
  */
 export const MASTER_TODO_RULES =
-  "【ボスの TODO】todo_add / todo_list / todo_get / todo_resolve は、ボスが ebi-team を使う上で" +
+  "【ボスの TODO】todo 系（todo_add / todo_list / todo_get / todo_resolve）は deferred tool。会話の最初（/clear 直後を含む）に ToolSearch で読み込む。" +
+  "todo_add / todo_list / todo_get / todo_resolve は、ボスが ebi-team を使う上で" +
   "やらなければならないこと（質問への回答・権限の許可・ボスの手作業）だけを載せる台帳。" +
   "メモ・備忘・進捗の記録には使わない。ボスに裁定や作業を頼むときは todo_add で載せ、チャットには『TODO #N』と番号を添える。" +
   "ボスが『TODO の N 番』と言ったら、話す前に todo_get(N) で詳細を確かめる。" +
