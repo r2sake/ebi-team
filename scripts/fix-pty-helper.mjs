@@ -2,6 +2,9 @@
 // prebuilds に同梱される spawn-helper が npm 展開時に実行権限を失い、
 // PTY spawn が `posix_spawnp failed` で失敗することがある。
 // postinstall でこのバイナリへ実行権限を付け直す（macOS / Linux 向け）。
+// 注意: `posix_spawnp failed` は node-pty が投げる汎用メッセージで、原因はこれだけではない。
+// /dev/ptmx の枯渇（kern.tty.ptmx_max 到達）でも同じ文言になる。切り分けは
+// docs/plans/pty-leak-fix-plan.md と起動ログの `[ebi-team] ptmx: N/M` を参照。
 import { chmodSync, existsSync, readdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";

@@ -37,8 +37,11 @@ try {
     const res = parseImagegenResult(text);
     const ok = res.results.filter((r) => r.status === "ok").length;
     console.log(`OK: job_id=${res.jobId} ${ok}/${res.results.length} ok / ${res.summary}`);
+    if (res.genCount !== null) console.log(`  生成の呼び出し: ${res.genCount} 回`);
+    if (res.contact !== null) console.log(`  一覧: ${res.contact}`);
     for (const r of res.results) {
       console.log(`  - ${r.id}: ${r.status}${r.errorCode ? ` (${r.errorCode})` : ""} ${r.path ?? ""}`);
+      if (r.alphaPath !== null) console.log(`      透過版: ${r.alphaPath}`);
     }
   }
 } catch (err) {

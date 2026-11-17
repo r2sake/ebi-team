@@ -464,6 +464,10 @@ test("新しい会話: resume 無しで起動し直し、コスト累計と pend
   assert.equal(h.events.filter((e) => e.event.kind === "cleared").length, 1);
   const snap = h.session.snapshot();
   assert.ok(snap.events.some((e) => e.event.kind === "cleared"));
+  // seq は新しい会話にしても戻らない（TODO の chatSeq が別の発言を指さない）。
+  const last = h.events[h.events.length - 1]!.seq;
+  assert.equal(h.session.latestSeq(), last);
+  assert.ok(last >= 3);
 });
 
 test("新しい会話の直後も送信できる（新プロセスの stdin へ載る）", async () => {
@@ -621,6 +625,46 @@ test("resyncPending は台帳に無い孤児だけを discarded で畳む", asyn
   await h.session.stop();
 });
 
+test("同じ id の質問が 2 回届いても、回答（settled 1 件）で保留が消える（2026-10-02 回帰）", async () => {
+  // 旧実装は件数のカウンタで、NDJSON の正規化とブローカの両方から同じ id の question が
+  // 届くと pending=2 になり、回答後も「未応答の承認/質問が 1 件」が UI に残った。
+  const h = makeSession();
+  await h.session.start();
+  const brain = h.brains[0]!;
+  const q = { kind: "question" as const, id: "toolu_q#0", header: "H", question: "Q", options: [], multi: false };
+  brain.emit(q);
+  brain.emit(q);
+  await waitEvents(h, h.events.length + 2);
+  assert.equal(h.session.pendingCount, 1);
+
+  brain.emit({ kind: "permissionSettled", id: "toolu_q#0", outcome: "allowed", answer: "A" });
+  await waitEvents(h, h.events.length + 1);
+  assert.equal(h.session.pendingCount, 0);
+  assert.equal(h.session.state, "busy");
+  // UI（スティッキーバー）へ最後に送った件数も 0。
+  assert.deepEqual(h.states.at(-1), { state: "busy", pending: 0 });
+  await h.session.stop();
+});
+
+test("waiting のまま件数だけ減ったときも UI へ件数を送る", async () => {
+  const h = makeSession();
+  await h.session.start();
+  const brain = h.brains[0]!;
+  brain.emit({ kind: "question", id: "q#0", header: "H", question: "Q0", options: [], multi: false });
+  brain.emit({ kind: "question", id: "q#1", header: "H", question: "Q1", options: [], multi: false });
+  await waitEvents(h, h.events.length + 2);
+  assert.deepEqual(h.states.at(-1), { state: "waiting", pending: 2 });
+
+  brain.emit({ kind: "permissionSettled", id: "q#0", outcome: "allowed", answer: "A" });
+  await waitEvents(h, h.events.length + 1);
+  assert.deepEqual(h.states.at(-1), { state: "waiting", pending: 1 });
+
+  brain.emit({ kind: "permissionSettled", id: "q#1", outcome: "allowed", answer: "B" });
+  await waitEvents(h, h.events.length + 1);
+  assert.deepEqual(h.states.at(-1), { state: "busy", pending: 0 });
+  await h.session.stop();
+});
+
 test("exit のあとに破棄が来ても stopped を busy へ上書きしない", async () => {
   const h = makeSession();
   await h.session.start();
@@ -666,7 +710,7 @@ test("shareImage: seq を進めてイベントを流し、snapshot に含まれ�
   const h = makeSession();
   await h.session.start();
   const before = h.events.length;
-  h.session.shareImage([
+  const seq = h.session.shareImage([
     {
       name: "chat-20260905-101010-abcdef12.png",
       url: "/control/chat-attachment?name=chat-20260905-101010-abcdef12.png",
@@ -688,6 +732,9 @@ test("shareImage: seq を進めてイベントを流し、snapshot に含まれ�
   assert.equal(JSON.stringify(envelope!.event).includes("base64"), false);
   // seq は既存イベントの続き（単調増加）。
   assert.equal(envelope!.seq, (h.events[before - 1]?.seq ?? 0) + 1);
+  // 振った seq を返す（chat_image の戻り値 → todo_add の chat_seq）。latestSeq もそこを指す。
+  assert.equal(seq, envelope!.seq);
+  assert.equal(h.session.latestSeq(), envelope!.seq);
 
   const snap = h.session.snapshot();
   assert.ok(
@@ -701,7 +748,7 @@ test("shareImage: 空配列では何も流さない", async () => {
   const h = makeSession();
   await h.session.start();
   const before = h.events.length;
-  h.session.shareImage([]);
+  assert.equal(h.session.shareImage([]), null);
   assert.equal(h.events.length, before);
   await h.session.stop();
 });

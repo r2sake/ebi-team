@@ -117,6 +117,7 @@ cp ebi-team.config.example.json ebi-team.config.json
 | `permissionMode` | Claude Code の権限モード（`acceptEdits` など） |
 | `args` | 追加の起動引数 |
 | `appendSystemPrompt` | **ここが人格・カスタムロールの定義点です。** そのエージェントの性格や役割、振る舞いのルールをシステムプロンプトとして注入します |
+| `appendSystemPromptFile` | `appendSystemPrompt` の本文をファイルから読みます（長い指示文を別ファイルの 1 か所で管理したいとき）。`cwd` と同じく `$HOME` / `~` / `$EBI_TEAM` を展開し、相対パスは config 基準。中身はそのまま使います。`appendSystemPrompt` との同時指定はエラー、ファイルが読めないときは `cwd` 不在と同じく、その固定エビ 1 体だけが起動対象から外れます（サーバのログに id と理由を警告として出し、ほかの固定エビは起動します） |
 
 つまり、コード側は誰にとっても同じ「箱」のままにしておき、**自分らしいエージェントの人格や役割分担は `ebi-team.config.json` の `appendSystemPrompt` に書く**、という運用を想定しています。
 
@@ -205,6 +206,21 @@ UI では各エビに backend バッジ（🟣 claude / 🟢 codex / 🔵 gemini
 
 詳細は `docs/backends/claude.md` / `docs/backends/codex.md` / `docs/backends/gemini.md` を参照してください。
 
+### 推論努力度 (effort) のモデル別既定
+
+claude の `--effort`（推論努力度 `low` / `medium` / `high`）は、従来 master 固定エビの `args` に直書きする経路しか無く、役割付きの動的エビ（engineer 等）には届かず CLI 既定（`medium`）で走っていました。top-level `effortByModel` に **モデル→effort の既定表** を 1 つ置くと、全 spawn 経路（固定エビ・役割付き動的エビ・`model` 上書き spawn）が同じ表を見て自動で `--effort` を付けます。キーは `*` をワイルドカードに使え、同じモデルに複数当たる場合は **完全一致 > より具体的（長い）パターン > 記載順** で決まります。
+
+```jsonc
+{
+  "effortByModel": { "claude-opus-5-5": "high" },   // Opus 5.5 は常に high で走らせる
+  "roles": {
+    "deep-thinker": { "defaultModel": "claude-opus-5-5", "effort": "high" }  // 役割ごとの既定も書ける
+  }
+}
+```
+
+適用の優先順位は **`args` の `--effort` 明示 > spawn の `effort` 明示（`spawn_ebi` / `spawn_engineer` / `send_message` の `effort` 引数・`POST /control/spawn` の `effort`）> 役割の `effort` > `effortByModel` > claude CLI 既定**。`args` に `--effort` が書かれているエビには**二重付与しません**（運用者が書いた値が常に勝つ）。`--effort` は claude 方言のフラグなので codex / gemini のエビには付きません。表が効いたエビは起動ログに `effort: high (by model)` のように出ます。設定変更の反映にはサーバ再起動が必要です。
+
 ### master チャット UI (master chat)
 
 統括役（master）だけは、ターミナル表示（xterm）ではなく **ChatGPT のような専用チャット画面**で動かせます。既定は従来どおりのターミナルで、`ui` を書かない限りこの機能は一度も動きません。
@@ -286,6 +302,32 @@ Slack / Discord などの外部チャンネルに常駐する「待機・秘書�
 - 共有した画像は**添付保管庫（`.ebi-team/chat-attachments/`）へコピー**され、以降は basename だけで参照します（配信は `GET /control/chat-attachment?name=`）。元ファイルを消しても履歴の画像は残り、サーバ再起動後も会話ログ（`master-chat.jsonl`）から復元されます。
 - `ui` が `terminal` の構成で呼ぶと、自動で `open_viewer` にフォールバックします（ツールは失敗しません）。
 - 作業エビの MCP には露出しません（画像を見せるのは master 経由）。詳細は [`docs/ops/master-chat-ui.md`](docs/ops/master-chat-ui.md) §10。
+
+### ファイル編集（env の書き換え・request_file_edit）
+
+ボスが UI からファイル（主に `.env` などの設定ファイル）を書き換えられます。入口は 2 つです。
+
+- **自分で開く**: サイドバーの「📝 ファイルを編集」かチャットヘッダの 📝 → フルパス（`~` 可）を入力 → 編集 → **差分を確認** → 保存。無いファイルは新規作成になり、親フォルダが無ければ「フォルダを作成してよい」にチェックが要ります。
+- **master から頼まれる**: `ui:"chat"` の master 専用ツール `request_file_edit({ path, keys?, note? })` を呼ぶと、チャットに「この鍵を入れてください」というカードが出ます。「✏️ 入力する」で鍵ごとの入力欄（既定は伏せ字）に値を入れて保存します。ツールはすぐ返り（`status: pending`）、保存/見送りの結果は `[file-edit <id>]` の通知で master に届きます。**値そのものは master に届きません。**
+
+安全のための決まり:
+
+- 書けるのは許可ルート配下だけです。許可ルートは `EBI_EDIT_ROOTS`（`:` 区切り・既定は `$HOME/workspace:$HOME/.config`）で、viewer の `EBI_VIEWER_ROOTS` とは別の設定です。`..` を含むパスは拒否し、シンボリックリンクは実体（`realpath`）で判定します（新規作成は「いちばん近い既存の祖先」の実体で判定）。サイズ上限は `EBI_EDIT_MAX_BYTES`（既定 1MB）で、バイナリは扱いません。
+- 書き込みは**同一オリジンのブラウザの WS 接続**からだけ受け付けます（Origin の無い接続＝エビの素の WS クライアントや、別サイトからの接続は拒否）。master のツールが渡せるのはパス・鍵名・メモだけで、本文を書く口はありません。作業エビの MCP には露出しません。
+- 上書きは「開いたときの sha256」と現物が一致するときだけ行い、違えば開き直しを求めます。一時ファイルへ書いてから rename し、元の権限を保ちます。新規の秘密ファイル（`.env` / `.dev.vars` / `*.key` など）は `0600`。
+- 上書き前の控え（`<file>.bak-YYYYMMDD-HHMMSS`・元と同じ権限）は既定で残し、画面のチェックで外せます。
+- 本文は保存を操作した接続とサーバの間だけを流れ、チャットの会話ログ・notice・master への通知には載りません。保存後は内容を再表示しません。
+- 書き込みの記録は `.ebi-team/file-edits.jsonl`（`EBI_FILE_EDIT_LOG_PATH`）に「いつ・どのファイル・誰（`boss-ui` / `boss-ui:request:<id>`）・控え」だけを残します。値は残しません。
+
+### ボスの TODO（todo_add / todo_resolve）
+
+チャットで裁定をやりとりすると流れて探しにくいので、**ボスがやらなければならないこと**（質問への回答・権限の許可・ボスの手作業）だけを載せる一覧があります。メモや進捗の記録には使いません。設計は `docs/plans/boss-todo-plan.md`。
+
+- **開く**: トップバーの「📋 TODO n」（n は未解決の件数）を押すと、右から一覧が出ます（スマホでは全画面）。行を押すと詳細（Markdown）・選択肢（推奨バッジ付き）・補足の入力欄が開きます。
+- **答える**: 選択肢か補足を入れて「回答して送る」、許可・作業なら「✓ 対応した」。master のチャットに `[TODO #N への回答] …` / `[TODO #N 対応済み] …` がボスの発話として届き、その TODO は消えます。master が止まっていて送れないときは消さずに残します。チャットで「12 番は B で」と答えても構いません（master が `todo_resolve` で消します）。
+- **載せる**: master 専用ツール `todo_add({ title, detail?, kind, ebi?, project?, options?, recommended? })`。`kind` は `question`（質問）/ `permission`（権限の許可）/ `action`（作業）。UI に追加ボタンは無く、ボスが「TODO に入れて」と言ったときも master が載せます。ほかに `todo_list`（詳細なし）/ `todo_get(no)`（詳細まで）/ `todo_resolve(no)`。作業エビの MCP には出ません。
+- **番号**: 通し番号で使い回しません。「新しい会話」やサーバの再起動でもリセットしないので、「TODO の N 番」が別の TODO と混ざりません。消えた番号を `todo_get` すると「解決済み」が返ります。
+- **保存先**: `.ebi-team/todos.json`（`EBI_TODOS_PATH`）。未解決のものと次の番号だけを持ち、解決したものの履歴は残しません（UI から答えたものはチャットログに残ります）。
 
 ### master コンテキスト枯渇ガード (context-guard)
 

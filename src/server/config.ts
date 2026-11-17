@@ -8,7 +8,7 @@
 // - config が無い場合は固定エビ無し（空配列）として扱い、起動は継続する（任意機能）。
 
 import { readFile } from "node:fs/promises";
-import { statSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { isAbsolute, resolve, dirname } from "node:path";
 import { homedir } from "node:os";
 import type { AgentKind } from "../shared/protocol.ts";
@@ -32,6 +32,16 @@ import {
   MASTER_BRAIN_IDS,
   type MasterBrainId,
 } from "./master/brain.ts";
+// 推論努力度（--effort）の解決は effort.ts が SoT（純関数・I/O なし）。
+import {
+  EMPTY_EFFORT_BY_MODEL,
+  describeEffort,
+  effortArgs,
+  normalizeEffortByModel,
+  resolveEffort,
+  type Effort,
+  type EffortByModel,
+} from "./effort.ts";
 
 // permission-mode の語彙は backends/types.ts（バックエンド非依存の抽象語彙）が SoT。
 // 既存の import 元（roles.ts / index.ts / control-server.ts 等）を壊さないよう再エクスポートする。
@@ -62,6 +72,12 @@ interface RawFixedEbi {
   permissionMode?: unknown;
   args?: unknown;
   appendSystemPrompt?: unknown;
+  /**
+   * appendSystemPrompt の本文をファイルから読む場合のパス（appendSystemPrompt と同時指定は不可）。
+   * cwd と同じく $EBI_TEAM / $HOME / ~ を展開し、相対パスは config のあるディレクトリ基準。
+   * 中身はそのまま（置換・trim なし）使う。読めなければ cwd 不在と同じく起動時エラー。
+   */
+  appendSystemPromptFile?: unknown;
   /** テスト用にバイナリを差し替えたい場合（既定は claude / EBI_COMMAND）。 */
   command?: unknown;
   /**
@@ -103,6 +119,11 @@ interface RawConfig {
   defaultBackend?: unknown;
   /** バックエンド別の既定（command / defaultModel）。検証は loadBackendSettings。 */
   backends?: unknown;
+  /**
+   * モデル→推論努力度（claude の `--effort`）の既定表（{ モデルパターン: low|medium|high }）。
+   * 検証・引き当ては effort.ts（normalizeEffortByModel / effortForModel）が SoT。
+   */
+  effortByModel?: unknown;
 }
 
 /**
@@ -242,6 +263,23 @@ export async function loadBackendSettings(configPath: string): Promise<BackendSe
   }
 }
 
+// ===== 推論努力度の既定（top-level "effortByModel"） =====
+
+/**
+ * ebi-team.config.json の top-level "effortByModel" を読み、正規化して返す。
+ * - ファイルが無い／キーが無ければ空の表（＝従来どおり CLI 既定 effort に任せる）。
+ * - 検証失敗は throw（呼び出し側で警告ログにして起動継続する想定）。
+ */
+export async function loadEffortByModel(configPath: string): Promise<EffortByModel> {
+  const parsed = await readRawConfig(configPath);
+  if (parsed === null) return EMPTY_EFFORT_BY_MODEL;
+  try {
+    return normalizeEffortByModel(parsed.effortByModel);
+  } catch (err) {
+    throw new Error(`${configPath} の ${(err as Error).message}`);
+  }
+}
+
 /** master の UI 方式。既定は terminal（現行の PTY 経路と完全に同一）。 */
 export type MasterUiMode = "terminal" | "chat";
 
@@ -265,8 +303,18 @@ export interface FixedEbiSpec {
    * MasterBrain へ直接渡すため、正規化済みの値をここにも持つ）。
    */
   permissionMode: PermissionMode;
-  /** config の args（$EBI_TEAM 等を展開済み・**方言フラグを付ける前**の生の追加引数）。 */
+  /**
+   * config の args（$EBI_TEAM 等を展開済み・**方言フラグを付ける前**の生の追加引数）。
+   * ただし effortByModel が効いた場合は解決済みの `--effort <値>` がここに含まれる
+   * （claude 方言のフラグだが、PTY 経路と master チャット経路の両方が extraArgs を
+   * そのまま末尾へ流すため、1 か所で揃えるのが最も漏れが無い）。
+   */
   extraArgs: string[];
+  /**
+   * この固定エビに実際に付与した推論努力度（`--effort`）。
+   * null なら付与していない（args に明示があった／表に当たらなかった＝CLI 既定）。
+   */
+  effort: Effort | null;
   /**
    * notification（mailbox 購読）経路で受信するか（既定 true）。
    * false のとき送信側は購読確立を待たず PTY 注入で届ける（受信 PTY 固定）。
@@ -408,11 +456,39 @@ function asStringArray(v: unknown): string[] {
 }
 
 /**
+ * appendSystemPrompt（直書き）/ appendSystemPromptFile（ファイル参照）から本文を決める。
+ * 長い指示文を別ファイルの 1 か所で管理し、config へ写し直す手間とズレを無くすための口。
+ * 両方指定は曖昧なので明示エラー。ファイルが読めないときは cwd 不在と同じく throw し、
+ * その固定エビ 1 体だけを起動対象から外す（指示文抜きで起動させない＝境界エビの安全指示が
+ * 黙って欠ける事故を作らない。ほかの固定エビは loadFixedEbiReport が起こす）。
+ */
+function resolveAppendSystemPrompt(raw: RawFixedEbi, configDir: string, id: string): string | undefined {
+  const inline = asString(raw.appendSystemPrompt);
+  const fileRaw = asString(raw.appendSystemPromptFile);
+  if (fileRaw === undefined) return inline;
+  if (inline !== undefined) {
+    throw new Error(`固定エビ "${id}" は appendSystemPrompt と appendSystemPromptFile を同時に指定できません`);
+  }
+  const expanded = expandEnv(fileRaw, configDir);
+  const abs = isAbsolute(expanded) ? expanded : resolve(configDir, expanded);
+  try {
+    return readFileSync(abs, "utf8");
+  } catch (err) {
+    throw new Error(`固定エビ "${id}" の appendSystemPromptFile を読めません: ${abs}（${(err as Error).message}）`);
+  }
+}
+
+/**
  * 1 件の生定義を検証・正規化して FixedEbiSpec を返す。
  * 起動引数（args）の組み立て順:
  *   [--model M]? [--permission-mode P]? [--append-system-prompt S]? ...任意 args
  */
-function normalizeOne(raw: RawFixedEbi, configDir: string, defaults: ConfigDefaults): FixedEbiSpec {
+function normalizeOne(
+  raw: RawFixedEbi,
+  configDir: string,
+  defaults: ConfigDefaults,
+  effortByModel: EffortByModel = EMPTY_EFFORT_BY_MODEL,
+): FixedEbiSpec {
   const id = asString(raw.id);
   if (!id) throw new Error("固定エビの id（文字列）が必要です");
 
@@ -460,7 +536,7 @@ function normalizeOne(raw: RawFixedEbi, configDir: string, defaults: ConfigDefau
   }
   const brain = (brainRaw ?? DEFAULT_MASTER_BRAIN_ID) as MasterBrainId;
 
-  const appendSystemPrompt = asString(raw.appendSystemPrompt);
+  const appendSystemPrompt = resolveAppendSystemPrompt(raw, configDir, id);
   // args は $EBI_TEAM / $HOME / ~ を展開する（--mcp-config の絶対パス指定を machine 非依存に）。
   const extraArgs = asStringArray(raw.args).map((a) => expandEnv(a, configDir));
 
@@ -478,14 +554,33 @@ function normalizeOne(raw: RawFixedEbi, configDir: string, defaults: ConfigDefau
   const command =
     asString(raw.command) ?? (backendId ? getBackend(backendId).defaultCommand : defaults.command);
 
+  // 実際に使うバックエンド（明示 > command からの解決 > サーバ既定）。
+  const resolvedBackendId: BackendId =
+    backendId ?? resolveBackend(command)?.id ?? defaults.backend ?? DEFAULT_BACKEND_ID;
+
+  // 推論努力度（--effort）。claude 方言のフラグなので、**その固定エビが実際に claude で動く
+  // ときだけ**適用する（backend 明示 claude / command が claude に解決できる場合）。
+  // どの backend にも一致しない command（bash 等のスタブ起動）には付けない＝従来どおり。
+  const isClaudeLaunch =
+    backendId === DEFAULT_BACKEND_ID ||
+    (backendId === null && resolveBackend(command)?.id === DEFAULT_BACKEND_ID);
+  const resolvedEffort = isClaudeLaunch
+    ? resolveEffort({ model, table: effortByModel, existingArgs: extraArgs })
+    : { effort: null, source: null };
+  // args 側に明示があればそれを優先する（resolveEffort が effort:null を返す）＝二重付与しない。
+  const extraArgsWithEffort = [...extraArgs, ...effortArgs(resolvedEffort)];
+
   const args = buildClaudeArgs({
     command,
     backendId,
     model,
     permissionMode,
     appendSystemPrompt,
-    extraArgs,
+    extraArgs: extraArgsWithEffort,
   });
+
+  const effortNote = describeEffort(resolvedEffort);
+  if (effortNote) console.log(`[ebi-team] 固定エビ ${id}: ${effortNote}`);
 
   // notifySubscribe（既定 true）。false は「受信を PTY 注入に固定」する印。
   const notifySubscribe = raw.notifySubscribe === undefined ? true : asBoolean(raw.notifySubscribe, id);
@@ -496,7 +591,8 @@ function normalizeOne(raw: RawFixedEbi, configDir: string, defaults: ConfigDefau
     ui,
     brain,
     permissionMode,
-    extraArgs,
+    extraArgs: extraArgsWithEffort,
+    effort: resolvedEffort.effort,
     // 固定エビの backend は **明示指定 > command から解決**（サーバ既定を波及させない）。
     // 理由: 設計上 master は常に claude（統括系を落とさない）で、EBI_BACKEND=codex のような
     // サーバ既定をそのまま master に付けると、claude/bash のプロセスに codex の性質
@@ -508,7 +604,7 @@ function normalizeOne(raw: RawFixedEbi, configDir: string, defaults: ConfigDefau
       args,
       cwd,
       model,
-      backend: backendId ?? resolveBackend(command)?.id ?? defaults.backend ?? DEFAULT_BACKEND_ID,
+      backend: resolvedBackendId,
       // 役割プロンプトは args だけでは足りない。gemini は `--append-system-prompt` 相当を
       // 持たず per-エビ GEMINI.md（backend.buildEnv 経由）で注入するため、生の本文を
       // launch にも載せて agent.ts → backend.buildEnv へ渡す。
@@ -519,35 +615,66 @@ function normalizeOne(raw: RawFixedEbi, configDir: string, defaults: ConfigDefau
   };
 }
 
+/** 読み込みで外した固定エビ 1 体ぶんの記録（id が読めないときは "#<配列の位置>"）。 */
+export interface SkippedFixedEbi {
+  id: string;
+  reason: string;
+}
+
 /**
- * config ファイルを読み込み、固定エビ定義を正規化して返す。
- * - ファイルが無ければ空配列（固定エビ無し）。
- * - JSON 不正・スキーマ不正は throw（呼び出し側で警告ログにして起動継続するか判断）。
+ * config ファイルを読み込み、固定エビ定義を正規化して返す（1 体ずつ fail-soft）。
+ * - ファイルが無ければ空（固定エビ無し）。
+ * - JSON 不正・fixedEbi が配列でない・effortByModel 不正は全体の問題なので throw。
+ * - 1 体ぶんの検証・正規化エラー（cwd 不在・appendSystemPromptFile が読めない・kind 不正 等）は
+ *   その 1 体だけを specs から外し、skipped に id と理由を積む（ほかの固定エビは起こす）。
+ * - id 重複は後から出た方を外す（先に書かれた定義を正とする）。
  */
-export async function loadFixedEbi(
+export async function loadFixedEbiReport(
   configPath: string,
   defaults: ConfigDefaults,
-): Promise<FixedEbiSpec[]> {
+): Promise<{ specs: FixedEbiSpec[]; skipped: SkippedFixedEbi[] }> {
   const parsed = await readRawConfig(configPath);
   if (parsed === null) {
     // ファイル無し＝固定エビ機能を使わない。エラーにしない。
-    return [];
+    return { specs: [], skipped: [] };
   }
 
   const list = parsed.fixedEbi;
-  if (list === undefined) return [];
+  if (list === undefined) return { specs: [], skipped: [] };
   if (!Array.isArray(list)) {
     throw new Error(`${configPath} の fixedEbi は配列である必要があります`);
   }
 
   const configDir = dirname(configPath);
-  const specs = list.map((raw) => normalizeOne(raw as RawFixedEbi, configDir, defaults));
-
-  // id 重複チェック。
+  const effortByModel = normalizeEffortByModel(parsed.effortByModel);
+  const specs: FixedEbiSpec[] = [];
+  const skipped: SkippedFixedEbi[] = [];
   const seen = new Set<string>();
-  for (const s of specs) {
-    if (seen.has(s.id)) throw new Error(`固定エビの id が重複しています: ${s.id}`);
-    seen.add(s.id);
-  }
+  list.forEach((raw, i) => {
+    const rawId = asString((raw as RawFixedEbi | null)?.id);
+    const label = rawId || `#${i}`;
+    try {
+      const spec = normalizeOne(raw as RawFixedEbi, configDir, defaults, effortByModel);
+      if (seen.has(spec.id)) throw new Error(`固定エビの id が重複しています: ${spec.id}`);
+      seen.add(spec.id);
+      specs.push(spec);
+    } catch (err) {
+      skipped.push({ id: label, reason: (err as Error).message });
+    }
+  });
+  return { specs, skipped };
+}
+
+/**
+ * 固定エビ定義を厳格に読む（1 体でも外れる定義があれば、その理由で throw）。
+ * サーバの起動経路は loadFixedEbiReport を使う（1 体の不備で全体を止めない）。
+ * こちらは定義の検証をまとめて確かめたいとき用。
+ */
+export async function loadFixedEbi(
+  configPath: string,
+  defaults: ConfigDefaults,
+): Promise<FixedEbiSpec[]> {
+  const { specs, skipped } = await loadFixedEbiReport(configPath, defaults);
+  if (skipped.length > 0) throw new Error(skipped[0].reason);
   return specs;
 }

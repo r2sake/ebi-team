@@ -1,5 +1,6 @@
 import * as pty from "node-pty";
 import { IdleDetector } from "./idleDetector.ts";
+import { countPtmxFds, readPtmxMax } from "./ptmxWatch.ts";
 import type { AgentRecord, AgentStatus, AgentMode, AgentKind } from "../shared/protocol.ts";
 import { deliveryText } from "../shared/deliveryTag.ts";
 import { extractFinalReport, isRelayEnabled, type FinalReport } from "./finalReport.ts";
@@ -627,13 +628,24 @@ export class Agent {
       }),
       backend.envDenyList,
     );
-    this.proc = pty.spawn(launch.command, launch.args, {
-      name: "xterm-color",
-      cols: 80,
-      rows: 24,
-      cwd: launch.cwd,
-      env: spawnEnv,
-    });
+    try {
+      this.proc = pty.spawn(launch.command, launch.args, {
+        name: "xterm-color",
+        cols: 80,
+        rows: 24,
+        cwd: launch.cwd,
+        env: spawnEnv,
+      });
+    } catch (err) {
+      // node-pty は pty 枯渇でも spawn-helper の不在でも一律 "posix_spawnp failed." を投げる。
+      // 一次切り分けを数秒で終わらせるため、その時点の ptmx 本数と上限を添えて残す
+      // （2026-09-22 の /dev/ptmx 枯渇事故では、この情報が無くて原因特定に時間を要した）。
+      console.error(
+        `[ebi-team] [${id}] pty.spawn 失敗: ${String(err)} / ` +
+          `ptmx ${countPtmxFds()}/${readPtmxMax()} 本使用中`,
+      );
+      throw err;
+    }
     this.pid = this.proc.pid;
 
     this.proc.onData((data) => {

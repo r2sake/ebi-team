@@ -13,7 +13,8 @@ results:
     tool: image_gen__imagegen
   - id: empty-state-1
     status: ok
-    path: /Users/you/workspace/GitHub/ebi-team/tmp/images/sample-2026-09-05/empty-state-1.png
+    path: /Users/you/workspace/GitHub/ebi-team/tmp/images/sample-2026-09-05/empty-state-1_magenta.png
+    alpha_path: /Users/you/workspace/GitHub/ebi-team/tmp/images/sample-2026-09-05/empty-state-1_alpha.png
     pixels: 1024x1024
     bytes: 831865
     format: png
@@ -23,3 +24,5 @@ results:
     error_code: GEN_ERROR
     note: 生成ツールがエラー応答。同一プロンプトで 1 回だけ再試行し、同じ結果。
 gen_seconds: 233
+gen_count: 3
+contact: /Users/you/workspace/GitHub/ebi-team/tmp/images/sample-2026-09-05/contact.png

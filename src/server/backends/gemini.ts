@@ -96,7 +96,7 @@ export function toGeminiApprovalMode(mode: PermissionMode | null): GeminiApprova
 /**
  * モデル指定を gemini 用に解決する。
  *
- * ebi-team の役割既定モデル（engineer は "claude-opus-5"）がそのまま `-m` に流れると
+ * ebi-team の役割既定モデル（engineer は "claude-opus-5-5"）がそのまま `-m` に流れると
  * 404 で即死するため、**gemini 系でないモデル名は既定モデルへ落とす**。
  * 役割ごとの backend 別モデル既定は PR-E（EbiRole.backend / config.backends）で入る。
  */

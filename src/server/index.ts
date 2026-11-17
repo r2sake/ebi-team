@@ -35,11 +35,12 @@ import {
 import { addWorktree, removeWorktree } from "./git.ts";
 import { Supervisor } from "./supervisor.ts";
 import {
-  loadFixedEbi,
+  loadFixedEbiReport,
   supervisorEngineFrom,
   loadRawCustomRoles,
   loadDevChannelsAllowlist,
   loadBackendSettings,
+  loadEffortByModel,
   validatePermissionMode,
   DEFAULT_PERMISSION_MODE,
   EMPTY_BACKEND_SETTINGS,
@@ -47,6 +48,13 @@ import {
   type FixedEbiSpec,
 } from "./config.ts";
 import { EBI_ROLES, resolveRole, registerCustomRoles, unknownRoleError } from "./roles.ts";
+import {
+  EMPTY_EFFORT_BY_MODEL,
+  describeEffort,
+  effortArgs,
+  resolveEffort,
+  type EffortByModel,
+} from "./effort.ts";
 import { isRunningFromSrc, mcpConfigPathFor, type McpConfigRole } from "./mcpConfigPath.ts";
 import { needsPreflight, runPreflight } from "./backendPreflight.ts";
 import {
@@ -65,9 +73,19 @@ import { UsageStore } from "./usageStore.ts";
 import { configureUsageHistory, usageHistoryPath } from "./usageHistory.ts";
 import { ContextGuard, contextGuardConfigFromEnv, type GuardNotice } from "./contextGuard.ts";
 import { ViewerRegistry } from "./viewerRegistry.ts";
+import { TodoBoard, answerTodo } from "./todos.ts";
+import {
+  FileEditConflictError,
+  FileEditError,
+  FileEditor,
+  FileEditRequests,
+} from "./fileEditor.ts";
+import { startPtmxWatch } from "./ptmxWatch.ts";
 import {
   loadAuthConfig,
-  isLoopback,
+  isTrustedLocal,
+  isSameOriginBrowser,
+  checkRequestOrigin,
   authorize,
   tokenMatches,
   buildAuthCookie,
@@ -86,6 +104,9 @@ import {
   type SubscribeMessage,
   type UnsubscribeMessage,
   type ChatHistoryMessage,
+  type TodoAnswerMessage,
+  type FileEditOpenMessage,
+  type FileEditSaveMessage,
 } from "../shared/protocol.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -103,6 +124,9 @@ const COMMAND = process.env.EBI_COMMAND ?? "claude";
 // config 由来のバックエンド既定（top-level "defaultBackend" / "backends"）。
 // listen 前に loadAndApplyBackendSettings() が確定させる（それまでは「既定なし」）。
 let backendSettings: BackendSettings = EMPTY_BACKEND_SETTINGS;
+// config 由来のモデル→effort 既定表（top-level "effortByModel"）。
+// listen 前に loadAndApplyEffortByModel() が確定させる（それまでは「表なし」＝CLI 既定）。
+let effortByModel: EffortByModel = EMPTY_EFFORT_BY_MODEL;
 // サーバ既定のバックエンド id。優先度は spawn 引数 > 役割(EbiRole.backend) >
 // config.defaultBackend > env EBI_BACKEND > "claude"。
 // 未実装 id を指定されたら起動前に throw する（黙って claude に落とさない）。
@@ -220,7 +244,9 @@ function controlMcpSpecFor(mcpRole: McpConfigRole, agentId: string): ControlMcpS
     args: server.args,
     cwd: root,
     env: {
-      EBI_CONTROL_URL: `http://${HOST}:${PORT}`,
+      // 0.0.0.0 / :: で待ち受けていても、内部の呼び出しは Host が 127.0.0.1 になる URL で繋ぐ
+      // （Host が localhost 等でない loopback 接続はトークン認証が要るため・isTrustedLocal）。
+      EBI_CONTROL_URL: `http://${HOST === "0.0.0.0" || HOST === "::" ? "127.0.0.1" : HOST}:${PORT}`,
       EBI_MCP_ROLE: mcpRole,
       EBI_ID: agentId,
       // channel 注入非対応の backend は PTY 注入で受けるため、購読ループは回さない。
@@ -276,6 +302,40 @@ const usageStore = new UsageStore();
 // viewers.json（open 中の viewer の永続化先）。再起動後に同じタブを復元するために使う。
 const VIEWERS_PATH = process.env.EBI_VIEWERS_PATH ?? join(process.cwd(), ".ebi-team", "viewers.json");
 const viewerRegistry = new ViewerRegistry({ storePath: VIEWERS_PATH });
+
+// ファイル編集（ボスが UI からファイル＝主に env を書き換える）。
+// 書き込みの記録（いつ・どのファイルを・誰が。値は残さない）は `.ebi-team/file-edits.jsonl`。
+const FILE_EDIT_LOG_PATH =
+  process.env.EBI_FILE_EDIT_LOG_PATH ?? join(process.cwd(), ".ebi-team", "file-edits.jsonl");
+const fileEditor = new FileEditor({ auditPath: FILE_EDIT_LOG_PATH });
+// master の request_file_edit の依頼台帳。カードの表示と決着は chat master のトランスクリプトへ、
+// 保存/見送りの結果（値は含まない）は依頼した送り手へ逆方向通知で返す。
+const fileEditRequests = new FileEditRequests(fileEditor, {
+  onRequest: (req) => masterSession?.showFileEditRequest(req),
+  onSettled: (req, outcome, summary, notify) => {
+    masterSession?.settleFileEditRequest(req.id, outcome, summary);
+    if (!notify) return;
+    const to = req.from && registryHasTarget(req.from) ? req.from : (masterSession?.id ?? "master");
+    void registry
+      .reverseInject("file-editor", to, `[file-edit ${req.id}] ${summary}`, "reply")
+      .catch((err) => console.warn("[file-edit] 結果の通知に失敗:", (err as Error).message));
+  },
+});
+
+// ボスの TODO 台帳（ボスがやらなければならないこと）。追加・解決は master の MCP todo_*、
+// 回答はボスの UI（WS todoAnswer）。保存先は `.ebi-team/todos.json`（env EBI_TODOS_PATH で変更可）。
+const TODOS_PATH = process.env.EBI_TODOS_PATH ?? join(process.cwd(), ".ebi-team", "todos.json");
+const todoBoard = new TodoBoard({
+  storePath: TODOS_PATH,
+  onChange: (items) => broadcast({ type: "todos", items }),
+  // TODO からチャットの発言へ飛ぶための seq（chat master が居ない構成では null）。
+  chatSeqNow: () => masterSession?.latestSeq() ?? null,
+});
+
+/** 逆方向通知の宛先として届くか（PTY エビ or chat master）。 */
+function registryHasTarget(id: string): boolean {
+  return registry.has(id) || masterSession?.id === id;
+}
 
 // ===== 接続中の WebSocket クライアント集合 =====
 const clients = new Set<WebSocket>();
@@ -691,9 +751,18 @@ const controlApi = createControlApi({
         save: (bytes, mediaType) => chatAttachments.save(bytes, mediaType),
       },
     );
-    session.shareImage([image]);
-    return image;
+    const seq = session.shareImage([image]);
+    return seq === null ? image : { ...image, seq };
   },
+  // ファイル編集の入力依頼（master の request_file_edit）。チャットにカードを出してすぐ返る。
+  // 受けるのはパス・鍵名・メモだけで、本文や値を書き込む口はここには無い。
+  requestFileEdit: async (input) => {
+    if (!masterSession) throw new Error('ファイル編集の依頼は ui:"chat" の master が居るときだけ使えます');
+    const { request, exists } = await fileEditRequests.create(input);
+    return { requestId: request.id, path: request.path, exists, keys: request.keys };
+  },
+  // ボスの TODO（master 専用 MCP todo_*）。変化は onChange で WS `todos` に流れる。
+  todos: todoBoard,
   // 承認/質問（PR-M5）。claude の --permission-prompt-tool → 制御MCP → ここ。
   // ボスが UI で答えるまで resolve しない（未応答は待ち続ける・自動拒否しない）。
   // 「未応答 N 件」の再同期（孤児の破棄）。サーバ再起動なしで UI を実体へ戻す口。
@@ -716,7 +785,8 @@ function wantsHtml(req: IncomingMessage): boolean {
 const httpServer = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", "http://127.0.0.1");
   const urlPath = url.pathname;
-  const loopback = isLoopback(req);
+  // loopback でも Host が localhost 等でなければ無認証にしない（DNS リバインディング対策）。
+  const loopback = isTrustedLocal(req);
 
   // ---- ログイン導線（認証ゲートより前・常に到達可能）----
   // GET /login: トークン入力ページを返す。POST /login: 照合して Cookie を発行する。
@@ -783,6 +853,18 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
+  // 制御API は別サイトのページからの呼び出し（CSRF・<img src> での GET）を弾く。
+  // Origin も Sec-Fetch-Site も付けない Node のクライアント（ebi-control MCP 等）は従来どおり通る。
+  if (urlPath.startsWith("/control/")) {
+    const verdict = checkRequestOrigin(req);
+    if (!verdict.ok) {
+      console.warn(`[ebi-team] 制御API を拒否（${verdict.reason}）: ${req.method} ${urlPath} origin=${req.headers["origin"] ?? "-"}`);
+      res.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: "forbidden origin" }));
+      return;
+    }
+  }
+
   // 制御API（/control/*）を最優先で処理する。該当すれば静的配信へは進まない。
   if (await controlApi(req, res, urlPath, url.searchParams)) return;
   let filePath = join(CLIENT_DIST, normalize(urlPath === "/" ? "/index.html" : urlPath));
@@ -806,24 +888,39 @@ const httpServer = createServer(async (req, res) => {
 // ===== WebSocket =====
 // HTTP 入口と同じ二段判定でハンドシェイクをゲートする。ここを塞がないと WS だけ
 // 素通りしてしまう（plan §7-2）。token は Cookie ebi_auth / ?token= から拾う。
+// あわせて Origin を見て、別サイトのページからの接続を弾く（checkRequestOrigin）。
 const wss = new WebSocketServer({
   server: httpServer,
   path: "/ws",
   verifyClient: (info, cb) => {
     const req = info.req;
-    const loopback = isLoopback(req);
+    const loopback = isTrustedLocal(req);
     const query = new URL(req.url ?? "/ws", "http://127.0.0.1").searchParams;
     const auth = authorize(req, loopback, authConfig, query);
-    if (auth.ok) {
-      cb(true);
-    } else {
+    if (!auth.ok) {
       cb(false, 401, "Unauthorized");
+      return;
     }
+    // 別サイトのページからの接続（CSWSH）を弾く。通すと spawn・入力・kill まで乗っ取られる。
+    // Origin の無い接続（ブラウザ以外）は上のトークン認証に任せる。
+    const verdict = checkRequestOrigin(req);
+    if (!verdict.ok) {
+      console.warn(`[ebi-team] WS 接続を拒否（${verdict.reason}）: origin=${req.headers["origin"] ?? "-"}`);
+      cb(false, 403, "Forbidden");
+      return;
+    }
+    cb(true);
   },
 });
 
-wss.on("connection", (ws) => {
+// 接続ごとの「同一オリジンのブラウザから来たか」。ファイル編集はこれが true の接続だけに許す
+// （ブラウザは WS に必ず Origin を付ける。エビの素の WS クライアントや、別サイトのページからの
+//  接続＝ CSWSH ではファイルを書かせない）。
+const browserConnections = new WeakSet<WebSocket>();
+
+wss.on("connection", (ws, req) => {
   clients.add(ws);
+  if (isSameOriginBrowser(req)) browserConnections.add(ws);
   // 接続直後にサーバ能力（監督が有効か）を送る。クライアントはこれで要約 UI の出し分けをする。
   send(ws, { type: "capabilities", supervisor: supervisor.enabled });
   // master が ui:"chat" なら、registry より**先に** state と直近の会話を送る。
@@ -836,6 +933,8 @@ wss.on("connection", (ws) => {
   send(ws, usageStore.snapshot());
   // 接続直後に現在の viewer 一覧も送る（再接続時に開いている viewer を復元するため）。
   send(ws, { type: "viewers", viewers: viewerRegistry.list() });
+  // 接続直後に未解決の TODO も送る（トップバーの件数とパネルの一覧）。
+  send(ws, { type: "todos", items: todoBoard.list() });
   // 接続前に broadcast された notice を古い順に replay する（replay:true・当時の ts 付き）。
   // 起動直後に固定エビが crashloop 停止しても、後からブラウザを開いた人が気づけるようにする。
   for (const n of noticeBuffer.list()) {
@@ -1051,10 +1150,152 @@ function handleClientMessage(ws: WebSocket, msg: ClientMessage): void {
       handleChatHistory(ws, msg);
       break;
     }
+    case "fileEditOpen": {
+      void handleFileEditOpen(ws, msg);
+      break;
+    }
+    case "fileEditSave": {
+      void handleFileEditSave(ws, msg);
+      break;
+    }
+    case "todoAnswer": {
+      void handleTodoAnswer(ws, msg);
+      break;
+    }
+    case "fileEditCancel": {
+      if (!browserConnections.has(ws)) {
+        send(ws, { type: "error", text: "ファイル編集はブラウザの UI からだけ使えます" });
+        break;
+      }
+      fileEditRequests.cancel(msg.requestId);
+      break;
+    }
     default: {
       send(ws, { type: "error", text: "未知の message type です" });
     }
   }
+}
+
+// ===== ボスの TODO（WS）=====
+
+/**
+ * ボスが UI から TODO に答えた。答えを master へ `[TODO #N への回答] …` として流し、
+ * 受け付けられたら台帳から消す（WS `todos` で全画面から消える）。送れなければ残す。
+ * 回答は同一オリジンのブラウザからだけ受ける（ファイル編集と同じ線引き）。
+ */
+async function handleTodoAnswer(ws: WebSocket, msg: TodoAnswerMessage): Promise<void> {
+  const no = Number(msg.no);
+  if (!browserConnections.has(ws)) {
+    send(ws, { type: "todoAnswerResult", no, ok: false, error: "TODO への回答はブラウザの UI からだけ使えます" });
+    return;
+  }
+  const r = await answerTodo(
+    todoBoard,
+    no,
+    {
+      ...(typeof msg.choice === "string" ? { choice: msg.choice } : {}),
+      ...(typeof msg.text === "string" ? { text: msg.text } : {}),
+      ...(msg.done === true ? { done: true } : {}),
+    },
+    async (text) => {
+      // chat の master ならボスの発話として流す（チャットにも残る）。PTY の master なら注入する。
+      if (masterSession) return masterSession.sendUserText(text);
+      const out = await registry.resolveAndInject("master", "boss", text);
+      return out.delivered.includes("master")
+        ? { accepted: true }
+        : { accepted: false, reason: out.rejected[0]?.reason ?? "master が見つかりません" };
+    },
+  );
+  send(ws, r.ok ? { type: "todoAnswerResult", no, ok: true } : { type: "todoAnswerResult", no, ok: false, error: r.error });
+}
+
+// ===== ファイル編集（WS）=====
+// 本文は**要求した接続にだけ**返す（broadcast・notice・ログに載せない）。エラー文にも本文は入らない。
+
+/** ファイル編集を許す接続か（同一オリジンのブラウザだけ）。違えば error を返して false。 */
+function fileEditAllowed(ws: WebSocket): boolean {
+  if (browserConnections.has(ws)) return true;
+  send(ws, { type: "error", text: "ファイル編集はブラウザの UI からだけ使えます" });
+  return false;
+}
+
+/**
+ * 依頼 id 付きの操作で、依頼がまだ有効かとパスが一致するかを確かめる。
+ * 依頼が無い（サーバ再起動で消えた等）ときはカードを畳んで null。
+ */
+function fileEditRequestFor(requestId: string | undefined): { ok: true; path: string | null } | { ok: false; error: string } {
+  if (requestId === undefined) return { ok: true, path: null };
+  const req = fileEditRequests.get(requestId);
+  if (!req) {
+    fileEditRequests.forgetUnknown(requestId);
+    return { ok: false, error: "依頼は無効です（サーバ再起動などで破棄されました）" };
+  }
+  return { ok: true, path: req.path };
+}
+
+async function handleFileEditOpen(ws: WebSocket, msg: FileEditOpenMessage): Promise<void> {
+  if (!fileEditAllowed(ws)) return;
+  const base = { type: "fileEditLoaded" as const, path: String(msg.path ?? ""), ...(msg.requestId ? { requestId: msg.requestId } : {}) };
+  const req = fileEditRequestFor(msg.requestId);
+  if (!req.ok) {
+    send(ws, { ...base, error: req.error });
+    return;
+  }
+  try {
+    const file = await fileEditor.load(msg.path);
+    if (req.path && file.path !== req.path) {
+      send(ws, { ...base, error: "依頼と違うファイルは開けません" });
+      return;
+    }
+    send(ws, { ...base, file });
+  } catch (err) {
+    send(ws, { ...base, error: fileEditErrorText(err) });
+  }
+}
+
+async function handleFileEditSave(ws: WebSocket, msg: FileEditSaveMessage): Promise<void> {
+  if (!fileEditAllowed(ws)) return;
+  const base = { type: "fileEditSaved" as const, path: String(msg.path ?? ""), ...(msg.requestId ? { requestId: msg.requestId } : {}) };
+  const req = fileEditRequestFor(msg.requestId);
+  if (!req.ok) {
+    send(ws, { ...base, error: req.error });
+    return;
+  }
+  try {
+    if (req.path) {
+      // 依頼のパス以外へは書かせない（カードから開いた画面で別ファイルへ保存させない）。
+      const target = await fileEditor.resolve(msg.path);
+      if (target.realPath !== req.path) {
+        send(ws, { ...base, error: "依頼と違うファイルには保存できません" });
+        return;
+      }
+    }
+    const saved = await fileEditor.save({
+      path: msg.path,
+      content: msg.content,
+      baseHash: typeof msg.baseHash === "string" ? msg.baseHash : null,
+      createDirs: msg.createDirs === true,
+      backup: msg.backup === true,
+      actor: msg.requestId ? `boss-ui:request:${msg.requestId}` : "boss-ui",
+      requestedBy: msg.requestId ? (fileEditRequests.get(msg.requestId)?.from ?? null) : null,
+    });
+    send(ws, { ...base, saved });
+    if (msg.requestId) fileEditRequests.markSaved(msg.requestId, saved);
+  } catch (err) {
+    send(ws, {
+      ...base,
+      error: fileEditErrorText(err),
+      ...(err instanceof FileEditConflictError ? { conflict: true } : {}),
+    });
+  }
+}
+
+/** ファイル編集の失敗を UI 向けの 1 行にする（想定外の例外は errno 程度に留める）。 */
+function fileEditErrorText(err: unknown): string {
+  if (err instanceof FileEditError) return err.message;
+  const e = err as NodeJS.ErrnoException;
+  if (e?.code === "EACCES" || e?.code === "EPERM") return `権限がありません（${e.code}）`;
+  return `失敗しました: ${e?.code ?? (e?.message || "不明なエラー")}`;
 }
 
 /**
@@ -1144,6 +1385,24 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
       ? spawnConfig.command
       : (backendSettings.backends[backendId]?.command ?? backend.defaultCommand);
 
+  // 推論努力度（--effort）の解決: 明示 effort > 役割の effort > config の effortByModel >
+  // CLI 既定。`--effort` は claude 方言のフラグなので、実際に claude を起動するときだけ付ける
+  // （codex/gemini は reasoning effort の語彙が別。EBI_COMMAND=bash 等のスタブ起動にも付けない）。
+  // 明示値の検証は backend に関わらず行う（不正値を黙って捨てない）。
+  const baseExtraArgs = extraArgsForBackend(backendId);
+  const resolvedEffort = resolveEffort({
+    explicit: params.effort,
+    role: role?.effort ?? null,
+    model,
+    table: effortByModel,
+    existingArgs: baseExtraArgs,
+  });
+  const isClaudeLaunch =
+    backendId === DEFAULT_BACKEND_ID && resolveBackend(command)?.id === DEFAULT_BACKEND_ID;
+  const extraArgs = isClaudeLaunch
+    ? [...baseExtraArgs, ...effortArgs(resolvedEffort)]
+    : baseExtraArgs;
+
   // 役割付きなら ebi-control MCP（最小権限・reply_to_master 等）を追加する。
   // 「どのフラグをどう付けるか」はバックエンド実装（backends/claude.ts の buildArgs）に閉じており、
   // ここでは抽象パラメータ（mcpConfigPath / notifyMode）を渡すだけにする。
@@ -1166,6 +1425,8 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   //   どのエビの cost/context かを識別できるようにする（ダッシュボード）。
   // command 種別に関わらず注入してよい（bash テストでも env 継承の確認ができる）。
   const launchEnv = { EBI_ID: agentId };
+  const effortNote = isClaudeLaunch ? describeEffort(resolvedEffort) : null;
+  if (effortNote) console.log(`[ebi-team] [${agentId}] ${effortNote}`);
 
   // バックエンド固有の起動引数を組み立てる（claude なら
   // --model / --permission-mode / --append-system-prompt / --mcp-config / dev-channels）。
@@ -1181,7 +1442,7 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     // フォルダ信頼ゲートを出させないために宣言するディレクトリ（codex のみ使用）。
     trustPaths,
     notifyMode: isNotifyMode(),
-    extraArgs: extraArgsForBackend(backendId),
+    extraArgs,
   });
 
   // 起動前チェック（認証ファイル / 必須 env / CLI バージョン）。
@@ -1460,6 +1721,11 @@ export interface SendMessageParams {
   role?: string;
   /** spawnIfMissing で起動する際のバックエンド（未指定は役割の既定→サーバ既定）。 */
   backend?: string;
+  /**
+   * spawnIfMissing で起動する際の推論努力度（low/medium/high）。
+   * 未指定なら役割の effort → config の effortByModel → CLI 既定。
+   */
+  effort?: string;
   /** 【後方互換】spawnIfMissing で起動する際 engineer 役割にするか（既定 true 相当）。role が優先。 */
   asEngineer?: boolean;
 }
@@ -1531,6 +1797,7 @@ async function sendMessage(params: SendMessageParams): Promise<SendMessageResult
       kind: "dynamic",
       role: roleId,
       backend: params.backend,
+      effort: params.effort,
     });
     spawned = true;
     agent = registry.get(to);
@@ -1657,10 +1924,15 @@ async function handleSummarize(ws: WebSocket, id: string): Promise<void> {
  * 固定エビ config を読み、自動起動する。
  * config が無ければ何もしない。読み込み/検証失敗時は警告のみで起動は継続する
  * （動的エビ運用は config 無しでも成立するため、サーバごと落とさない）。
+ * 1 体ぶんの定義不備はその 1 体だけ外して警告し、ほかの固定エビは起動する。
  */
 async function startFixedEbi(): Promise<void> {
   try {
-    const raw = await loadFixedEbi(CONFIG_PATH, { command: COMMAND, backend: BACKEND_ID });
+    // 1 体ぶんの不備（cwd 不在・指示文ファイルが読めない等）はその 1 体だけ外し、ほかは起こす。
+    const { specs: raw, skipped } = await loadFixedEbiReport(CONFIG_PATH, { command: COMMAND, backend: BACKEND_ID });
+    for (const s of skipped) {
+      console.warn(`[ebi-team] 固定エビ ${s.id} を起動対象から外しました: ${s.reason}`);
+    }
     // master には役割別 MCP config を spawn 直前に自動付与する（config への手書きを不要にし、
     // dev / 本番のファイル名差分をサーバ側で吸収する）。args に明示があればそちらを優先。
     // master は backend=claude に固定する（config/env で他 backend を既定にしても統括系は落とさない）。
@@ -1769,6 +2041,26 @@ async function loadAndApplyBackendSettings(): Promise<void> {
 }
 
 /**
+ * ebi-team.config.json の top-level "effortByModel"（モデル→推論努力度の既定表）を読み、
+ * サーバ既定へ反映する。httpServer.listen()／固定エビ自動起動より前に完了させ、以降の spawn が
+ * 常に表を見るようにする。config が無い/未指定なら何もしない（＝CLI 既定 effort）。
+ * 検証失敗時は警告のみで起動を継続する。
+ */
+async function loadAndApplyEffortByModel(): Promise<void> {
+  try {
+    effortByModel = await loadEffortByModel(CONFIG_PATH);
+    if (effortByModel.length > 0) {
+      console.log(
+        `[ebi-team] effort 既定表: ` +
+          effortByModel.map((r) => `${r.pattern}=${r.effort}`).join(", "),
+      );
+    }
+  } catch (err) {
+    console.warn(`[ebi-team] effortByModel の読み込みに失敗（CLI 既定 effort で継続）:`, err);
+  }
+}
+
+/**
  * ワンショット要約エンジン（ask_supervisor / WS summarize）の backend / model を
  * config の supervisor 固定エビから引き継ぐ。
  *
@@ -1778,7 +2070,8 @@ async function loadAndApplyBackendSettings(): Promise<void> {
  */
 async function loadAndApplySupervisorEngine(): Promise<void> {
   try {
-    const specs = await loadFixedEbi(CONFIG_PATH, { command: COMMAND, backend: BACKEND_ID });
+    // 外した固定エビの警告は startFixedEbi 側で出す（ここでは二重に出さない）。
+    const { specs } = await loadFixedEbiReport(CONFIG_PATH, { command: COMMAND, backend: BACKEND_ID });
     const engine = supervisorEngineFrom(specs);
     if (!engine || engine.backend === DEFAULT_BACKEND_ID) return;
     supervisor = new Supervisor({ backend: engine.backend, model: engine.model });
@@ -1790,12 +2083,16 @@ async function loadAndApplySupervisorEngine(): Promise<void> {
 // spawn 要求（WS / 制御API いずれも）を受け付ける前にカスタム役割・許可リスト・
 // バックエンド既定を確定させる。
 await loadAndApplyBackendSettings();
+await loadAndApplyEffortByModel();
 await loadAndRegisterCustomRoles();
 await loadAndApplyDevChannelsAllowlist();
 await loadAndApplySupervisorEngine();
 
 // 前回終了時に開いていた viewer を復元する（fail-soft: 個別エントリの失敗は warn して掃除）。
 const viewerRestore = await viewerRegistry.restore();
+// 未解決の TODO を復元する（壊れていれば退避して空で始める）。
+const todoRestore = await todoBoard.restore();
+if (todoRestore.restored > 0) console.log(`[ebi-team] TODO 復元: ${todoRestore.restored} 件（次の番号 #${todoBoard.nextNo}）`);
 
 // ===== 起動 / 終了処理 =====
 httpServer.listen(PORT, HOST, () => {
@@ -1835,6 +2132,14 @@ httpServer.listen(PORT, HOST, () => {
   // 監督機能の状態のみ表示。キー値は出さない。
   console.log(`[ebi-team] ${supervisor.describeStartup()}`);
   console.log(`[ebi-team] dev フロント: http://localhost:5173 （Vite）`);
+  // pty master fd（/dev/ptmx）の保持本数を起動時＋5 分ごとにログする保険。
+  // 枯渇すると spawn が "posix_spawnp failed." で失敗し続けるため、閾値超えは UI notice にも出す。
+  startPtmxWatch({
+    liveCount: () => registry.list().length,
+    onAlert: (level, message) => {
+      broadcast({ type: "notice", id: "ptmx-watch", text: `[${level}] ${message}` });
+    },
+  });
   // 固定エビの自動起動（非同期・失敗してもサーバは継続）。
   void startFixedEbi();
 });

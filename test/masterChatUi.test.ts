@@ -7,8 +7,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  BOTTOM_SLACK_PX,
   ChatTranscript,
   collectImages,
+  isAtBottom,
   firstUnsettledPending,
   lightboxCounter,
   LightboxState,
@@ -773,4 +775,16 @@ test("cleared: snapshot（再接続）から復元しても区切り以降だけ
   assert.equal(t.items.length, 2);
   assert.equal(t.items[0]!.kind === "notice" && t.items[0]!.text, CLEARED_TEXT);
   assert.equal(t.items[1]!.kind === "assistant" && t.items[1]!.text, "新しい会話");
+});
+
+test("isAtBottom: 遊びは 2px だけ（少しでも上げたら追従を切る）", () => {
+  assert.equal(BOTTOM_SLACK_PX, 2);
+  // scrollHeight 1000 / clientHeight 400 → 一番下は scrollTop 600。
+  assert.equal(isAtBottom(600, 400, 1000), true);
+  assert.equal(isAtBottom(599, 400, 1000), true); // 1px 上
+  assert.equal(isAtBottom(598, 400, 1000), true); // 2px 上
+  assert.equal(isAtBottom(597, 400, 1000), false); // 3px 上
+  assert.equal(isAtBottom(595, 400, 1000), false); // 5px 上
+  assert.equal(isAtBottom(599.4, 400, 1000), true); // 小数の scrollTop
+  assert.equal(isAtBottom(0, 400, 300), true); // 中身が画面より短い
 });

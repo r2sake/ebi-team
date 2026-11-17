@@ -204,6 +204,55 @@ gen_seconds: 233
   assert.equal(res.genSeconds, 233);
 });
 
+test("報告: gen_count・contact・alpha_path を読む（無ければ null）／形が違えば弾く", () => {
+  const res = parseImagegenResult(`imagegen_result: v1
+job_id: a
+summary: 1/1 ok
+results:
+  - id: ring-1
+    status: ok
+    path: /x/tmp/images/a/ring-1_magenta.png
+    alpha_path: /x/tmp/images/a/ring-1_alpha.png
+    pixels: 1254x1254
+gen_count: 2
+contact: /x/tmp/images/a/contact.png
+`);
+  assert.equal(res.genCount, 2);
+  assert.equal(res.contact, "/x/tmp/images/a/contact.png");
+  assert.equal(res.results[0]!.alphaPath, "/x/tmp/images/a/ring-1_alpha.png");
+
+  const bare = parseImagegenResult(`imagegen_result: v1
+job_id: a
+summary: s
+results:
+  - id: a
+    status: ok
+    path: /x/a.png
+    pixels: 10x10
+`);
+  assert.equal(bare.genCount, null);
+  assert.equal(bare.contact, null);
+  assert.equal(bare.results[0]!.alphaPath, null);
+
+  const issues = issuesOf(() =>
+    parseImagegenResult(`imagegen_result: v1
+job_id: a
+summary: s
+results:
+  - id: a
+    status: ok
+    path: /x/a.png
+    alpha_path: a_alpha.png
+    pixels: 10x10
+gen_count: -1
+contact: contact.png
+`),
+  );
+  assert.ok(issues.some((m) => m.includes("gen_count")));
+  assert.ok(issues.some((m) => m.includes("contact")));
+  assert.ok(issues.some((m) => m.includes("alpha_path")));
+});
+
 test("報告: status ok は絶対パスと実測 pixels が必須／未知の status・error_code は弾く", () => {
   const issues = issuesOf(() =>
     parseImagegenResult(`imagegen_result: v1

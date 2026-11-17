@@ -2,7 +2,7 @@
 <html lang="ja">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
     <title>ebi-team 🦐 — エビチーム</title>
     <link rel="stylesheet" href="./style.css" />
   </head>
@@ -11,6 +11,8 @@
       <!-- 狭幅時のみ表示するサイドバー（registry ドロワー）開閉ボタン。 -->
       <button id="sidebar-toggle" class="sidebar-toggle" title="registry を開閉" aria-label="registry を開閉">☰</button>
       <h1>🦐 ebi-team <span class="sub">エビチーム</span></h1>
+      <!-- ボスの TODO（ボスがやらなければならないこと）。押すと一覧のパネルが開く。中身は todoPanel.ts。 -->
+      <button id="todo-btn" class="todo-btn" aria-haspopup="dialog" aria-expanded="false">📋 TODO 0</button>
       <div class="controls">
         <input id="spawn-cwd" type="text" placeholder="cwd（空ならデフォルト）" />
         <label class="wt-toggle" title="git worktree を切って隔離 cwd で起動">
@@ -76,6 +78,12 @@
     <!-- ファイルピッカー（ユーザーが自分で md/txt を開くための簡易ブラウザ。既定は非表示）。
          中身は filePicker.ts が動的に構築する。 -->
     <div id="file-picker" hidden></div>
+
+    <!-- ファイル編集ダイアログ（env などを書き換える。中身は fileEditor.ts が構築する）。 -->
+    <div id="file-editor" hidden></div>
+
+    <!-- ボスの TODO パネル（トップバーの 📋 から開く。中身は todoPanel.ts が構築する）。 -->
+    <div id="todo-panel" role="dialog" aria-label="ボスの TODO" hidden></div>
 
     <!-- スマホ用入力補助バー（狭幅時のみ表示）。スマホに無いキーを選択中ペインへ送る。 -->
     <div id="key-assist" class="key-assist" hidden>

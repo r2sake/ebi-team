@@ -71,6 +71,22 @@ export type ChatItem =
       answer: string | null;
     }
   | { kind: "notice"; seq: number; ts: number; level: "info" | "warn" | "error"; text: string }
+  /**
+   * master の request_file_edit による入力依頼のカード。値は持たない（鍵名・パス・メモだけ）。
+   * settled は `fileEditSettled` で埋まる（null の間は「入力する / 見送る」を出す）。
+   */
+  | {
+      kind: "fileEdit";
+      seq: number;
+      ts: number;
+      requestId: string;
+      path: string;
+      keys: string[];
+      note: string | null;
+      from: string;
+      settled: "saved" | "cancelled" | "discarded" | null;
+      summary: string | null;
+    }
   | {
       kind: "turnEnd";
       seq: number;
@@ -262,6 +278,30 @@ export class ChatTranscript {
       case "notice":
         this.closeStream();
         return this.push({ kind: "notice", seq, ts, level: ev.level, text: ev.text });
+      case "fileEditRequest":
+        this.closeStream();
+        return this.push({
+          kind: "fileEdit",
+          seq,
+          ts,
+          requestId: ev.id,
+          path: ev.path,
+          keys: [...ev.keys],
+          note: ev.note,
+          from: ev.from,
+          settled: null,
+          summary: null,
+        });
+      case "fileEditSettled": {
+        for (let i = this.items.length - 1; i >= 0; i -= 1) {
+          const item = this.items[i]!;
+          if (item.kind !== "fileEdit" || item.requestId !== ev.id || item.settled != null) continue;
+          item.settled = ev.outcome;
+          item.summary = ev.summary;
+          return { touched: [i], appendedFrom: -1 };
+        }
+        return NO_CHANGE;
+      }
       case "cleared": {
         // 「新しい会話」の区切り。これより前の表示は捨てる（JSONL には残っている）。
         this.closeStream();
@@ -456,6 +496,21 @@ export function settledLabel(
       return "⛔ 拒否しました";
     case "discarded":
       return "🗑 破棄されました（頭脳プロセスが入れ替わったため応答できません）";
+  }
+}
+
+/** ファイル編集依頼の決着の表示（summary は値を含まない 1 行）。 */
+export function fileEditSettledLabel(
+  outcome: "saved" | "cancelled" | "discarded",
+  summary: string | null,
+): string {
+  switch (outcome) {
+    case "saved":
+      return `✅ ${summary ?? "保存しました"}`;
+    case "cancelled":
+      return "⏭ 見送りました";
+    case "discarded":
+      return `🗑 ${summary ?? "依頼は無効になりました"}`;
   }
 }
 
@@ -895,3 +950,49 @@ export function headerMetrics(stats: ChatStats, rl: HeaderRateLimits): HeaderMet
   ];
 }
 
+
+/**
+ * 入力欄で押されたキーが「送信」か「何もしない（既定動作に任せる）」かを決める。
+ * - IME の変換中・変換確定の Enter（isComposing / keyCode 229 / composition 中）は送信しない（PC・スマホ共通）。
+ * - タッチ端末（touch=true）では Enter は改行。送信は送信ボタンだけ
+ *   （スマホのソフトキーボードは Enter＝確定/改行で、Shift+Enter が打てないため）。
+ * - それ以外（PC）は Enter で送信 / Shift+Enter で改行。
+ */
+export function enterAction(k: {
+  key: string;
+  shiftKey: boolean;
+  isComposing: boolean;
+  keyCode: number;
+  composing: boolean;
+  touch: boolean;
+}): "send" | "default" {
+  if (k.key !== "Enter") return "default";
+  if (k.isComposing || k.keyCode === 229 || k.composing) return "default";
+  if (k.touch || k.shiftKey) return "default";
+  return "send";
+}
+
+/** 入力欄の案内文。タッチ端末では Enter が改行なので送信の説明を出さない（短くして 1 行に収める）。 */
+export function inputPlaceholder(state: string, touch: boolean): string {
+  if (!sendEnabled(state)) return "master（chat）が起動していません…";
+  if (touch) return state === "busy" ? "実行中でも送れます" : "master に話しかける";
+  return state === "busy"
+    ? "実行中でも送れます（Enter で送信 / 中断は ⏹）"
+    : "master に話しかける（Enter で送信 / Shift+Enter で改行）";
+}
+
+/**
+ * 「最下部にいる」とみなす遊び（px）。0 にしないのは、拡大率や HiDPI で scrollTop が小数になり、
+ * 一番下にいても 0.5〜1px ずれることがあるため。少しでも上へ動かしたら追従を切る（ボス要件）。
+ */
+export const BOTTOM_SLACK_PX = 2;
+
+/** スクロール位置が最下部か（中身が画面より短いときも true）。 */
+export function isAtBottom(
+  scrollTop: number,
+  clientHeight: number,
+  scrollHeight: number,
+  slack: number = BOTTOM_SLACK_PX,
+): boolean {
+  return scrollTop + clientHeight >= scrollHeight - slack;
+}

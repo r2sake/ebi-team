@@ -18,6 +18,7 @@ import {
   type ChatImage,
   type ViewerRecord,
 } from "../shared/protocol.ts";
+import { TodoError, type TodoBoard } from "./todos.ts";
 import {
   ALLOWED_ATTACH_TYPES,
   maxBytesFor,
@@ -47,6 +48,12 @@ export interface GeneralizedSpawnParams {
    * 実装済みでない backend id は明示エラーで弾く（黙って claude に落とさない）。
    */
   backend?: string;
+  /**
+   * 推論努力度（claude の `--effort`。low/medium/high。未検証文字列で受け、spawnAgent 側で検証）。
+   * 未指定なら「役割の effort → config の effortByModel → CLI 既定」。
+   * claude 以外の backend では無視される（`--effort` は claude 方言のフラグ）。
+   */
+  effort?: string;
   /** エビ種別（既定 dynamic）。 */
   kind?: AgentKind;
   /**
@@ -95,6 +102,8 @@ export interface SendMessageInput {
   role?: string;
   /** spawnIfMissing で起動する際のバックエンド（未指定は役割の既定→サーバ既定）。 */
   backend?: string;
+  /** spawnIfMissing で起動する際の推論努力度（未指定は役割 → effortByModel → CLI 既定）。 */
+  effort?: string;
   /** 【後方互換】spawnIfMissing で起動する際 engineer 役割にするか。role が優先。 */
   asEngineer?: boolean;
 }
@@ -205,7 +214,7 @@ export interface ControlDeps {
     path: string,
     title?: string,
     caption?: string,
-  ) => Promise<ChatImage | null>;
+  ) => Promise<(ChatImage & { seq?: number }) | null>;
   /**
    * 承認 / 質問の受け口（`POST /control/chat-permission` の実体・PR-M5）。
    *
@@ -226,6 +235,27 @@ export interface ControlDeps {
    * サーバ再起動 / 「新しい会話」を使わずに直すための逃げ道。畳んだ件数を返す。
    */
   resyncChatPending: (() => number) | null;
+  /**
+   * ファイル編集の入力依頼（`POST /control/file-edit-request` の実体）。
+   *
+   * master の request_file_edit から呼ばれ、チャットに入力カードを出して**すぐ返る**
+   *（ボスの入力は待たない。保存/見送りの結果は後から master へ通知される）。
+   * 本文や値を受け取る口ではない（受けるのはパス・鍵名・メモだけ）。
+   * パスが許可ルート外・鍵名が不正なら throw（400）。chat master が居ない構成では null（404）。
+   */
+  requestFileEdit:
+    | ((input: { path: unknown; keys?: unknown; note?: unknown; from?: unknown }) => Promise<{
+        requestId: string;
+        path: string;
+        exists: boolean;
+        keys: string[];
+      }>)
+    | null;
+  /**
+   * ボスの TODO 台帳（`/control/todos` `/control/todo` `/control/todo-add` `/control/todo-resolve` の実体）。
+   * master 専用 MCP の todo_* から呼ばれる。null なら 404。
+   */
+  todos: Pick<TodoBoard, "list" | "lookup" | "add" | "resolve"> | null;
 }
 
 /** JSON レスポンスを返すヘルパー。 */
@@ -342,6 +372,7 @@ export function createControlApi(deps: ControlDeps) {
           appendSystemPrompt: asString(body.appendSystemPrompt) ?? null,
           permissionMode: asString(body.permissionMode),
           backend: asString(body.backend),
+          effort: asString(body.effort),
           kind: (kindRaw as AgentKind | undefined) ?? "dynamic",
           role: asString(body.role),
           asEngineer: asBool(body.asEngineer),
@@ -493,6 +524,7 @@ export function createControlApi(deps: ControlDeps) {
           branch: asString(body.branch),
           role: asString(body.role),
           backend: asString(body.backend),
+          effort: asString(body.effort),
           asEngineer: asBool(body.asEngineer),
         });
         if (result.ok) {
@@ -740,6 +772,33 @@ export function createControlApi(deps: ControlDeps) {
         return true;
       }
 
+      // ---- POST /control/file-edit-request ----
+      // master 専用 MCP `request_file_edit` からのブリッジ。チャットに入力カードを出してすぐ返る。
+      // ここでは本文も値も受け取らない（書き込みはボスのブラウザからの WS `fileEditSave` だけ）。
+      if (pathname === "/control/file-edit-request" && method === "POST") {
+        if (!deps.requestFileEdit) {
+          sendJson(res, 404, { error: 'ファイル編集の依頼は ui:"chat" の master が居るときだけ使えます' });
+          return true;
+        }
+        const body = await readJsonBody(req);
+        try {
+          const r = await deps.requestFileEdit({
+            path: body.path,
+            keys: body.keys,
+            note: body.note,
+            from: body.from,
+          });
+          sendJson(res, 200, {
+            ...r,
+            status: "pending",
+            note: "ボスのチャットに入力欄を出しました。保存または見送りの結果は後から通知します（値は届きません）",
+          });
+        } catch (err) {
+          sendJson(res, 400, { error: (err as Error).message });
+        }
+        return true;
+      }
+
       // ---- POST /control/chat-attach ----
       // チャット入力欄へのペースト/ドロップで来た画像（と、長すぎる貼り付けのテキスト）を
       // サーバ側の保管庫へ保存する。Content-Type が MIME、ボディが生バイト列。
@@ -787,6 +846,81 @@ export function createControlApi(deps: ControlDeps) {
         });
         res.end(file.bytes);
         return true;
+      }
+
+      // ---- ボスの TODO（master 専用 MCP todo_* のブリッジ）----
+      // 追加・解決は master の MCP から。ボスの UI からの回答は WS todoAnswer（index.ts）。
+      if (pathname.startsWith("/control/todo")) {
+        const todos = deps.todos;
+        if (!todos) {
+          sendJson(res, 404, { error: "TODO 台帳は無効です" });
+          return true;
+        }
+        // ---- GET /control/todos: 未解決の一覧（詳細は含めない＝トークン節約）----
+        if (pathname === "/control/todos" && method === "GET") {
+          const items = todos.list().map(({ no, kind, title, ebi, project, createdAt }) => ({
+            no,
+            kind,
+            title,
+            ebi,
+            project,
+            createdAt,
+          }));
+          sendJson(res, 200, { count: items.length, items });
+          return true;
+        }
+        // ---- GET /control/todo?no=N: 1 件の全部 ----
+        if (pathname === "/control/todo" && method === "GET") {
+          const no = Number(query.get("no"));
+          if (!Number.isInteger(no) || no < 1) {
+            sendJson(res, 400, { error: "no（1 以上の整数）は必須です" });
+            return true;
+          }
+          const r = todos.lookup(no);
+          if (r.found) sendJson(res, 200, { item: r.item });
+          else
+            sendJson(res, 404, {
+              error:
+                r.status === "resolved"
+                  ? `TODO #${no} は解決済みです（台帳から消えています）`
+                  : `TODO #${no} はまだ発行されていない番号です`,
+              status: r.status,
+            });
+          return true;
+        }
+        // ---- POST /control/todo-add ----
+        if (pathname === "/control/todo-add" && method === "POST") {
+          const body = await readJsonBody(req);
+          try {
+            const item = await todos.add(body, { chatSeq: body.chat_seq });
+            sendJson(res, 200, { no: item.no, item });
+          } catch (err) {
+            sendJson(res, err instanceof TodoError ? 400 : 500, { error: (err as Error).message });
+          }
+          return true;
+        }
+        // ---- POST /control/todo-resolve {no} ----
+        if (pathname === "/control/todo-resolve" && method === "POST") {
+          const body = await readJsonBody(req);
+          const no = body.no;
+          if (typeof no !== "number" || !Number.isInteger(no) || no < 1) {
+            sendJson(res, 400, { error: "no（1 以上の整数）は必須です" });
+            return true;
+          }
+          const item = await todos.resolve(no);
+          if (!item) {
+            const r = todos.lookup(no);
+            sendJson(res, 404, {
+              error:
+                !r.found && r.status === "resolved"
+                  ? `TODO #${no} はもう解決済みです`
+                  : `TODO #${no} はありません`,
+            });
+            return true;
+          }
+          sendJson(res, 200, { ok: true, no: item.no, title: item.title });
+          return true;
+        }
       }
 
       // 該当なし。

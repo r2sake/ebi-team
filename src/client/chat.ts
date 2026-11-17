@@ -8,12 +8,16 @@ import type {
 import {
   ChatTranscript,
   collectImages,
+  enterAction,
+  fileEditSettledLabel,
+  isAtBottom,
   firstUnsettledPending,
   formatBytes,
   formatContextPct,
   formatCost,
   headerMetrics,
   InputHistory,
+  inputPlaceholder,
   LARGE_PASTE_CHARS,
   MAX_CHAT_ITEMS,
   NO_RATE_LIMITS,
@@ -32,6 +36,27 @@ import {
   type HeaderRateLimits,
 } from "./chatModel.ts";
 import { renderMarkdownInto } from "./viewer.ts";
+import type { FileEditRequestInfo } from "./fileEditor.ts";
+
+/**
+ * タッチ端末（スマホ・タブレット）か。主たるポインタが指（pointer: coarse）なら真。
+ * PC（マウス・トラックパッド。タッチ対応ノート PC も主ポインタは fine）は偽。
+ */
+function isTouchDevice(): boolean {
+  return window.matchMedia?.("(pointer: coarse)").matches ?? false;
+}
+
+/** ファイル編集の導線（main.ts が FileEditorDialog と WS へ配線する）。 */
+export interface FileEditHooks {
+  /** 自由編集（パス入力から）。 */
+  open(): void;
+  /** master の依頼カードから開く。 */
+  openRequest(req: FileEditRequestInfo): void;
+  /** 依頼を見送る。 */
+  cancelRequest(requestId: string): void;
+}
+
+const NO_FILE_EDIT_HOOKS: FileEditHooks = { open: () => {}, openRequest: () => {}, cancelRequest: () => {} };
 
 /**
  * master チャットパネル（ui:"chat" の master をメイン領域に出す 1 枚）。
@@ -83,6 +108,8 @@ export class ChatPanel {
   /** items と 1:1 で並ぶ描画済み要素（増分更新のため index で引く）。 */
   private readonly rendered: HTMLElement[] = [];
   private state: MasterChatState = "stopped";
+  /** IME で変換中か（compositionstart〜compositionend）。 */
+  private composing = false;
   private pending = 0;
   private visible = false;
   /** 最下部に張り付いているか（false のとき新着で勝手にスクロールしない）。 */
@@ -103,6 +130,8 @@ export class ChatPanel {
   private lightboxUi: LightboxUi | null = null;
   /** ライトボックスを開く直前にフォーカスしていた要素（閉じたら戻す）。 */
   private lightboxOpener: HTMLElement | null = null;
+  /** ファイル編集の導線（setFileEditHooks で差し込む）。 */
+  private fileEdit: FileEditHooks = NO_FILE_EDIT_HOOKS;
 
   constructor(
     private readonly el: HTMLElement,
@@ -141,7 +170,13 @@ export class ChatPanel {
       this.updateStats();
       this.onNew(this.masterId);
     });
-    this.head.append(title, this.stateBadge, this.statsEl, this.newBtn);
+    const editBtn = document.createElement("button");
+    editBtn.className = "chat-new chat-edit-file";
+    editBtn.textContent = "📝";
+    editBtn.title = "ファイルを編集（env など。許可ルート配下のみ）";
+    editBtn.setAttribute("aria-label", "ファイルを編集");
+    editBtn.addEventListener("click", () => this.fileEdit.open());
+    this.head.append(title, this.stateBadge, this.statsEl, editBtn, this.newBtn);
 
     // ---- ログ ----
     this.logEl = div("chat-log");
@@ -162,8 +197,11 @@ export class ChatPanel {
     this.input = document.createElement("textarea");
     this.input.className = "chat-input";
     this.input.rows = 1;
-    this.input.placeholder = "master に話しかける（Enter で送信 / Shift+Enter で改行）";
+    this.input.placeholder = inputPlaceholder(this.state, isTouchDevice());
     this.input.addEventListener("keydown", (e) => this.onKeyDown(e));
+    // IME の変換中フラグ（keydown の isComposing が付かないブラウザ向けの保険）。
+    this.input.addEventListener("compositionstart", () => (this.composing = true));
+    this.input.addEventListener("compositionend", () => (this.composing = false));
     this.input.addEventListener("input", () => this.autoGrow());
     this.input.addEventListener("paste", (e) => this.onPaste(e));
     // ドロップは入力欄だけでなくパネル全体で受ける（ログ側に落としても添付できる）。
@@ -204,6 +242,11 @@ export class ChatPanel {
     this.syncControls();
   }
 
+  /** ファイル編集の導線を差し込む（ヘッダの 📝 と、依頼カードのボタン）。 */
+  setFileEditHooks(hooks: FileEditHooks): void {
+    this.fileEdit = hooks;
+  }
+
   /** chat モードの master が居るか（居なければ main.ts は従来の PTY ペインを出す）。 */
   get chatMasterId(): string | null {
     return this.masterId;
@@ -211,10 +254,12 @@ export class ChatPanel {
 
   /** 表示/非表示（master-detail の 1 枚として）。 */
   setVisible(visible: boolean): void {
+    const wasVisible = this.visible;
     this.visible = visible;
     this.el.hidden = !visible;
-    // 表示に切り替えた瞬間は最下部へ寄せる（隠れている間の新着を見せる）。
-    if (visible) this.scrollToBottom(true);
+    // 隠れていた → 表示に切り替えた瞬間だけ最下部へ寄せる（隠れている間の新着を見せる）。
+    // 表示中に呼ばれ直す（registry 受信のたびの applyVisibility）ときは、読んでいる位置を動かさない。
+    if (visible && !wasVisible) this.scrollToBottom(true);
   }
 
   /** WS `chatState`。chat モードの master が居ることの判定材料も兼ねる。 */
@@ -268,14 +313,15 @@ export class ChatPanel {
 
   /** 入力欄へフォーカス（広幅のみ。狭幅は勝手にソフトキーボードを出さない）。 */
   focusInput(): void {
-    if (window.matchMedia?.("(pointer: coarse)").matches) return;
+    if (isTouchDevice()) return;
     this.input.focus();
   }
 
   // ===== 内部 =====
 
   private onKeyDown(e: KeyboardEvent): void {
-    if (e.isComposing) return; // IME 変換中のキーはすべて変換操作（履歴も送信も動かさない）。
+    // IME 変換中のキーはすべて変換操作（履歴も送信も動かさない）。確定の Enter も keyCode 229 で来る。
+    if (e.isComposing || e.keyCode === 229 || this.composing) return;
     // ↑/↓ の入力履歴。複数行を編集しているときの行移動を邪魔しないよう、
     // ↑ は「キャレットが先頭」、↓ は「キャレットが末尾」のときだけ履歴として振る舞う。
     if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.shiftKey && !e.altKey && !e.metaKey) {
@@ -301,8 +347,16 @@ export class ChatPanel {
       }
       return;
     }
-    // Enter 送信 / Shift+Enter 改行。
-    if (e.key !== "Enter" || e.shiftKey) return;
+    // PC は Enter 送信 / Shift+Enter 改行。タッチ端末は Enter 改行（送信はボタンだけ）。
+    const action = enterAction({
+      key: e.key,
+      shiftKey: e.shiftKey,
+      isComposing: e.isComposing,
+      keyCode: e.keyCode,
+      composing: this.composing,
+      touch: isTouchDevice(),
+    });
+    if (action !== "send") return;
     e.preventDefault();
     this.onSendClick();
   }
@@ -467,11 +521,7 @@ export class ChatPanel {
     this.sendBtn.disabled = blocked;
     this.stopBtn.disabled = !stopEnabled(this.state);
     this.input.disabled = blocked;
-    this.input.placeholder = blocked
-      ? "master（chat）が起動していません…"
-      : this.state === "busy"
-        ? "実行中でも送れます（Enter で送信 / 中断は ⏹）"
-        : "master に話しかける（Enter で送信 / Shift+Enter で改行）";
+    this.input.placeholder = inputPlaceholder(this.state, isTouchDevice());
     this.newBtn.disabled = this.state === "starting";
     if (this.pending > 0) {
       this.pendingBar.hidden = false;
@@ -529,23 +579,37 @@ export class ChatPanel {
    * 表示中のトランスクリプトに無い（＝ログにしか残っていない）ときは何もしない。
    */
   private jumpToSeq(seq: number): void {
-    const index = this.transcript.items.findIndex((it) => it.seq === seq);
-    const el = index >= 0 ? this.rendered[index] : null;
-    if (!el) return;
-    el.scrollIntoView({ block: "center" });
-    el.classList.add("flash");
-    window.setTimeout(() => el.classList.remove("flash"), 1200);
+    this.revealSeq(seq, 1200);
   }
 
-  /** 返信ボタン / 引用チップから引ける「その seq が今の画面に居るか」。 */
-  private hasSeq(seq: number): boolean {
+  /**
+   * seq の発言を画面の中央へ出して強調する（TODO の「💬 チャットで見る」から・main.ts）。
+   * 表示に切り替えた直後は setVisible() が一番下への追従を予約しているので、それを取り消してから
+   * 飛ぶ（そのままだと飛んだ直後に一番下へ戻される）。画面に無ければ false。
+   */
+  revealSeq(seq: number, flashMs = 2500): boolean {
+    const index = this.transcript.items.findIndex((it) => it.seq === seq);
+    const el = index >= 0 ? this.rendered[index] : null;
+    if (!el) return false;
+    if (this.scrollRaf !== 0) {
+      cancelFrame(this.scrollRaf);
+      this.scrollRaf = 0;
+    }
+    this.stuckToBottom = false;
+    el.scrollIntoView({ block: "center" });
+    el.classList.add("flash");
+    window.setTimeout(() => el.classList.remove("flash"), flashMs);
+    return true;
+  }
+
+  /** 返信ボタン / 引用チップ / TODO から引ける「その seq が今の画面に居るか」。 */
+  hasSeq(seq: number): boolean {
     return this.transcript.items.some((it) => it.seq === seq);
   }
 
   private onScroll(): void {
-    // 「最下部にいる」判定は 32px の遊びを持たせる（§5.3）。
-    const atBottom =
-      this.logEl.scrollTop + this.logEl.clientHeight >= this.logEl.scrollHeight - 32;
+    // 「最下部にいる」判定の遊びは 2px だけ（少しでも上へ動かしたら追従を切る・BOTTOM_SLACK_PX）。
+    const atBottom = isAtBottom(this.logEl.scrollTop, this.logEl.clientHeight, this.logEl.scrollHeight);
     this.stuckToBottom = atBottom;
     if (atBottom) {
       this.unseen = 0;
@@ -787,6 +851,7 @@ export class ChatPanel {
         onJump: (seq) => this.jumpToSeq(seq),
         hasSeq: (seq) => this.hasSeq(seq),
       },
+      this.fileEdit,
     );
     const prev = this.rendered[index];
     if (prev) {
@@ -837,6 +902,7 @@ function buildItem(
   onAnswer: (requestId: string, answer: { allow?: boolean; choice?: string[]; text?: string }) => void,
   onOpenImage: OpenImage = () => {},
   reply: ReplyHooks = NO_REPLY_HOOKS,
+  fileEdit: FileEditHooks = NO_FILE_EDIT_HOOKS,
 ): HTMLElement {
   switch (item.kind) {
     case "user": {
@@ -946,6 +1012,53 @@ function buildItem(
         bubble.appendChild(permissionActions(item.requestId, onAnswer));
       } else {
         bubble.appendChild(questionForm(item, onAnswer));
+      }
+      row.appendChild(bubble);
+      return row;
+    }
+    case "fileEdit": {
+      // master の request_file_edit による入力依頼。値はここには無い（入力はダイアログで行う）。
+      const row = bubbleRow("assistant");
+      const bubble = div(`chat-bubble pending file-edit${item.settled ? ` settled-${item.settled}` : ""}`);
+      bubble.append(meta(`📝 入力の依頼（${item.from}）`, item.ts));
+      const t = div("chat-pending-title");
+      t.textContent = item.keys.length > 0 ? `鍵を入れてください: ${item.keys.join(", ")}` : "ファイルを編集してください";
+      const p = div("chat-pending-detail chat-file-path");
+      p.textContent = item.path;
+      bubble.append(t, p);
+      if (item.note) {
+        const n = div("chat-pending-detail");
+        n.textContent = item.note;
+        bubble.appendChild(n);
+      }
+      if (item.settled) {
+        const done = div("chat-pending-settled");
+        done.textContent = fileEditSettledLabel(item.settled, item.summary);
+        bubble.appendChild(done);
+      } else {
+        const actions = div("chat-pending-actions");
+        const openBtn = document.createElement("button");
+        openBtn.className = "chat-pending-btn allow";
+        openBtn.textContent = "✏️ 入力する";
+        openBtn.addEventListener("click", () =>
+          fileEdit.openRequest({
+            requestId: item.requestId,
+            path: item.path,
+            keys: [...item.keys],
+            note: item.note,
+            from: item.from,
+          }),
+        );
+        const skipBtn = document.createElement("button");
+        skipBtn.className = "chat-pending-btn deny";
+        skipBtn.textContent = "見送る";
+        skipBtn.addEventListener("click", () => {
+          if (!window.confirm("この依頼を見送ります（master には「見送った」と伝わります）。よろしいですか？")) return;
+          for (const el of actions.querySelectorAll("button")) el.disabled = true;
+          fileEdit.cancelRequest(item.requestId);
+        });
+        actions.append(openBtn, skipBtn);
+        bubble.appendChild(actions);
       }
       row.appendChild(bubble);
       return row;
@@ -1247,4 +1360,10 @@ function safeLocalStorage(): Storage | null {
 function requestFrame(fn: () => void): number {
   if (typeof window.requestAnimationFrame === "function") return window.requestAnimationFrame(fn);
   return window.setTimeout(fn, 16);
+}
+
+/** requestFrame() の予約を取り消す。 */
+function cancelFrame(handle: number): void {
+  if (typeof window.cancelAnimationFrame === "function") window.cancelAnimationFrame(handle);
+  else window.clearTimeout(handle);
 }

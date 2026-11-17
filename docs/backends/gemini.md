@@ -27,7 +27,7 @@ gemini -m gemini-2.5-flash --approval-mode yolo --allowed-mcp-server-names ebi-c
 | 項目 | 値 | 理由 |
 |---|---|---|
 | モデル | `gemini-2.5-flash`（既定）／重い読解のみ `gemini-2.5-pro`／supervisor 要約は `gemini-3.5-flash`（§12） | **alias は 404**（`gemini-flash-latest` / `gemini-2.0-flash` / `gemini-3-*-preview` はいずれも Code Assist 経路で NOT_FOUND）。明示 ID 必須 |
-| モデルの解決 | `gemini-` で始まらない指定は既定モデルへ落とす | 役割既定モデル（engineer = `claude-opus-5`）がそのまま `-m` に流れると即 404。役割ごとの backend 別モデルは PR-E |
+| モデルの解決 | `gemini-` で始まらない指定は既定モデルへ落とす | 役割既定モデル（engineer = `claude-opus-5-5`）がそのまま `-m` に流れると即 404。役割ごとの backend 別モデルは PR-E |
 | 承認モード | permissionMode から写像（既定 `yolo`） | §4 参照 |
 | `--allowed-mcp-server-names` | 制御MCP を持たせるときだけ付与 | settings の `trust: true` と二重の保険 |
 | cwd | **エビの worktree ルート**（サブディレクトリ不可） | yolo でも「workspace 外ファイルの読み取り確認」ダイアログが出て注入が食われる |

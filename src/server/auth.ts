@@ -3,7 +3,8 @@
 // 設計方針（docs/plans/mobile-access-plan.md §3 準拠）:
 // - 環境変数 `EBI_AUTH_TOKEN` の共有シークレットで HTTP 入口・WS ハンドシェイク・
 //   非 loopback からの制御API を一括ゲートする。
-// - **二段判定**: loopback（127.0.0.1 / ::1）からのアクセスは常に無認証で通す。
+// - **二段判定**: loopback（127.0.0.1 / ::1）からのアクセスは無認証で通す。ただし Host が
+//   localhost / 127.0.0.1 / [::1] のときに限る（DNS リバインディング対策・isTrustedLocal）。
 //   これにより master 仲介の内部制御API 呼び（エビ間 MCP）や、母艦上のローカル利用
 //   （localhost:5173 / :8787）を認証で壊さない。
 // - **安全側デフォルト**: `EBI_AUTH_TOKEN` 未設定のときは、非 loopback からのアクセスを
@@ -33,6 +34,88 @@ export function loadAuthConfig(env: NodeJS.ProcessEnv = process.env): AuthConfig
 export function isLoopback(req: IncomingMessage): boolean {
   const addr = req.socket?.remoteAddress ?? "";
   return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
+}
+
+/** 無認証で通す loopback 接続に許す Host 名（ポートは問わない）。 */
+const LOCAL_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/**
+ * Host ヘッダが母艦ローカルの名前（localhost / 127.0.0.1 / [::1]、ポート付き可）か判定する。
+ * Host が無い・それ以外の名前（mac-mini・0.0.0.0・任意のドメイン等）は false。
+ */
+export function isLocalHostHeader(host: string | undefined): boolean {
+  if (typeof host !== "string" || host === "") return false;
+  try {
+    const u = new URL(`http://${host}`);
+    // URL が受け付けても Host にパスや userinfo が混ざっているものは弾く。
+    if (u.host.toLowerCase() !== host.toLowerCase()) return false;
+    return LOCAL_HOSTNAMES.has(u.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 無認証で通してよい「母艦ローカル」の接続か（DNS リバインディング対策）。
+ *
+ * 送信元が loopback でも、攻撃者のドメインを 127.0.0.1 に向け直されると、ブラウザは
+ * Origin と Host を攻撃者のドメインのまま loopback へ繋いでくる（Origin の判定も通ってしまう）。
+ * そこで「送信元が loopback」かつ「Host が localhost / 127.0.0.1 / [::1]」のときだけ無認証とし、
+ * それ以外の Host で来た loopback の接続は非 loopback と同じくトークン認証を求める（拒否はしない）。
+ */
+export function isTrustedLocal(req: IncomingMessage): boolean {
+  return isLoopback(req) && isLocalHostHeader(req.headers["host"]);
+}
+
+/**
+ * 同一オリジンのブラウザからの接続か（WS ハンドシェイクの Origin と Host が一致するか）。
+ *
+ * ブラウザは WS 接続に必ず Origin を付け、ページのスクリプトからは書き換えられない。
+ * - Origin が無い → ブラウザ以外（エビの素の WS クライアント等）なので false
+ * - Origin のホストが Host と違う → 別サイトのページからの接続（CSWSH）なので false
+ * ファイル編集のように「ボスの UI 操作だけに許したい」操作のゲートに使う。
+ * dev（Vite proxy）では Origin も Host も `localhost:5173` のまま届くので一致する。
+ */
+export function isSameOriginBrowser(req: Pick<IncomingMessage, "headers">): boolean {
+  const origin = req.headers["origin"];
+  const host = req.headers["host"];
+  if (typeof origin !== "string" || typeof host !== "string" || origin === "null") return false;
+  try {
+    const u = new URL(origin);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+    return u.host.toLowerCase() === host.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 別サイトのページから来たリクエストを弾く判定（CSWSH / CSRF 対策）。WS ハンドシェイクと /control/* で使う。
+ *
+ * loopback の無認証や Cookie の自動付与は「ブラウザが別サイトのページの代わりに繋ぐ」ことでも
+ * 成り立ってしまうため、トークン認証とは別に「どのページから来たか」を見る。
+ * - Origin がある → Host と一致する（同一オリジンのページ）ときだけ通す。"null" は弾く。
+ *   ブラウザは WS ハンドシェイクと別オリジンへの POST に必ず Origin を付ける。
+ * - Origin が無い → Sec-Fetch-Site を見る。`cross-site` / `same-site`（同じホストの別ポートも
+ *   same-site 扱い）は弾き、`same-origin` / `none`（直打ち・ブックマーク）だけ通す。
+ *   `<img src>` などの別サイトからの GET は Origin を付けないので、ここで止める。
+ * - どちらも無い → ブラウザ以外（エビの MCP ブリッジ・statusLine の報告・curl 等）。
+ *   Web ページからは作れない接続なので、従来どおりトークン認証（loopback は無認証）に任せる。
+ */
+export type OriginVerdict =
+  | { ok: true }
+  | { ok: false; reason: "cross-origin" | "cross-site" };
+
+export function checkRequestOrigin(req: Pick<IncomingMessage, "headers">): OriginVerdict {
+  const origin = req.headers["origin"];
+  if (typeof origin === "string") {
+    return isSameOriginBrowser(req) ? { ok: true } : { ok: false, reason: "cross-origin" };
+  }
+  const site = req.headers["sec-fetch-site"];
+  if (typeof site === "string" && site !== "same-origin" && site !== "none") {
+    return { ok: false, reason: "cross-site" };
+  }
+  return { ok: true };
 }
 
 /** 認証判定の結果。ok=false のとき reason で理由を区別する。 */

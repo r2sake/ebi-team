@@ -3,6 +3,8 @@ import { Dashboard } from "./dashboard.ts";
 import { Viewer } from "./viewer.ts";
 import { FilePicker } from "./filePicker.ts";
 import { ChatPanel } from "./chat.ts";
+import { FileEditorDialog } from "./fileEditor.ts";
+import { TodoPanel } from "./todoPanel.ts";
 import {
   type ClientMessage,
   type ServerMessage,
@@ -85,6 +87,30 @@ const filePicker = new FilePicker(
   (path) => sendMsg({ type: "listDir", path }),
   (path, title) => sendMsg({ type: "openViewer", path, title }),
 );
+
+// ファイル編集ダイアログ（ボスが UI からファイル＝主に env を書き換える）。
+// 本文は WS の fileEditOpen / fileEditSave でこの接続とサーバの間だけを流れる。
+const fileEditor = new FileEditorDialog(document.getElementById("file-editor") as HTMLElement, (msg) =>
+  sendMsg(msg),
+);
+// ボスの TODO パネル（トップバーの「📋 TODO n」から開く）。一覧は WS `todos`、回答は WS `todoAnswer`。
+// 「💬 チャットで見る」: チャットへ切り替えて、その TODO を載せたときの発言へ飛ぶ。
+const todoPanel = new TodoPanel(
+  document.getElementById("todo-btn") as HTMLButtonElement,
+  document.getElementById("todo-panel") as HTMLElement,
+  (msg) => sendMsg(msg),
+  (seq) => {
+    const id = chatMasterId();
+    if (id === null || !chatPanel.hasSeq(seq)) return false;
+    setActive(id);
+    return chatPanel.revealSeq(seq);
+  },
+);
+chatPanel.setFileEditHooks({
+  open: () => fileEditor.open(),
+  openRequest: (req) => fileEditor.openRequest(req),
+  cancelRequest: (requestId) => sendMsg({ type: "fileEditCancel", requestId }),
+});
 
 // 表示順: dashboard → master → supervisor → dynamic。同種は元の順を維持（Array.sort は V8 で安定）。
 // 種別ソートにすることで、固定エビが自動再起動で末尾に来ても順序が崩れない。
@@ -280,6 +306,18 @@ function handleServerMessage(msg: ServerMessage): void {
     case "chatEvent":
       chatPanel.applyEvent({ seq: msg.seq, ts: msg.ts, event: msg.event });
       break;
+    case "fileEditLoaded":
+      fileEditor.handleLoaded(msg);
+      break;
+    case "fileEditSaved":
+      fileEditor.handleSaved(msg);
+      break;
+    case "todos":
+      todoPanel.update(msg.items);
+      break;
+    case "todoAnswerResult":
+      todoPanel.handleResult(msg);
+      break;
     case "dirListing":
       // ファイルピッカーのディレクトリ列挙応答。error なら理由をモーダル内に表示。
       if (msg.error) filePicker.setError(msg.error);
@@ -441,6 +479,19 @@ function renderRegistry(): void {
     const td = document.createElement("td");
     td.colSpan = 6;
     td.textContent = "📂 ファイルを開く";
+    tr.appendChild(td);
+    registryBody.appendChild(tr);
+  }
+
+  // 「📝 ファイルを編集」合成エントリ。クリックで編集ダイアログ（パス入力から）を開く。
+  {
+    const tr = document.createElement("tr");
+    tr.className = "agent-row open-file-row";
+    tr.title = "許可ルート配下のファイル（env など）を書き換える";
+    tr.addEventListener("click", () => fileEditor.open());
+    const td = document.createElement("td");
+    td.colSpan = 6;
+    td.textContent = "📝 ファイルを編集";
     tr.appendChild(td);
     registryBody.appendChild(tr);
   }
@@ -665,6 +716,25 @@ spawnBtn.addEventListener("click", () => {
 window.addEventListener("resize", () => {
   if (activeId) panes.get(activeId)?.refit();
 });
+
+// ===== スマホ: 画面の高さを「実際に見えている高さ」に合わせる =====
+// 100vh / 100dvh だけだと、ブラウザ下部のツールバーやソフトキーボードの裏に
+// 下端のチャット入力欄が潜ることがある（interactive-widget 未対応のブラウザ等）。
+// 狭幅のときだけ visualViewport の高さを --app-h に入れ、body の高さに使う（style.css）。
+// ピンチズーム中（scale≠1）は見えている高さが縮むだけなので追従しない。広幅（PC）では触らない。
+function syncAppHeight(): void {
+  const vv = window.visualViewport;
+  const narrow = window.matchMedia("(max-width: 768px)").matches;
+  if (!vv || !narrow) {
+    document.body.style.removeProperty("--app-h");
+    return;
+  }
+  if (Math.abs(vv.scale - 1) > 0.01) return;
+  document.body.style.setProperty("--app-h", `${Math.round(vv.height)}px`);
+}
+syncAppHeight();
+window.visualViewport?.addEventListener("resize", syncAppHeight);
+window.addEventListener("resize", syncAppHeight);
 
 // ===== スマホ: サイドバー（registry ドロワー）開閉 =====
 function setDrawer(open: boolean): void {

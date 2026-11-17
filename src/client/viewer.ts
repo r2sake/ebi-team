@@ -14,6 +14,10 @@ import { parseMarkdown, type MdBlock, type MdInline } from "./markdown.ts";
  */
 export class Viewer {
   private current: ViewerRecord | null = null;
+  /** 最後に描いた record（同じ中身なら描き直さない＝読んでいる位置を保つ）。undefined は未描画。 */
+  private rendered: ViewerRecord | null | undefined = undefined;
+  /** viewer ごとの読んでいた位置（別の viewer へ移って戻ったときに戻す。メモリのみ）。 */
+  private readonly scrollById = new Map<string, number>();
 
   constructor(
     private readonly el: HTMLElement,
@@ -26,13 +30,36 @@ export class Viewer {
     this.el.hidden = !visible;
     if (!visible) return;
     if (record !== undefined) this.current = record;
-    this.render();
+    this.renderIfChanged();
   }
 
   /** 現在表示中の viewer を差し替えて再描画する（表示中のみ）。 */
   update(record: ViewerRecord | null): void {
     this.current = record;
-    if (!this.el.hidden) this.render();
+    if (!this.el.hidden) this.renderIfChanged();
+  }
+
+  /**
+   * 中身が変わったときだけ描き直す。registry / viewers を受けるたびに setVisible / update が
+   * 呼ばれるので、毎回 render() すると `.viewer-body` が入れ替わって先頭へ戻ってしまう。
+   * 描き直すときは、離れる viewer の位置を覚えておき、描いた viewer に覚えた位置があれば戻す
+   *（別の viewer を開いて閉じた後や、同じ viewer の内容が変わったときも読んでいた所に居られる）。
+   */
+  private renderIfChanged(): void {
+    const prev = this.rendered;
+    const next = this.current;
+    if (prev !== undefined && !viewerNeedsRender(prev, next)) return;
+    const prevBody = this.bodyEl();
+    if (prev && prevBody) this.scrollById.set(prev.id, prevBody.scrollTop);
+    this.render();
+    this.rendered = next;
+    const saved = next ? this.scrollById.get(next.id) : undefined;
+    const body = this.bodyEl();
+    if (saved !== undefined && body) body.scrollTop = saved;
+  }
+
+  private bodyEl(): HTMLElement | null {
+    return this.el.querySelector<HTMLElement>(".viewer-body");
   }
 
   /** パネル全体を描画する。 */
@@ -105,6 +132,20 @@ export class Viewer {
 
     this.el.append(head, body);
   }
+}
+
+/** 描いたもの（prev）と表示したいもの（next）で描き直しが要るか（表示に出る欄のどれかが違えば要る）。 */
+export function viewerNeedsRender(prev: ViewerRecord | null, next: ViewerRecord | null): boolean {
+  if (prev === next) return false;
+  if (!prev || !next) return true;
+  return (
+    prev.id !== next.id ||
+    prev.openedAt !== next.openedAt ||
+    prev.format !== next.format ||
+    prev.title !== next.title ||
+    prev.path !== next.path ||
+    prev.content !== next.content
+  );
 }
 
 /** markdown 文字列を AST 化し、el 配下へ安全な DOM として構築する。 */

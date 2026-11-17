@@ -22,7 +22,7 @@ import { applyMasterBackendFailsafe } from "../src/server/fixedEbi.ts";
 
 test("組込み engineer の既定 backend は claude のまま（実装役は claude 維持）", () => {
   assert.equal(BUILTIN_ROLES.engineer.backend, "claude");
-  assert.equal(BUILTIN_ROLES.engineer.defaultModel, "claude-opus-5");
+  assert.equal(BUILTIN_ROLES.engineer.defaultModel, "claude-opus-5-5");
 });
 
 test("カスタム役割に backend を指定できる（実装済み id のみ）", () => {

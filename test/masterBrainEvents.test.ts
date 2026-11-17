@@ -129,7 +129,7 @@ test("assistant の text / thinking / tool_use が正規化される", () => {
   assert.deepEqual(call.kind === "toolCall" ? call.input : null, { a: 1 });
 });
 
-test("AskUserQuestion は question イベントへ射影される", () => {
+test("AskUserQuestion は question ではなく通常のツール呼び出しとして出す（質問はブローカ経由だけ）", () => {
   const n = new ClaudeStreamNormalizer();
   const out = n.push({
     type: "assistant",
@@ -153,13 +153,13 @@ test("AskUserQuestion は question イベントへ射影される", () => {
       ],
     },
   });
-  assert.deepEqual(kinds(out), ["question"]);
-  const q = out[0];
-  assert.ok(q.kind === "question");
-  assert.equal(q.id, "toolu_q#0");
-  assert.equal(q.header, "方針");
-  assert.equal(q.multi, false);
-  assert.deepEqual(q.options, [{ label: "A", description: "案A" }, { label: "B" }]);
+  // 質問（question）の供給源は PermissionBroker だけ。ここでも出すと同じ id の保留が
+  // 二重に立ち、回答後も「未応答」が残る（2026-10-02 回帰）。
+  assert.deepEqual(kinds(out), ["toolCall"]);
+  const t = out[0];
+  assert.ok(t.kind === "toolCall");
+  assert.equal(t.id, "toolu_q");
+  assert.equal(t.name, "AskUserQuestion");
 });
 
 test("AskUserQuestion の形が想定外なら通常ツールとして出す（黙って落とさない）", () => {

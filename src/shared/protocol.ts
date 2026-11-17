@@ -258,6 +258,45 @@ export interface OpenViewerMessage {
   title?: string;
 }
 
+/**
+ * ファイル編集画面で 1 ファイルを開く（クライアント → サーバ）。
+ * サーバは許可ルート（EBI_EDIT_ROOTS）配下に限定して検証し、**要求した接続にだけ**
+ * `fileEditLoaded` で本文を返す（broadcast しない・チャットのログにも載せない）。
+ */
+export interface FileEditOpenMessage {
+  type: "fileEditOpen";
+  /** 開くファイルの絶対パス（`~` 可）。無ければ新規作成として開く。 */
+  path: string;
+  /** master の request_file_edit の依頼から開いたときの依頼 id。 */
+  requestId?: string;
+}
+
+/**
+ * ファイル編集画面での保存（クライアント → サーバ）。
+ * content は**要求した接続とサーバの間だけ**を流れる（ログ・会話履歴・master には渡さない）。
+ */
+export interface FileEditSaveMessage {
+  type: "fileEditSave";
+  path: string;
+  content: string;
+  /**
+   * 開いたときの本文の sha256（`FileEditView.baseHash`）。新規作成は null。
+   * サーバの現物と食い違えば保存しない（開いた後に他所で書き換わった＝上書き事故の防止）。
+   */
+  baseHash: string | null;
+  /** 親フォルダが無いとき作ってよいか（ボスが確認した印）。 */
+  createDirs: boolean;
+  /** 上書き前に控え（`<file>.bak-YYYYMMDD-HHMMSS`）を残すか。 */
+  backup: boolean;
+  requestId?: string;
+}
+
+/** master の request_file_edit の依頼を断る（クライアント → サーバ）。 */
+export interface FileEditCancelMessage {
+  type: "fileEditCancel";
+  requestId: string;
+}
+
 export type ClientMessage =
   | SpawnMessage
   | KillMessage
@@ -275,7 +314,11 @@ export type ClientMessage =
   | ChatAnswerMessage
   | ChatStopMessage
   | ChatNewMessage
-  | ChatHistoryMessage;
+  | ChatHistoryMessage
+  | FileEditOpenMessage
+  | FileEditSaveMessage
+  | FileEditCancelMessage
+  | TodoAnswerMessage;
 
 // ===== サーバ → クライアント =====
 
@@ -447,7 +490,128 @@ export type ServerMessage =
   | DirListingMessage
   | ChatEventMessage
   | ChatSnapshotMessage
-  | ChatStateMessage;
+  | ChatStateMessage
+  | FileEditLoadedMessage
+  | FileEditSavedMessage
+  | TodosMessage
+  | TodoAnswerResultMessage;
+
+// ===== ボスの TODO（ボスがやらなければならないこと）=====
+//
+// 追加・解決は master の MCP（todo_add / todo_resolve）から、回答はボスの UI（todoAnswer）から。
+// 番号 no は通し番号で使い回さない（消えた番号が別の TODO と混ざらない）。設計: docs/plans/boss-todo-plan.md
+
+/** TODO の種類（質問 / 権限の許可 / 作業＝ボスの手作業）。 */
+export type TodoKind = "question" | "permission" | "action";
+
+/** 質問の選択肢 1 つ。 */
+export interface TodoOption {
+  label: string;
+  description?: string;
+}
+
+/** TODO 1 件。 */
+export interface TodoItem {
+  /** 通し番号（「N番」）。消しても使い回さない。 */
+  no: number;
+  /** 件名（1 行）。 */
+  title: string;
+  /** 詳細（Markdown）。 */
+  detail: string;
+  kind: TodoKind;
+  /** どのエビか（無ければ null）。 */
+  ebi: string | null;
+  /** どの案件か（自由文字列・無ければ null）。 */
+  project: string | null;
+  /** 選択肢（質問以外は空でよい）。 */
+  options: TodoOption[];
+  /** 推奨する選択肢の label（options にあるものだけ）。 */
+  recommended: string | null;
+  /** 作った時刻（epoch ms）。 */
+  createdAt: number;
+  /**
+   * master のチャットの発言（seq）とのつながり。TODO パネルの「💬 チャットで見る」で飛ぶ先。
+   * todo_add の chat_seq（chat_image が返す seq）、無ければ追加した時点の最新 seq。
+   * chat master が居ない構成・つながりを持たない古い TODO では null。
+   */
+  chatSeq: number | null;
+}
+
+/** 未解決の TODO の全件（サーバ → クライアント）。接続直後と変化のたびに送る。 */
+export interface TodosMessage {
+  type: "todos";
+  items: TodoItem[];
+}
+
+/**
+ * ボスが UI から TODO に答える（クライアント → サーバ）。
+ * サーバは答えを master へ `[TODO #N への回答] …` として流し、受け付けられたら台帳から消す。
+ * - choice: 選んだ選択肢の label
+ * - text:   自由入力（補足）
+ * - done:   true なら「✓ 対応した」（選択肢の無い作業・許可向け）
+ */
+export interface TodoAnswerMessage {
+  type: "todoAnswer";
+  no: number;
+  choice?: string;
+  text?: string;
+  done?: boolean;
+}
+
+// ===== ファイル編集（ボスが UI からファイルを書き換える）=====
+//
+// 本文（秘密の値を含みうる）は **fileEditOpen / fileEditSave を送った接続とサーバの間だけ**を流れる。
+// broadcast・チャットのトランスクリプト・JSONL・master への通知のどれにも載せない。
+
+/** 編集画面に渡す 1 ファイル分。 */
+export interface FileEditView {
+  /** 書き込み先の絶対パス（シンボリックリンクは解決済み）。 */
+  path: string;
+  /** 既にあるファイルか（false なら新規作成）。 */
+  exists: boolean;
+  /** 現在の本文（新規は null）。 */
+  content: string | null;
+  /** 現在の本文の sha256（新規は null）。保存時にそのまま返す。 */
+  baseHash: string | null;
+  /** 秘密を含みそうなファイルか（.env / *.key 等。UI は既定で伏せ字にする）。 */
+  secret: boolean;
+  /** 作る必要がある親フォルダ（浅い順の絶対パス）。空なら親はある。 */
+  missingDirs: string[];
+  /** 現在のサイズ（バイト・新規は 0）。 */
+  size: number;
+}
+
+/** 保存の結果（本文は含めない）。 */
+export interface FileEditSaveSummary {
+  path: string;
+  action: "create" | "update";
+  bytes: number;
+  /** 残した控えの絶対パス（残さなかった・新規作成は null）。 */
+  backupPath: string | null;
+  /** 新しく作った親フォルダ。 */
+  createdDirs: string[];
+}
+
+/** `fileEditOpen` への応答（要求した接続にだけ送る）。 */
+export interface FileEditLoadedMessage {
+  type: "fileEditLoaded";
+  /** 要求したパス（応答の突き合わせ用）。 */
+  path: string;
+  requestId?: string;
+  file?: FileEditView;
+  error?: string;
+}
+
+/** `fileEditSave` への応答（要求した接続にだけ送る）。 */
+export interface FileEditSavedMessage {
+  type: "fileEditSaved";
+  path: string;
+  requestId?: string;
+  saved?: FileEditSaveSummary;
+  error?: string;
+  /** 開いた後に他所で書き換わっていたため保存しなかった（開き直しを促す）。 */
+  conflict?: boolean;
+}
 
 // ===== master チャット UI（ui:"chat"）のプロトコル =====
 //
@@ -602,6 +766,27 @@ export type MasterChatEvent =
     }
   | { kind: "notice"; level: "info" | "warn" | "error"; text: string }
   /**
+   * master の request_file_edit による「このファイルにこの鍵を入れてください」の依頼。
+   * チャットに入力カードを出す。**値は載らない**（鍵名・パス・メモだけ）。
+   */
+  | {
+      kind: "fileEditRequest";
+      id: string;
+      path: string;
+      /** 入れてほしい鍵名（空なら本文を自由に編集する依頼）。 */
+      keys: string[];
+      note: string | null;
+      /** 依頼した送り手（MCP ブリッジの EBI_ID）。 */
+      from: string;
+    }
+  /** ファイル編集依頼の決着（保存した / 断った / 破棄された）。summary に値は入れない。 */
+  | {
+      kind: "fileEditSettled";
+      id: string;
+      outcome: "saved" | "cancelled" | "discarded";
+      summary: string | null;
+    }
+  /**
    * 「新しい会話」（WS `chatNew`）で文脈をリセットした区切り。
    *
    * `notice` の 1 行ではなく構造化イベントにしてあるのは、**UI がここでトランスクリプトを
@@ -722,4 +907,12 @@ export interface ChatStateMessage {
   state: MasterChatState;
   /** 未応答の承認/質問の件数（「待機 N 件」ではない。busy 中の投入はキューされない）。 */
   pending: number;
+}
+
+/** todoAnswer の結果（サーバ → 送った接続だけ）。ok=false のとき TODO は消えずに残る。 */
+export interface TodoAnswerResultMessage {
+  type: "todoAnswerResult";
+  no: number;
+  ok: boolean;
+  error?: string;
 }

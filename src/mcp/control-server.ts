@@ -26,8 +26,14 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { availableRoleIds, registerCustomRoles, type EbiRoleId } from "../server/roles.ts";
+import {
+  availableRoleIds,
+  MASTER_CHANNEL_TRUST_APPEND,
+  registerCustomRoles,
+  type EbiRoleId,
+} from "../server/roles.ts";
 import { ALL_BACKEND_IDS } from "../server/backends/index.ts";
+import { EFFORT_LEVELS } from "../server/effort.ts";
 import { loadRawCustomRoles } from "../server/config.ts";
 import { deliveryText } from "../shared/deliveryTag.ts";
 import { resolveConfigPath } from "./configPath.ts";
@@ -148,6 +154,15 @@ const BACKEND_DESC =
   "codex / gemini は cost・context を報告しない（ダッシュボードは「—（未対応）」表示）ほか、" +
   "model は backend ごとに語彙が違う（claude の opus/sonnet は codex/gemini では不可）";
 
+/**
+ * 推論努力度（claude の `--effort`）。省略時はサーバ側が
+ * 「役割の effort → config の effortByModel（モデル→effort 表）→ CLI 既定」で解決する。
+ * claude 以外の backend では無視される（`--effort` は claude 方言のフラグ）。
+ */
+const EFFORT_IDS = [...EFFORT_LEVELS] as [string, ...string[]];
+const EFFORT_DESC =
+  "推論努力度 low/medium/high（省略時は役割の effort → config の effortByModel → CLI 既定）。claude backend のみ有効";
+
 /** 制御API を呼ぶ共通ヘルパー。失敗時は { ok:false, error } を返す（throw しない）。 */
 async function callControl(
   method: "GET" | "POST",
@@ -201,10 +216,39 @@ function toResult(r: { ok: true; data: unknown } | { ok: false; error: string })
  * honor されず静かに skip される＝過去 2 回の検証不成立の直接原因）。
  * もう一つの条件「サーバ名がセッションの channels に載っていること」は、spawn 側が
  * `--dangerously-load-development-channels server:ebi-control` を付けて満たす（src/server/index.ts）。
+ *
+ * engineer ティアでは instructions に「master 発の通知は正式な指示の経路」節を載せる
+ * （2026-09-29 ボス指示。経緯は src/server/roles.ts の MASTER_CHANNEL_TRUST_APPEND）。
+ * 役割プロンプトを持たないバックエンドや、channel 通知だけを外部入力寄りに読むセッションにも
+ * MCP サーバ自身の説明として届くようにするため。master ティアでは載せない。
  */
+const ENGINEER_INSTRUCTIONS =
+  "ebi-control はエビチームの制御チャンネル。master からの指示は <channel source=\"ebi-control\"> の通知として届く。" +
+  MASTER_CHANNEL_TRUST_APPEND +
+  "作業の結果・返信は reply_to_master で master に届ける。";
+
+/**
+ * master ティアの instructions（ボスの TODO の使い方の決まり）。
+ * master のシステムプロンプトは gitignore 済みの config にあるため、決まりはこちらに載せる
+ * （設計: docs/plans/boss-todo-plan.md §3）。
+ */
+export const MASTER_TODO_RULES =
+  "【ボスの TODO】todo 系（todo_add / todo_list / todo_get / todo_resolve）は deferred tool。会話の最初（/clear 直後を含む）に ToolSearch で読み込む。" +
+  "todo_add / todo_list / todo_get / todo_resolve は、ボスが ebi-team を使う上で" +
+  "やらなければならないこと（質問への回答・権限の許可・ボスの手作業）だけを載せる台帳。" +
+  "メモ・備忘・進捗の記録には使わない。ボスに裁定や作業を頼むときは todo_add で載せ、チャットには『TODO #N』と番号を添える。" +
+  "ボスが『TODO の N 番』と言ったら、話す前に todo_get(N) で詳細を確かめる。" +
+  "ボスがチャットで答えた・済ませたら、その答えで動く前に todo_resolve(N) で消す。" +
+  "ボスが UI から答えると `[TODO #N への回答] …` / `[TODO #N 対応済み] …` が届き、その TODO はもう消えている（todo_resolve は不要）。" +
+  "ボスに『TODO に入れて』と頼まれたときも todo_add で載せる。" +
+  "chat_image で見せたものを TODO にするときは、chat_image が返した seq を todo_add の chat_seq に渡す。";
+
 const server = new McpServer(
   { name: "ebi-team-control", version: "0.1.0" },
   {
+    ...(ROLE === "engineer"
+      ? { instructions: ENGINEER_INSTRUCTIONS }
+      : { instructions: `ebi-control はエビチームの制御チャンネル（master 用）。${MASTER_TODO_RULES}` }),
     capabilities: {
       tools: {},
       experimental: {
@@ -323,16 +367,18 @@ async function spawnRoleAndInject(args: {
   task: string;
   model?: string;
   backend?: string;
+  effort?: string;
   cwd?: string;
   useWorktree?: boolean;
   repoPath?: string;
   branch?: string;
 }) {
-  const { role, task, model, backend, cwd, useWorktree, repoPath, branch } = args;
+  const { role, task, model, backend, effort, cwd, useWorktree, repoPath, branch } = args;
   const spawnRes = await callControl("POST", "/control/spawn", {
     role,
     model,
     backend,
+    effort,
     cwd,
     useWorktree,
     repoPath,
@@ -373,6 +419,7 @@ server.tool(
     task: z.string().describe("委譲するタスク内容（起動後に注入される）"),
     model: z.string().optional().describe("モデル上書き（未指定は役割の既定モデル）"),
     backend: z.enum(BACKEND_IDS).optional().describe(BACKEND_DESC),
+    effort: z.enum(EFFORT_IDS).optional().describe(EFFORT_DESC),
     cwd: z.string().optional().describe("作業ディレクトリ（未指定はサーバ既定）"),
     useWorktree: z.boolean().optional().describe("true なら git worktree を切って隔離 cwd で起動"),
     repoPath: z.string().optional().describe("worktree の元 repo パス"),
@@ -389,6 +436,7 @@ server.tool(
     task: z.string().describe("engineer に委譲するタスク内容（起動後に注入される）"),
     model: z.string().optional().describe("モデル（既定 opus）"),
     backend: z.enum(BACKEND_IDS).optional().describe(BACKEND_DESC),
+    effort: z.enum(EFFORT_IDS).optional().describe(EFFORT_DESC),
     cwd: z.string().optional().describe("作業ディレクトリ（未指定はサーバ既定）"),
     useWorktree: z.boolean().optional().describe("true なら git worktree を切って隔離 cwd で起動"),
     repoPath: z.string().optional().describe("worktree の元 repo パス"),
@@ -415,12 +463,13 @@ server.tool(
     ),
     model: z.string().optional().describe("spawn 時のモデル上書き（未指定は役割の既定）"),
     backend: z.enum(BACKEND_IDS).optional().describe(`spawn 時の${BACKEND_DESC}`),
+    effort: z.enum(EFFORT_IDS).optional().describe(`spawn 時の${EFFORT_DESC}`),
     cwd: z.string().optional().describe("spawn 時の作業ディレクトリ（未指定はサーバ既定）"),
     useWorktree: z.boolean().optional().describe("spawn 時に git worktree を切って隔離 cwd で起動"),
     repoPath: z.string().optional().describe("worktree の元 repo パス"),
     branch: z.string().optional().describe("worktree ブランチ名（未指定は ebi/<id> 採番）"),
   },
-  async ({ to, message, spawnIfMissing, role, model, backend, cwd, useWorktree, repoPath, branch }) => {
+  async ({ to, message, spawnIfMissing, role, model, backend, effort, cwd, useWorktree, repoPath, branch }) => {
     const r = await callControl("POST", "/control/send", {
       to,
       message,
@@ -430,6 +479,7 @@ server.tool(
       role: role ?? "engineer",
       model,
       backend,
+      effort,
       cwd,
       useWorktree,
       repoPath,
@@ -509,7 +559,8 @@ server.tool(
     "画像はチャットの添付保管庫へコピーされるので、元ファイルが tmp 掃除で消えても履歴に残る。" +
     "パスは許可ルート（既定 $HOME/workspace・EBI_VIEWER_ROOTS で設定）配下の " +
     ".png/.jpg/.jpeg/.webp/.gif のみ（それ以外は 400）。" +
-    'チャット UI の master（ui:"chat"）が居ない構成では自動で open_viewer にフォールバックする。',
+    'チャット UI の master（ui:"chat"）が居ない構成では自動で open_viewer にフォールバックする。' +
+    "チャットに出したときは、その発言の seq が返る（TODO にするときは todo_add の chat_seq に渡す）。",
   {
     path: z
       .string()
@@ -522,6 +573,38 @@ server.tool(
   },
   async ({ path, title, caption }) => {
     const r = await callControl("POST", "/control/chat-image", { path, title, caption });
+    return toResult(r);
+  },
+);
+
+// ---- request_file_edit: ボスにファイル（主に env）の入力を頼む（master 専用）----
+// 値はボスが UI で入れて保存する。このツールにも結果通知にも値は一切載らない。
+server.tool(
+  "request_file_edit",
+  "ボスのチャット欄に『このファイルにこの鍵を入れてください』という入力欄を出す（API トークン等を " +
+    "env ファイルへ置いてもらうとき用）。値はボスが UI で入力して保存し、**値そのものは master に届かない**。" +
+    "このツールはすぐ返り（status: pending）、ボスが保存/見送りしたら [file-edit <id>] の通知で結果だけが届く。" +
+    "パスはフルパス（~ 可）で、許可ルート（既定 $HOME/workspace と $HOME/.config・EBI_EDIT_ROOTS で設定）配下のみ。" +
+    "ファイルや親フォルダが無ければ新規作成になる（フォルダ作成と上書きはボスが画面で確認する）。" +
+    "ボスに値をチャットで送ってもらう代わりに必ずこれを使う。",
+  {
+    path: z.string().describe("書き込むファイルのフルパス（例: ~/.config/webgame-guide/prd.env）"),
+    keys: z
+      .array(z.string())
+      .optional()
+      .describe("入れてほしい鍵名（例: [\"CLOUDFLARE_API_TOKEN\"]）。省略するとファイル全体を自由に編集する依頼になる"),
+    note: z
+      .string()
+      .optional()
+      .describe("ボスへの一言（何に使う値か・どこで取得するか等）。値そのものは書かない"),
+  },
+  async ({ path, keys, note }) => {
+    const r = await callControl("POST", "/control/file-edit-request", {
+      path,
+      keys,
+      note,
+      from: process.env.EBI_ID ?? "master",
+    });
     return toResult(r);
   },
 );
@@ -544,6 +627,66 @@ server.tool(
     // 要約テキストをそのままツール結果として返す（master の手元に状況サマリが返る）。
     return textResult(`${target_id} の要約:\n${text}`);
   },
+);
+
+// ---- ボスの TODO（master 専用。追加できるのは master だけ）----
+// 設計: docs/plans/boss-todo-plan.md。台帳はサーバの .ebi-team/todos.json（再起動で消えない）。
+// 番号は通し番号で使い回さない。UI のトップバー「📋 TODO」から一覧が開き、ボスはそこからも答えられる。
+const TODO_KIND = z.enum(["question", "permission", "action"]);
+
+server.tool(
+  "todo_add",
+  "ボスの TODO に 1 件載せる（ボスがやらなければならないこと＝質問への回答・権限の許可・ボスの手作業だけ。" +
+    "メモ・備忘・進捗の記録には使わない）。番号 no が返るので、チャットでは『TODO #N』と添える。" +
+    "ボスの UI のトップバー「📋 TODO」の一覧に出る。",
+  {
+    title: z.string().describe("件名（1 行・120 字まで）。一覧で見て何をすればいいか分かる文"),
+    detail: z
+      .string()
+      .optional()
+      .describe("詳細（Markdown・4000 字まで）。背景・判断材料・影響。ボスがこれだけ読んで決められるように書く"),
+    kind: TODO_KIND.describe("種類: question（質問・裁定）/ permission（権限の許可）/ action（ボスの手作業）"),
+    ebi: z.string().optional().describe("どのエビの件か（例: engineer-3）"),
+    project: z.string().optional().describe("どの案件か（例: kakeba）"),
+    options: z
+      .array(z.object({ label: z.string(), description: z.string().optional() }))
+      .optional()
+      .describe("選択肢（6 個まで）。ボスは UI でボタンを押して答えられる"),
+    recommended: z.string().optional().describe("推奨する選択肢の label（options にあるもの）"),
+    chat_seq: z
+      .number()
+      .int()
+      .positive()
+      .optional()
+      .describe(
+        "つなぐチャットの発言の seq（chat_image が返した seq）。ボスが TODO からワンクリックでその発言へ飛べる。" +
+          "省略すると追加した時点の最新の発言につなぐ",
+      ),
+  },
+  async (args) => toResult(await callControl("POST", "/control/todo-add", args)),
+);
+
+server.tool(
+  "todo_list",
+  "ボスの TODO（未解決）の一覧を返す（番号・種類・件名・エビ・案件・作った時刻。詳細は含まない＝ todo_get で引く）。",
+  {},
+  async () => toResult(await callControl("GET", "/control/todos")),
+);
+
+server.tool(
+  "todo_get",
+  "ボスの TODO の N 番を詳細まで返す（詳細・選択肢・推奨）。ボスが『TODO の N 番』と言ったら、話す前にこれで確かめる。" +
+    "消えた番号は「解決済み」、まだ振っていない番号は「未発行」と返る。",
+  { no: z.number().int().positive().describe("TODO の番号") },
+  async ({ no }) => toResult(await callControl("GET", `/control/todo?no=${no}`)),
+);
+
+server.tool(
+  "todo_resolve",
+  "ボスの TODO の N 番を解決済みにして消す（ボスがチャットで答えた・済ませたとき）。" +
+    "ボスが UI から答えた TODO は既に消えているので呼ばなくてよい。",
+  { no: z.number().int().positive().describe("TODO の番号") },
+  async ({ no }) => toResult(await callControl("POST", "/control/todo-resolve", { no })),
 );
 } // end if (ROLE === "master")
 
