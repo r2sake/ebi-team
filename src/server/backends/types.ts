@@ -121,8 +121,11 @@ export interface StartupGateSpec {
   isAutoAnswerEligible(args: readonly string[], allowlist: readonly string[]): boolean;
   /** ANSI 除去済みの走査バッファからゲート種別を判定する純関数。 */
   detect(plainScanBuffer: string): StartupGateKind | null;
-  /** ゲート検知時に PTY へ書き込む応答文字列。 */
-  answerFor(kind: StartupGateKind): string;
+  /**
+   * ゲート検知時に PTY へ書き込むキー列（順に少し間を空けて送る）。
+   * 選択肢がまだ描画されておらず決められないときは null（次の出力で判定し直す）。
+   */
+  answerFor(kind: StartupGateKind, plainScanBuffer: string): string[] | null;
   /** 自動応答したことをサーバログ / notice に残すための文言。 */
   noticeFor(kind: StartupGateKind): string;
 }
