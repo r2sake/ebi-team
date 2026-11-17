@@ -183,3 +183,32 @@ test("echoNeedle: タグを compact したものを針にする（空白・ANSI 
   assert.equal(echoNeedle(deliveryTag("master")), "[from:master]");
   assert.equal(echoNeedle("\x1b[2m[from:ebi-1#3] \x1b[0m"), "[from:ebi-1#3]");
 });
+
+// ===== workspace trust 確認で「信頼する（Yes）」を選ぶ（並び順に頼らない） =====
+import { trustGateKeys, CLAUDE_BACKEND } from "../src/server/backends/claude.ts";
+
+test("trust: 新しい並び（❯ No, exit / Yes, I trust this folder）では ↓ → Enter で Yes を選ぶ", () => {
+  // 2026-11 claude 2.1.322 の実画面（ANSI 除去後・空白が消える描画）
+  const screen =
+    "Security guide\n❯No,exit\nYes,Itrustthisfolder\n\nEntertoconfirm·Esctocancel";
+  assert.deepEqual(trustGateKeys(screen), ["\x1b[B", "\r"]);
+  assert.deepEqual(trustGateKeys("❯ No, exit\n  Yes, I trust this folder"), ["\x1b[B", "\r"]);
+});
+
+test("trust: カーソルが既に Yes なら Enter だけ・番号付きならその番号", () => {
+  assert.deepEqual(trustGateKeys("❯ 1. Yes, proceed\n  2. No, exit"), ["\r"]);
+  assert.deepEqual(trustGateKeys("❯ Yes, I trust this folder\n  No, exit"), ["\r"]);
+  assert.deepEqual(trustGateKeys("  1. No, exit\n  2. Yes, I trust this folder"), ["2\r"]);
+});
+
+test("trust: 選択肢がまだ描画されていない・カーソルが分からないときは送らない（No を選ばない）", () => {
+  assert.equal(trustGateKeys("Do you trust this folder?"), null);
+  assert.equal(trustGateKeys("❯ No, exit"), null);
+  assert.equal(trustGateKeys("No, exit\nYes, I trust this folder"), null);
+});
+
+test("trust: answerFor は trust では画面からキー列を決め、devChannels は従来どおり 1+Enter", () => {
+  const gates = CLAUDE_BACKEND.startupGates!;
+  assert.deepEqual(gates.answerFor("trust", "❯No,exit\nYes,Itrustthisfolder"), ["\x1b[B", "\r"]);
+  assert.deepEqual(gates.answerFor("devChannels", "anything"), ["1\r"]);
+});

@@ -90,6 +90,8 @@ const GATE_WINDOW_MS = Number(process.env.EBI_GATE_WINDOW_MS) || 90000;
  * （将来 claude 側がダイアログを出さなくなっても永久に ready にならない事故を防ぐ保険）。
  * 実測ではダイアログは spawn 後 2〜4 秒で出る。env `EBI_GATE_SETTLE_MS` で調整可。
  */
+/** 起動ゲートへ複数のキー（↓ → Enter など）を送るときの間隔(ms)。 */
+const GATE_KEY_INTERVAL_MS = 500;
 const GATE_SETTLE_MS = Number(process.env.EBI_GATE_SETTLE_MS) || 20000;
 
 /**
@@ -1096,6 +1098,26 @@ export class Agent {
     }
   }
 
+  /**
+   * 起動ゲートへのキー列を少し間を空けて送る（↓ と Enter を 1 回の write にまとめると
+   * TUI が 1 つのキー入力として解釈し損ねるため）。
+   */
+  private writeGateKeys(keys: readonly string[]): void {
+    // 1 キーだけ（従来の "1"+Enter）は即送る＝従来どおり。
+    // 複数キー（↓ → Enter）は、描画直後の ↓ が取りこぼされて既定の No のまま Enter に
+    // なるのを避けるため、最初のキーの前にも間を置く（実機で即送りすると No が選ばれた）。
+    if (keys.length <= 1) {
+      if (keys[0] !== undefined && !this.disposed) this.proc.write(keys[0]);
+      return;
+    }
+    const send = (i: number): void => {
+      if (i >= keys.length || this.disposed) return;
+      this.proc.write(keys[i]!);
+      setTimeout(() => send(i + 1), GATE_KEY_INTERVAL_MS);
+    };
+    setTimeout(() => send(0), GATE_KEY_INTERVAL_MS);
+  }
+
   private maybeAnswerStartupGates(chunk: string): void {
     const spec = this.gateSpec;
     if (this.disposed || !this.autoAnswerStartupGates || spec === null) return;
@@ -1115,8 +1137,11 @@ export class Agent {
     const gate = spec.detect(this.gateScanBuffer);
     if (gate === null || this.answeredGates.has(gate)) return;
 
+    // 選択肢がまだ描画途中で応答を決められなければ、送らずに次の出力を待つ。
+    const keys = spec.answerFor(gate, this.gateScanBuffer);
+    if (keys === null || keys.length === 0) return;
     this.answeredGates.add(gate);
-    this.proc.write(spec.answerFor(gate));
+    this.writeGateKeys(keys);
     this.gateScanBuffer = ""; // 次のダイアログ検知のため一旦クリア
     const msg = spec.noticeFor(gate);
     console.log(`[ebi-team] [${this.id}] ${msg}`);
