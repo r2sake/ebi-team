@@ -19,6 +19,7 @@ import {
   type ViewerRecord,
 } from "../shared/protocol.ts";
 import { TodoError, type TodoBoard } from "./todos.ts";
+import { callerMayActAs, getControlCaller } from "./controlAuth.ts";
 import {
   ALLOWED_ATTACH_TYPES,
   maxBytesFor,
@@ -505,6 +506,11 @@ export function createControlApi(deps: ControlDeps) {
           sendJson(res, 400, { error: "from と message（文字列）は必須です" });
           return true;
         }
+        // セキュアモード: engineer は自分の id でしか名乗れない（なりすまし防止）。
+        if (!callerMayActAs(getControlCaller(req), from)) {
+          sendJson(res, 403, { error: `セキュアモード: from=${from} を名乗ることはできません` });
+          return true;
+        }
         const result = await registry.reverseInject(from, to, message, kind);
         if (result.delivered.length === 0) {
           // 宛先なし/isolated/自己送信などで配信ゼロは 4xx で理由を返す。
@@ -593,6 +599,10 @@ export function createControlApi(deps: ControlDeps) {
           sendJson(res, 400, { error: "クエリ id は必須です" });
           return true;
         }
+        if (!callerMayActAs(getControlCaller(req), id)) {
+          sendJson(res, 403, { error: `セキュアモード: id=${id} の購読はできません` });
+          return true;
+        }
         const timeoutRaw = Number(query.get("timeoutMs"));
         const timeoutMs =
           Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? Math.min(Math.max(timeoutRaw, 1000), 60000) : 25000;
@@ -627,6 +637,10 @@ export function createControlApi(deps: ControlDeps) {
         const ids = idsRaw.filter((n): n is number => typeof n === "number" && Number.isFinite(n));
         if (!id) {
           sendJson(res, 400, { error: "id（文字列）は必須です" });
+          return true;
+        }
+        if (!callerMayActAs(getControlCaller(req), id)) {
+          sendJson(res, 403, { error: `セキュアモード: id=${id} の ACK はできません` });
           return true;
         }
         registry.ackDelivery(id, ids);
@@ -791,9 +805,11 @@ export function createControlApi(deps: ControlDeps) {
         res.on("close", () => {
           if (!res.writableEnded) ac.abort();
         });
+        // 「誰から」はトークンで分かるならそれを使う（body の from は名乗りにすぎない）。
+        const caller = getControlCaller(req);
         const decision = await deps.requestSecureApproval(
           {
-            from: asString(body.from) ?? null,
+            from: caller?.agentId ?? asString(body.from) ?? null,
             label: asString(body.label) ?? "承認が必要な操作",
             command,
             cwd: asString(body.cwd) ?? null,

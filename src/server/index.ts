@@ -33,6 +33,7 @@ import {
   type BackendLaunchInput,
   type ControlMcpSpec,
 } from "./backends/index.ts";
+import type { StartupGateKind } from "./backends/types.ts";
 import type { PermissionMode } from "./backends/types.ts";
 import { addWorktree, removeWorktree } from "./git.ts";
 import { Supervisor, configureSupervisorSecurity } from "./supervisor.ts";
@@ -41,10 +42,19 @@ import {
   clampForSecurity,
   resolveApprovalTimeoutMs,
   resolveSecurityMode,
+  assertSecureCwd,
   secureApprovalTitle,
+  securePermissionMode,
   shellQuote,
   type ResolvedSecurityMode,
 } from "./security.ts";
+import {
+  ControlTokenStore,
+  decideSecureControlAccess,
+  setControlCaller,
+  type ControlTokenRole,
+} from "./controlAuth.ts";
+import { CONTROL_TOKEN_HEADER } from "../shared/controlToken.ts";
 import {
   loadFixedEbiReport,
   supervisorEngineFrom,
@@ -107,7 +117,11 @@ import {
   recordSuccess,
   delay,
   FAILURE_DELAY_MS,
+  SessionStore,
+  DEFAULT_SESSION_TTL_MS,
+  isHttpsRequest,
 } from "./auth.ts";
+import { randomBytes } from "node:crypto";
 import {
   type ClientMessage,
   type ServerMessage,
@@ -239,7 +253,11 @@ function extraArgsForBackend(id: BackendId): string[] {
  * （dev = tsx で src、本番 = node で dist）。
  * EBI_ID をここで焼くのは、codex では pty env 継承だけに頼れないため（PoC の起動形も同じ）。
  */
-function controlMcpSpecFor(mcpRole: McpConfigRole, agentId: string): ControlMcpSpec {
+function controlMcpSpecFor(
+  mcpRole: McpConfigRole,
+  agentId: string,
+  controlToken: string | null = null,
+): ControlMcpSpec {
   const root = process.cwd();
   // dev（src 起点）でも `npx tsx` ではなく **同じ node バイナリ ＋ tsx ローダ**で起動する。
   // npx は解決に数秒かかり、codex の MCP 起動待ちに間に合わずツールが使えないまま
@@ -263,6 +281,8 @@ function controlMcpSpecFor(mcpRole: McpConfigRole, agentId: string): ControlMcpS
       EBI_ID: agentId,
       // channel 注入非対応の backend は PTY 注入で受けるため、購読ループは回さない。
       EBI_NOTIFY_SUBSCRIBE: "off",
+      // セキュアモードのエビごとのトークン（codex は pty env を MCP へ継承しないため引数に焼く）。
+      ...(controlToken ? { EBI_CONTROL_TOKEN: controlToken } : {}),
     },
   };
 }
@@ -325,6 +345,46 @@ if (IS_SECURE) {
 }
 configureSupervisorSecurity(SECURITY.mode, IS_SECURE ? SECURE_SETTINGS_PATH : null);
 
+/** secure で自動応答しない起動ゲート（workspace trust 確認。dev channels 警告は従来どおり自動応答）。 */
+const SECURE_MANUAL_GATES: readonly StartupGateKind[] = ["trust"];
+
+/**
+ * secure のログインセッション（Cookie には共有トークンではなくセッション ID を入れる・既定 12 時間）。
+ * standard では使わない（従来どおり Cookie にトークン・約 400 日）。
+ */
+const SESSION_TTL_MS = Number(process.env.EBI_SESSION_TTL_MS) > 0
+  ? Number(process.env.EBI_SESSION_TTL_MS)
+  : DEFAULT_SESSION_TTL_MS;
+const loginSessions = new SessionStore(SESSION_TTL_MS);
+const secureAuth = IS_SECURE ? { sessions: loginSessions } : null;
+
+/**
+ * secure で付けるセキュリティヘッダ（静的配信とログイン画面）。nonce はログイン画面の inline 用。
+ * UI は Vite のビルド成果物（外部 script）で、xterm が style 属性を使うため style だけ unsafe-inline。
+ */
+function securityHeaders(nonce?: string): Record<string, string> {
+  if (!IS_SECURE) return {};
+  const script = nonce ? `'self' 'nonce-${nonce}'` : "'self'";
+  const style = nonce ? `'self' 'unsafe-inline' 'nonce-${nonce}'` : "'self' 'unsafe-inline'";
+  return {
+    "Content-Security-Policy":
+      `default-src 'self'; script-src ${script}; style-src ${style}; img-src 'self' data: blob:; ` +
+      `connect-src 'self' ws: wss:; font-src 'self' data:; object-src 'none'; base-uri 'none'; ` +
+      `frame-ancestors 'none'; form-action 'self'`,
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+  };
+}
+
+/** 制御 API のエビごとのトークン（secure のときだけ発行・照合する）。 */
+const controlTokens = new ControlTokenStore();
+
+/** secure ならトークンを発行して env 断片を返す（standard では空＝従来どおり）。 */
+function controlTokenEnv(agentId: string, role: ControlTokenRole): Record<string, string> {
+  return IS_SECURE ? { EBI_CONTROL_TOKEN: controlTokens.issue(agentId, role) } : {};
+}
+
 /**
  * セキュアモードの締め付け（security.ts の clampForSecurity）を掛ける薄い口。
  * backend は「実際に起動するコマンドの方言」（bash 等のスタブは null＝引数に触らない）。
@@ -366,7 +426,26 @@ function applySecurityToFixedSpec(spec: FixedEbiSpec): FixedEbiSpec {
     console.warn(`[ebi-team] [secure] master の頭脳 ${spec.brain} には secure 設定（--settings）を渡せません`);
   }
   const extraArgs = isChat ? secureClamp(spec.id, chatBackend, spec.extraArgs) : spec.extraArgs;
-  return { ...spec, extraArgs, launch: { ...spec.launch, args, secureEnv: true } };
+  return {
+    ...spec,
+    extraArgs,
+    launch: { ...spec.launch, args, secureEnv: true, manualGates: SECURE_MANUAL_GATES },
+  };
+}
+
+/**
+ * 固定エビへ制御 API のトークンを配る（secure のときだけ）。master は master、supervisor は engineer、
+ * ボスが config で足した固定エビ（範囲外）は fixed（全許可＝今のまま使える）。
+ * 再起動しても同じトークンを使う（spec.launch.env に載せるため）。
+ */
+function withControlToken(spec: FixedEbiSpec): FixedEbiSpec {
+  if (!IS_SECURE) return spec;
+  const role: ControlTokenRole =
+    spec.kind === "master" ? "master" : spec.kind === "supervisor" ? "engineer" : "fixed";
+  return {
+    ...spec,
+    launch: { ...spec.launch, env: { ...(spec.launch.env ?? {}), ...controlTokenEnv(spec.id, role) } },
+  };
 }
 
 const spawnConfig: SpawnConfig = {
@@ -581,6 +660,7 @@ async function startMasterChatSession(spec: FixedEbiSpec): Promise<void> {
     mcpConfigPath: hasManualMcp ? null : ROLE_MCP_CONFIG.master,
     extraArgs: spec.extraArgs,
     secureEnv: spec.launch.secureEnv === true,
+    extraEnv: spec.launch.env ?? {},
     logPath: MASTER_CHAT_LOG_PATH,
     handlers: {
       onEvent: (id, envelope) => {
@@ -702,6 +782,8 @@ const handlers: AgentHandlers = {
     // （remove で Agent が消える前に控える）。
     const managed = fixedEbi.manages(id);
     registry.remove(id);
+    // 動的エビのトークンは終了で無効にする（固定エビは再起動で同じものを使う）。
+    if (!managed) controlTokens.revoke(id);
     // 静かな故障の作り直し用に控えた spawn 引数も破棄する（作り直し経路は remove の前に
     // 自分で取り出して delete 済みなので、ここで消えるのは通常終了ぶんだけ）。
     ackRespawnParams.delete(id);
@@ -944,6 +1026,13 @@ const httpServer = createServer(async (req, res) => {
   // ---- ログイン導線（認証ゲートより前・常に到達可能）----
   // GET /login: トークン入力ページを返す。POST /login: 照合して Cookie を発行する。
   if (urlPath === "/login" && (req.method ?? "GET") === "GET") {
+    if (IS_SECURE) {
+      // secure: トークンを localStorage に残さない・inline の script/style は nonce で許可する。
+      const nonce = randomBytes(16).toString("base64");
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", ...securityHeaders(nonce) });
+      res.end(loginPageHtml({ rememberToken: false, nonce }));
+      return;
+    }
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(loginPageHtml());
     return;
@@ -972,9 +1061,16 @@ const httpServer = createServer(async (req, res) => {
     // （非 loopback は安全側デフォルトで拒否のため、cookie を配っても意味がない）。
     if (authConfig.token && tokenMatches(token, authConfig.token)) {
       recordSuccess(req);
+      // secure: Cookie はセッション ID（共有トークンは渡さない）・短い有効期間・HTTPS なら Secure。
+      const cookie = IS_SECURE
+        ? buildAuthCookie(loginSessions.create(), {
+            maxAgeSec: Math.floor(SESSION_TTL_MS / 1000),
+            secure: isHttpsRequest(req),
+          })
+        : buildAuthCookie(authConfig.token);
       res.writeHead(200, {
         "Content-Type": "application/json; charset=utf-8",
-        "Set-Cookie": buildAuthCookie(authConfig.token),
+        "Set-Cookie": cookie,
       });
       res.end(JSON.stringify({ ok: true }));
       return;
@@ -987,7 +1083,7 @@ const httpServer = createServer(async (req, res) => {
   }
 
   // ---- 認証ゲート（loopback は常に素通り／非 loopback は token 必須）----
-  const auth = authorize(req, loopback, authConfig, url.searchParams);
+  const auth = authorize(req, loopback, authConfig, url.searchParams, secureAuth);
   if (!auth.ok) {
     if (urlPath.startsWith("/control/")) {
       // 制御API は JSON で 401（内部 MCP からの loopback 呼びはここに来ない）。
@@ -1018,6 +1114,28 @@ const httpServer = createServer(async (req, res) => {
     }
   }
 
+  // セキュアモード: 制御 API はエビごとのトークンで認証し、役割でエンドポイントを絞る。
+  // 非 loopback で EBI_AUTH_TOKEN 認証を通った呼び出し（ボスのリモート UI / API）は従来どおり。
+  if (IS_SECURE && urlPath.startsWith("/control/")) {
+    const header = req.headers[CONTROL_TOKEN_HEADER];
+    const caller = controlTokens.resolve(typeof header === "string" ? header : null);
+    const site = req.headers["sec-fetch-site"];
+    const verdict = decideSecureControlAccess({
+      method: req.method ?? "GET",
+      pathname: urlPath,
+      caller,
+      browser: isSameOriginBrowser(req) || site === "same-origin",
+      remoteAuthed: !loopback,
+    });
+    if (!verdict.ok) {
+      console.warn(`[ebi-team] [secure] 制御API を拒否: ${req.method} ${urlPath}（${caller?.agentId ?? "トークン無し"}）`);
+      res.writeHead(verdict.status, { "Content-Type": "application/json; charset=utf-8" });
+      res.end(JSON.stringify({ error: verdict.error }));
+      return;
+    }
+    if (caller) setControlCaller(req, caller);
+  }
+
   // 制御API（/control/*）を最優先で処理する。該当すれば静的配信へは進まない。
   if (await controlApi(req, res, urlPath, url.searchParams)) return;
   let filePath = join(CLIENT_DIST, normalize(urlPath === "/" ? "/index.html" : urlPath));
@@ -1029,7 +1147,10 @@ const httpServer = createServer(async (req, res) => {
   }
   try {
     const body = await readFile(filePath);
-    res.writeHead(200, { "Content-Type": MIME[extname(filePath)] ?? "application/octet-stream" });
+    res.writeHead(200, {
+      "Content-Type": MIME[extname(filePath)] ?? "application/octet-stream",
+      ...securityHeaders(),
+    });
     res.end(body);
   } catch {
     // SPA フォールバック（ビルド未実施でも dev は Vite を使うので問題なし）。
@@ -1049,7 +1170,7 @@ const wss = new WebSocketServer({
     const req = info.req;
     const loopback = isTrustedLocal(req);
     const query = new URL(req.url ?? "/ws", "http://127.0.0.1").searchParams;
-    const auth = authorize(req, loopback, authConfig, query);
+    const auth = authorize(req, loopback, authConfig, query, secureAuth);
     if (!auth.ok) {
       cb(false, 401, "Unauthorized");
       return;
@@ -1500,9 +1621,14 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   }
 
   // 適用優先度: 明示指定 > 役割既定 > サーバ既定。
-  const permissionMode = params.permissionMode
-    ? validatePermissionMode(params.permissionMode)
-    : (role?.permissionMode ?? DEFAULT_PERMISSION_MODE);
+  // セキュアモードでは、config で明示されていない bypassPermissions（組込み engineer の既定）を
+  // auto に下げる（securePermissionMode）。standard は従来どおり。
+  const permissionMode = securePermissionMode(SECURITY.mode, {
+    requested: params.permissionMode ? validatePermissionMode(params.permissionMode) : null,
+    roleMode: role?.permissionMode ?? null,
+    roleExplicit: role?.permissionModeExplicit === true,
+    fallback: DEFAULT_PERMISSION_MODE,
+  });
   const appendSystemPrompt = params.appendSystemPrompt ?? role?.appendSystemPrompt ?? null;
 
   // バックエンド解決: spawn 引数 > 役割既定（EbiRole.backend）> config.defaultBackend >
@@ -1520,6 +1646,12 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   // セキュアモード: 緩める指定（明示の bypassPermissions）と gemini の書き込み役は、
   // id を予約する前にここで弾く（制御 API / MCP には 400 で理由が返る）。
   secureClamp("spawn", backendId, [], { requested: params.permissionMode ?? null, permissionMode });
+  // セキュアモード: エビの cwd（と worktree の元 repo）は許可ルート（EBI_VIEWER_ROOTS）配下に限る。
+  assertSecureCwd(
+    SECURITY.mode,
+    params.repoPath && params.repoPath.trim() ? [cwd, params.repoPath.trim()] : [cwd],
+    viewerRegistry.getRoots(),
+  );
 
   // モデル名の語彙は backend ごとに別物（claude の "opus"/"sonnet" は codex では通らず、
   // ChatGPT アカウントでは `The 'sonnet' model is not supported` で毎ターン 400 になる）。
@@ -1587,7 +1719,12 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   // - 全エビ共通: statusLine スクリプトがこの id で usage を /control/usage へ POST し、
   //   どのエビの cost/context かを識別できるようにする（ダッシュボード）。
   // command 種別に関わらず注入してよい（bash テストでも env 継承の確認ができる）。
-  const launchEnv = { EBI_ID: agentId };
+  // セキュアモード: 制御 API のエビごとのトークン（engineer 権限）。制御 MCP・hook が送る。
+  const controlToken = IS_SECURE ? controlTokens.issue(agentId, "engineer") : null;
+  const launchEnv: Record<string, string> = {
+    EBI_ID: agentId,
+    ...(controlToken ? { EBI_CONTROL_TOKEN: controlToken } : {}),
+  };
   const effortNote = isClaudeLaunch ? describeEffort(resolvedEffort) : null;
   if (effortNote) console.log(`[ebi-team] [${agentId}] ${effortNote}`);
 
@@ -1601,7 +1738,7 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     permissionMode,
     systemPrompt: appendSystemPrompt,
     mcpConfigPath,
-    controlMcp: role ? controlMcpSpecFor(role.mcpRole, agentId) : null,
+    controlMcp: role ? controlMcpSpecFor(role.mcpRole, agentId, controlToken) : null,
     // フォルダ信頼ゲートを出させないために宣言するディレクトリ（codex のみ使用）。
     trustPaths,
     notifyMode: isNotifyMode(),
@@ -1645,6 +1782,7 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
       // 役割別の ACK 監視窓（imagegen のように 1 ターンが長い役割で誤 respawn を避ける）。
       ackWatchMs: role?.ackWatchMs ?? null,
       secureEnv: IS_SECURE,
+      ...(IS_SECURE ? { manualGates: SECURE_MANUAL_GATES } : {}),
     };
     const agent = registry.spawn(cwd, handlers, { id: agentId, kind: params.kind, role: role?.id, launch });
     watchEarlyExit(agent, backend, params);
@@ -1678,6 +1816,7 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     initialInject: initialInjectFor(command, input),
     ackWatchMs: role?.ackWatchMs ?? null,
     secureEnv: IS_SECURE,
+    ...(IS_SECURE ? { manualGates: SECURE_MANUAL_GATES } : {}),
   };
   const agent = registry.spawn(wt.worktreePath, handlers, {
     id: agentId,
@@ -2115,7 +2254,7 @@ async function startFixedEbi(): Promise<void> {
         process.env.EBI_MASTER_UI,
       );
       try {
-        specs.push(applySecurityToFixedSpec(base));
+        specs.push(withControlToken(applySecurityToFixedSpec(base)));
       } catch (err) {
         console.warn(`[ebi-team] 固定エビ ${s.id} を起動対象から外しました: ${(err as Error).message}`);
       }

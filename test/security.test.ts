@@ -59,6 +59,7 @@ test("秘密の env を抜く（EBI_AUTH_TOKEN・CLOUDFLARE_*・*_TOKEN 等）�
     STRIPE_SECRET_KEY: "s6",
     DISCORD_WEBHOOK_URL: "s7",
     DATABASE_URL: "s8",
+    EMDASH_PAT: "s9",
     CLAUDE_CODE_OAUTH_TOKEN: "keep",
     OPENAI_API_KEY: "keep2",
   });
@@ -70,7 +71,7 @@ test("秘密の env を抜く（EBI_AUTH_TOKEN・CLOUDFLARE_*・*_TOKEN 等）�
     "OPENAI_API_KEY",
     "PATH",
   ]);
-  assert.equal(dropped.length, 8);
+  assert.equal(dropped.length, 9);
   assert.ok(!JSON.stringify(dropped).includes("s1"));
 });
 
@@ -486,4 +487,222 @@ test("hook: 承認サーバに届かないときは deny に倒す（黙って�
   const d = decisionOf(await runHook(bashInput("git push"), "http://127.0.0.1:9"));
   assert.equal(d?.permissionDecision, "deny");
   assert.match(d?.permissionDecisionReason ?? "", /届かない/);
+});
+
+// ===== 追加要件（#1285）: engineer の既定権限・PermissionRequest・個別トークン・セッション・cwd =====
+
+import { securePermissionMode, isPathUnderRoots, assertSecureCwd } from "../src/server/security.ts";
+import {
+  ControlTokenStore,
+  callerMayActAs,
+  decideSecureControlAccess,
+} from "../src/server/controlAuth.ts";
+import {
+  SessionStore,
+  authorize,
+  buildAuthCookie,
+  isHttpsRequest,
+  loginPageHtml,
+} from "../src/server/auth.ts";
+import { BUILTIN_ROLES, registerCustomRoles, resolveRole } from "../src/server/roles.ts";
+import { CONTROL_TOKEN_HEADER } from "../src/shared/controlToken.ts";
+import type { IncomingMessage } from "node:http";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+
+test("permission: secure では明示されていない bypass（組込み engineer の既定）を auto に下げる", () => {
+  const base = { requested: null, roleExplicit: false, fallback: "auto" as const };
+  assert.equal(securePermissionMode("secure", { ...base, roleMode: "bypassPermissions" }), "auto");
+  assert.equal(securePermissionMode("standard", { ...base, roleMode: "bypassPermissions" }), "bypassPermissions");
+  // config で明示した bypass は opt-in として残す
+  assert.equal(
+    securePermissionMode("secure", { ...base, roleMode: "bypassPermissions", roleExplicit: true }),
+    "bypassPermissions",
+  );
+  // 明示要求はそのまま（bypass の要求は clampForSecurity が別途拒否する）
+  assert.equal(securePermissionMode("secure", { ...base, roleMode: "bypassPermissions", requested: "plan" }), "plan");
+  assert.equal(securePermissionMode("secure", { ...base, roleMode: "acceptEdits" }), "acceptEdits");
+});
+
+test("roles: config に permissionMode を書いた役割だけ permissionModeExplicit が立つ", () => {
+  assert.equal(BUILTIN_ROLES.engineer!.permissionModeExplicit, undefined);
+  registerCustomRoles({
+    "sec-test-a": { permissionMode: "bypassPermissions" },
+    "sec-test-b": {},
+  });
+  assert.equal(resolveRole("sec-test-a")?.permissionModeExplicit, true);
+  assert.equal(resolveRole("sec-test-b")?.permissionModeExplicit, undefined);
+});
+
+test("secure 設定: 権限の確認（PermissionRequest）も同じ hook でチャット承認へ回す", () => {
+  const s = buildSecureSettings({
+    configPath: "/c.json",
+    settingsPath: SETTINGS,
+    hookScriptPath: "/h.js",
+    hookCommand: "node /h.js",
+    approvalTimeoutMs: 1000,
+  }) as { hooks: Record<string, { matcher: string; hooks: { command: string }[] }[]> };
+  assert.equal(s.hooks.PermissionRequest?.[0]?.matcher, "*");
+  assert.equal(s.hooks.PermissionRequest?.[0]?.hooks[0]?.command, "node /h.js");
+});
+
+test("制御 API: engineer のトークンでは spawn / inject / send / kill を拒否し、配送の足回りは通す", () => {
+  const eng = { agentId: "engineer-1", role: "engineer" as const };
+  const v = (method: string, pathname: string, caller: typeof eng | null, extra?: Partial<{ browser: boolean; remoteAuthed: boolean }>) =>
+    decideSecureControlAccess({ method, pathname, caller, browser: false, remoteAuthed: false, ...extra });
+  for (const p of ["/control/spawn", "/control/inject", "/control/send", "/control/kill", "/control/todo-add", "/control/open-viewer"]) {
+    const r = v("POST", p, eng);
+    assert.equal(r.ok, false, p);
+    assert.equal(!r.ok && r.status, 403, p);
+  }
+  for (const [m, p] of [
+    ["POST", "/control/reverse-inject"],
+    ["GET", "/control/subscribe"],
+    ["POST", "/control/ack"],
+    ["GET", "/control/agents"],
+    ["POST", "/control/secure-approval"],
+  ] as const) {
+    assert.equal(v(m, p, eng).ok, true, p);
+  }
+  // master / fixed（範囲外の固定エビ）は全部通る
+  assert.equal(v("POST", "/control/spawn", { agentId: "master", role: "master" } as never).ok, true);
+  assert.equal(v("POST", "/control/inject", { agentId: "minaebi", role: "fixed" } as never).ok, true);
+  // トークン無し: statusLine の usage だけ通す・他は 401
+  assert.equal(v("POST", "/control/usage", null).ok, true);
+  const no = v("POST", "/control/spawn", null);
+  assert.equal(!no.ok && no.status, 401);
+  // ボスのブラウザは画像・添付だけトークン無しで通す
+  assert.equal(v("GET", "/control/viewer-file", null, { browser: true }).ok, true);
+  assert.equal(v("POST", "/control/spawn", null, { browser: true }).ok, false);
+  // 非 loopback で EBI_AUTH_TOKEN 認証済み（ボスのリモート）は従来どおり
+  assert.equal(v("POST", "/control/spawn", null, { remoteAuthed: true }).ok, true);
+});
+
+test("制御 API: engineer は自分の id でしか名乗れない・トークンは発行し直すと古いものが無効", () => {
+  const eng = { agentId: "engineer-1", role: "engineer" as const };
+  assert.equal(callerMayActAs(eng, "engineer-1"), true);
+  assert.equal(callerMayActAs(eng, "master"), false);
+  assert.equal(callerMayActAs({ agentId: "master", role: "master" }, "engineer-9"), true);
+  assert.equal(callerMayActAs(null, "anyone"), true);
+  const store = new ControlTokenStore();
+  const t1 = store.issue("engineer-1", "engineer");
+  assert.deepEqual(store.resolve(t1), eng);
+  const t2 = store.issue("engineer-1", "engineer");
+  assert.equal(store.resolve(t1), null);
+  assert.deepEqual(store.resolve(t2), eng);
+  store.revoke("engineer-1");
+  assert.equal(store.resolve(t2), null);
+  assert.equal(store.resolve(""), null);
+});
+
+function fakeReq(headers: Record<string, string>, encrypted = false): IncomingMessage {
+  return { headers, socket: { remoteAddress: "100.64.0.2", encrypted } } as unknown as IncomingMessage;
+}
+
+test("認証: secure の Cookie はセッション ID だけ受け、共有トークンそのもの・?token= は受けない", () => {
+  const config = { token: "shared-secret" };
+  let now = 1000;
+  const sessions = new SessionStore(60_000, () => now);
+  const sid = sessions.create();
+  const secure = { sessions };
+  assert.equal(authorize(fakeReq({ cookie: `ebi_auth=${sid}` }), false, config, undefined, secure).ok, true);
+  assert.equal(authorize(fakeReq({ cookie: "ebi_auth=shared-secret" }), false, config, undefined, secure).ok, false);
+  assert.equal(
+    authorize(fakeReq({}), false, config, new URLSearchParams({ token: "shared-secret" }), secure).ok,
+    false,
+  );
+  assert.equal(authorize(fakeReq({ authorization: "Bearer shared-secret" }), false, config, undefined, secure).ok, true);
+  // 有効期限切れ
+  now += 60_001;
+  assert.equal(authorize(fakeReq({ cookie: `ebi_auth=${sid}` }), false, config, undefined, secure).ok, false);
+  // standard は従来どおり（Cookie にトークン・?token= 可）
+  assert.equal(authorize(fakeReq({ cookie: "ebi_auth=shared-secret" }), false, config).ok, true);
+  assert.equal(authorize(fakeReq({}), false, config, new URLSearchParams({ token: "shared-secret" })).ok, true);
+});
+
+test("認証: secure の Cookie は短い Max-Age・HTTPS なら Secure。ログイン画面は localStorage に残さない", () => {
+  assert.match(buildAuthCookie("sid", { maxAgeSec: 43200, secure: true }), /Max-Age=43200; Secure$/);
+  assert.doesNotMatch(buildAuthCookie("tok"), /Secure/);
+  assert.equal(isHttpsRequest(fakeReq({ "x-forwarded-proto": "https" })), true);
+  assert.equal(isHttpsRequest(fakeReq({}, true)), true);
+  assert.equal(isHttpsRequest(fakeReq({})), false);
+  const securePage = loginPageHtml({ rememberToken: false, nonce: "abc" });
+  assert.doesNotMatch(securePage, /localStorage\.setItem/);
+  assert.match(securePage, /localStorage\.removeItem/);
+  assert.match(securePage, /<script nonce="abc">/);
+  assert.match(loginPageHtml(), /localStorage\.setItem/);
+});
+
+test("cwd: secure では許可ルートの外（symlink 越しを含む）を拒否する", () => {
+  const root = mkdtempSync(join(tmpdir(), "ebi-sec-root-"));
+  const outside = mkdtempSync(join(tmpdir(), "ebi-sec-out-"));
+  try {
+    mkdirSync(join(root, "repo"));
+    symlinkSync(outside, join(root, "link"));
+    assert.equal(isPathUnderRoots(join(root, "repo"), [root]), true);
+    assert.equal(isPathUnderRoots(root, [root]), true);
+    assert.equal(isPathUnderRoots(outside, [root]), false);
+    assert.equal(isPathUnderRoots(join(root, "link"), [root]), false);
+    assert.equal(isPathUnderRoots(join(root, "..", "x"), [root]), false);
+    assert.throws(() => assertSecureCwd("secure", [outside], [root]), SecureModeRejection);
+    assertSecureCwd("standard", [outside], [root]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+function permissionInput(tool: string, toolInput: unknown): unknown {
+  return { hook_event_name: "PermissionRequest", tool_name: tool, tool_input: toolInput, cwd: "/w", permission_suggestions: [] };
+}
+
+function prDecision(out: string): { behavior: string; message?: string } | null {
+  if (!out.trim()) return null;
+  return (JSON.parse(out) as { hookSpecificOutput: { hookEventName: string; decision: { behavior: string; message?: string } } })
+    .hookSpecificOutput.decision;
+}
+
+test("hook: 権限の確認（PermissionRequest）はボスの決定に従い、トークンを付けて送る", async () => {
+  let decision: unknown = { behavior: "allow" };
+  const seen: unknown[] = [];
+  await withControl(
+    async (req) => {
+      seen.push(req);
+      return decision;
+    },
+    async (url) => {
+      const a = prDecision(await runHook(permissionInput("Bash", { command: "python3 x.py" }), url, { EBI_CONTROL_TOKEN: "tok-1" }));
+      assert.equal(a?.behavior, "allow");
+      decision = { behavior: "deny", message: "ボスが拒否しました" };
+      const b = prDecision(await runHook(permissionInput("Edit", { file_path: "/w/a.ts" }), url));
+      assert.equal(b?.behavior, "deny");
+      assert.match(b?.message ?? "", /ボスが拒否しました/);
+      // AskUserQuestion は素通し（master の「ボスに聞く」を壊さない）
+      assert.equal(prDecision(await runHook(permissionInput("AskUserQuestion", { questions: [] }), url)), null);
+    },
+  );
+  assert.equal(seen.length, 2);
+  assert.equal((seen[0] as { label: string }).label, "権限の確認: Bash");
+  assert.equal((seen[0] as { command: string }).command, "python3 x.py");
+  assert.equal((seen[1] as { command: string }).command, "Edit: /w/a.ts");
+});
+
+test("hook: EBI_CONTROL_TOKEN を x-ebi-control-token ヘッダで送る", async () => {
+  const headers: string[] = [];
+  const server = createServer((req, res) => {
+    headers.push(String(req.headers[CONTROL_TOKEN_HEADER] ?? ""));
+    req.resume();
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ behavior: "allow" }));
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    await runHook(bashInput("git push"), `http://127.0.0.1:${port}`, { EBI_CONTROL_TOKEN: "tok-xyz" });
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+  assert.deepEqual(headers, ["tok-xyz"]);
 });

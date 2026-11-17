@@ -389,6 +389,12 @@ export interface LaunchParams {
    * ボスが config で足した固定エビ（minaebi 等）には付けない＝範囲外。
    */
   secureEnv?: boolean;
+  /**
+   * 起動ゲートのうち**自動応答しない**種別（セキュアモードの "trust"）。
+   * 検知したら応答を送らず、ボスに UI のターミナルで答えてもらう旨を notice で出す。
+   * dev channels 警告の自動応答とは分けて扱う（そちらは従来どおり許可リスト限定で自動応答する）。
+   */
+  manualGates?: readonly StartupGateKind[];
 }
 
 /** Agent からのイベントを購読するためのコールバック束。 */
@@ -654,8 +660,10 @@ export class Agent {
     // inlineTui の on/off は backend.buildEnv() へ渡して backend に判断させる
     // （claude は off なら空を返す＝従来と同一。gemini の system settings パスのように
     //   「TUI 描画ではなく起動の必須条件」である env まで落とさないため）。
-    const builtEnv = buildSpawnEnv(
-      process.env,
+    // secure: 秘密の値は「親から継承する env」からだけ抜く（ebi-team が意図して渡す launch.env の
+    // EBI_CONTROL_TOKEN 等は残す）。
+    const spawnEnv = buildSpawnEnv(
+      launch.secureEnv ? stripSecretEnv(process.env).env : process.env,
       launch.env,
       true,
       backend.buildEnv({
@@ -666,7 +674,6 @@ export class Agent {
       }),
       backend.envDenyList,
     );
-    const spawnEnv = launch.secureEnv ? stripSecretEnv(builtEnv).env : builtEnv;
     try {
       this.proc = pty.spawn(launch.command, launch.args, {
         name: "xterm-color",
@@ -1124,6 +1131,16 @@ export class Agent {
     if (gate === null || this.answeredGates.has(gate)) return;
 
     this.answeredGates.add(gate);
+    if (this.launch.manualGates?.includes(gate)) {
+      // セキュアモード: workspace trust 確認は自動で承認しない（ボスが UI で答える）。
+      this.gateScanBuffer = "";
+      const msg =
+        `セキュアモードのため起動時の確認（${gate === "trust" ? "workspace trust" : gate}）は自動で承認しません。` +
+        `このエビのターミナルで確認して答えてください`;
+      console.log(`[ebi-team] [${this.id}] ${msg}`);
+      this.handlers.onNotice(this.id, msg);
+      return;
+    }
     this.proc.write(spec.answerFor(gate));
     this.gateScanBuffer = ""; // 次のダイアログ検知のため一旦クリア
     const msg = spec.noticeFor(gate);

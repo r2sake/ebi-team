@@ -63,6 +63,8 @@ export interface MasterBrainStartOptions {
   secureEnv?: boolean;
   /** master の agent id（secure で EBI_ID として渡す）。 */
   agentId?: string | null;
+  /** 子 env に足す値（secure の EBI_CONTROL_TOKEN など）。秘密抜きの後に足す。 */
+  extraEnv?: Record<string, string>;
 }
 
 /** 文脈・トークンの観測値。 */

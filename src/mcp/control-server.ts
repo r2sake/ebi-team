@@ -38,8 +38,12 @@ import { loadRawCustomRoles } from "../server/config.ts";
 import { deliveryText } from "../shared/deliveryTag.ts";
 import { resolveConfigPath } from "./configPath.ts";
 import { postLongPoll } from "./longPoll.ts";
+import { CONTROL_TOKEN_HEADER } from "../shared/controlToken.ts";
 
 const CONTROL_URL = (process.env.EBI_CONTROL_URL ?? "http://127.0.0.1:8787").replace(/\/$/, "");
+// セキュアモードでサーバがエビごとに発行するトークン（無ければ付けない＝standard と同じ外形）。
+const CONTROL_TOKEN = process.env.EBI_CONTROL_TOKEN ?? "";
+const TOKEN_HEADERS: Record<string, string> = CONTROL_TOKEN ? { [CONTROL_TOKEN_HEADER]: CONTROL_TOKEN } : {};
 
 // role の選択肢と検証に、サーバ側（index.ts）が起動時にマージするのと同じカスタム役割を
 // 反映させるため、ここでも registerCustomRoles を「ツールスキーマを組み立てる前」に呼ぶ。
@@ -173,7 +177,8 @@ async function callControl(
   try {
     const res = await fetch(`${CONTROL_URL}${path}`, {
       method,
-      headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+      headers:
+        body !== undefined ? { ...TOKEN_HEADERS, "Content-Type": "application/json" } : { ...TOKEN_HEADERS },
       body: body !== undefined ? JSON.stringify(body) : undefined,
       ...(signal ? { signal } : {}),
     });
@@ -345,7 +350,7 @@ server.tool(
     const path = "/control/chat-permission";
     const payload = { tool_name, input, tool_use_id };
     const r =
-      (await postLongPoll(`${CONTROL_URL}${path}`, payload, extra?.signal)) ??
+      (await postLongPoll(`${CONTROL_URL}${path}`, payload, extra?.signal, TOKEN_HEADERS)) ??
       (await callControl("POST", path, payload, extra?.signal));
     if (!r.ok) {
       // 承認 UI へ到達できないときは**拒否**に倒す（黙って実行させない）。
@@ -723,6 +728,7 @@ async function subscribeLoop(): Promise<void> {
         token: SUBSCRIBER_TOKEN,
       });
       const res = await fetch(`${CONTROL_URL}/control/subscribe?${qs.toString()}`, {
+        headers: { ...TOKEN_HEADERS },
         signal: AbortSignal.timeout(SUBSCRIBE_TIMEOUT_MS + 5000),
       });
       if (res.status === 409) {
@@ -773,7 +779,7 @@ async function subscribeLoop(): Promise<void> {
       if (ackIds.length > 0) {
         void fetch(`${CONTROL_URL}/control/ack`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { ...TOKEN_HEADERS, "Content-Type": "application/json" },
           body: JSON.stringify({ id: EBI_ID, ids: ackIds }),
         }).catch(() => {});
       }

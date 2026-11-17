@@ -14,6 +14,8 @@
 //
 // このファイルは I/O を持たない純関数だけを置く（設定ファイルの書き出しは index.ts）。
 
+import { realpathSync } from "node:fs";
+import { relative, resolve, isAbsolute } from "node:path";
 import type { BackendId, PermissionMode } from "./backends/types.ts";
 
 /** セキュリティモード。standard = 従来どおり / secure = 締め付け。 */
@@ -77,6 +79,7 @@ export const SECRET_ENV_PATTERNS: readonly RegExp[] = [
   /_PRIVATE_KEY$/,
   /_PASSWORD$/,
   /_PASSWD$/,
+  /_PAT$/,
   /_WEBHOOK_URL$/,
   /_DATABASE_URL$/,
 ];
@@ -117,6 +120,30 @@ export function stripSecretEnv<T extends string | undefined>(
     out[k] = v;
   }
   return { env: out, dropped };
+}
+
+// ===== permission-mode の既定 =====
+
+/**
+ * セキュアモードでの permissionMode の決め方（純関数）。standard では役割既定をそのまま返す。
+ *
+ * - 明示の要求（制御 API / MCP の permissionMode）はそのまま使う（bypass は clampForSecurity が拒否）
+ * - 役割既定が bypassPermissions で、それがボスの config で**明示されていない**（組込み engineer の既定）
+ *   なら auto に下げる。auto は実機で権限確認がほぼ出ず（acceptEdits は 7 コマンド中 2 件で確認が出た）、
+ *   出た確認は PermissionRequest hook でチャットの承認バブルへ回る
+ * - config に bypassPermissions を明示した役割は opt-in として残す
+ */
+export const SECURE_DEFAULT_PERMISSION_MODE: PermissionMode = "auto";
+
+export function securePermissionMode(
+  mode: SecurityMode,
+  opts: { requested: PermissionMode | null; roleMode: PermissionMode | null; roleExplicit: boolean; fallback: PermissionMode },
+): PermissionMode {
+  if (opts.requested) return opts.requested;
+  const base = opts.roleMode ?? opts.fallback;
+  if (mode !== "secure") return base;
+  if (base === "bypassPermissions" && !opts.roleExplicit) return SECURE_DEFAULT_PERMISSION_MODE;
+  return base;
 }
 
 // ===== 起動引数の締め付け =====
@@ -292,6 +319,7 @@ export function secretReadRules(): string[] {
  * secure 設定（claude の --settings に渡す JSON）を組み立てる純関数。
  * - permissions.deny: 秘密の Read・設定ファイルの Edit・WebFetch・外部送信
  * - hooks.PreToolUse(Bash): git push・本番の操作をチャット承認へ回す／秘密への言及を止める
+ * - hooks.PermissionRequest: 権限の確認をチャット承認へ回す
  */
 export function buildSecureSettings(input: SecureSettingsInput): Record<string, unknown> {
   const deny = [
@@ -312,22 +340,20 @@ export function buildSecureSettings(input: SecureSettingsInput): Record<string, 
     "mcp__discord",
     "mcp__slack",
   ];
+  const hook = {
+    type: "command",
+    command: input.hookCommand,
+    // 秒。承認待ち（自動拒否まで）＋余裕。ここで切れると hook エラーになる。
+    timeout: Math.ceil(input.approvalTimeoutMs / 1000) + 60,
+  };
   return {
     permissions: { deny },
     hooks: {
-      PreToolUse: [
-        {
-          matcher: "Bash",
-          hooks: [
-            {
-              type: "command",
-              command: input.hookCommand,
-              // 秒。承認待ち（自動拒否まで）＋余裕。ここで切れると hook エラーになる。
-              timeout: Math.ceil(input.approvalTimeoutMs / 1000) + 60,
-            },
-          ],
-        },
-      ],
+      // git push・本番の操作をチャット承認へ／秘密への言及・外部送信を止める
+      PreToolUse: [{ matcher: "Bash", hooks: [hook] }],
+      // 権限の確認（auto / acceptEdits で出るダイアログ）をチャットの承認バブルへ回す。
+      // AskUserQuestion は hook 側で素通しする（master の「ボスに聞く」を壊さない）。
+      PermissionRequest: [{ matcher: "*", hooks: [hook] }],
     },
   };
 }
@@ -349,4 +375,36 @@ export function resolveApprovalTimeoutMs(raw: string | undefined): number {
 /** 承認バブルに出すツール名（「承認が必要: <これ>」）。 */
 export function secureApprovalTitle(from: string | null, label: string): string {
   return `${label}（${from ?? "不明なエビ"}・セキュアモード）`;
+}
+
+// ===== エビの cwd を許可ルート配下に限る =====
+
+/** 実在すれば realpath（symlink 越しの脱出を防ぐ）、無ければ resolve しただけの絶対パス。 */
+function realOrResolved(p: string): string {
+  const abs = resolve(p);
+  try {
+    return realpathSync(abs);
+  } catch {
+    return abs;
+  }
+}
+
+/** path が roots のどれかの配下（同一を含む）か。純関数寄り（realpath だけ fs を見る）。 */
+export function isPathUnderRoots(path: string, roots: readonly string[]): boolean {
+  const target = realOrResolved(path);
+  return roots.some((root) => {
+    const r = realOrResolved(root);
+    const rel = relative(r, target);
+    return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  });
+}
+
+/** secure で cwd / repoPath が許可ルート外なら拒否する（viewer・ファイル編集と同じ考え方）。 */
+export function assertSecureCwd(mode: SecurityMode, paths: readonly string[], roots: readonly string[]): void {
+  if (mode !== "secure") return;
+  for (const p of paths) {
+    if (!isPathUnderRoots(p, roots)) {
+      throw new SecureModeRejection(`cwd ${p} は許可ルート（${roots.join(", ")}）の外です`);
+    }
+  }
 }

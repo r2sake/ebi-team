@@ -12,7 +12,7 @@
 // - トークン照合は定数時間比較（timingSafeEqual）。失敗には軽いレート制限＋固定ディレイ。
 
 import type { IncomingMessage } from "node:http";
-import { timingSafeEqual } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 
 /** 認証設定。token=null は「EBI_AUTH_TOKEN 未設定」を表す。 */
 export interface AuthConfig {
@@ -134,12 +134,79 @@ export function authorize(
   loopback: boolean,
   config: AuthConfig,
   query?: URLSearchParams,
+  secure?: { sessions: SessionStore } | null,
 ): AuthOutcome {
   if (loopback) return { ok: true };
   if (!config.token) return { ok: false, reason: "no-token-config" };
+  if (secure) {
+    // セキュアモード: Cookie は共有トークンそのものではなくセッション ID だけを受ける。
+    // `?token=` は受けない（URL に秘密が残る）。API / curl 向けの Bearer は従来どおり。
+    const bearer = extractBearer(req);
+    if (bearer && tokenMatches(bearer, config.token)) return { ok: true };
+    const sid = parseCookie(req.headers["cookie"], "ebi_auth");
+    if (sid && secure.sessions.valid(sid)) return { ok: true };
+    return { ok: false, reason: "invalid-token" };
+  }
   const provided = extractToken(req, query);
   if (provided && tokenMatches(provided, config.token)) return { ok: true };
   return { ok: false, reason: "invalid-token" };
+}
+
+/** `Authorization: Bearer <token>` の値。 */
+function extractBearer(req: IncomingMessage): string | null {
+  const auth = req.headers["authorization"];
+  if (typeof auth === "string" && auth.startsWith("Bearer ")) {
+    const t = auth.slice(7).trim();
+    if (t) return t;
+  }
+  return null;
+}
+
+/** セッションの既定の有効期間（12 時間）。env EBI_SESSION_TTL_MS で変えられる。 */
+export const DEFAULT_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * セキュアモードのログインセッション（プロセス内メモリ）。
+ * Cookie に入れるのはランダムなセッション ID だけで、共有トークンはブラウザに渡さない。
+ * サーバ再起動で全セッションが切れる（再ログインが要る）。
+ */
+export class SessionStore {
+  private readonly sessions = new Map<string, number>();
+
+  constructor(
+    readonly ttlMs: number = DEFAULT_SESSION_TTL_MS,
+    private readonly now: () => number = Date.now,
+  ) {}
+
+  create(): string {
+    const sid = randomBytes(32).toString("base64url");
+    this.sessions.set(sid, this.now() + this.ttlMs);
+    this.sweep();
+    return sid;
+  }
+
+  valid(sid: string): boolean {
+    const exp = this.sessions.get(sid);
+    if (exp === undefined) return false;
+    if (exp <= this.now()) {
+      this.sessions.delete(sid);
+      return false;
+    }
+    return true;
+  }
+
+  private sweep(): void {
+    const t = this.now();
+    for (const [k, exp] of this.sessions) if (exp <= t) this.sessions.delete(k);
+  }
+}
+
+/** HTTPS 越しのリクエストか（直の TLS か、前段のプロキシが X-Forwarded-Proto: https を付けた）。 */
+export function isHttpsRequest(req: Pick<IncomingMessage, "headers" | "socket">): boolean {
+  if ((req.socket as { encrypted?: boolean } | undefined)?.encrypted) return true;
+  const proto = req.headers["x-forwarded-proto"];
+  const v = Array.isArray(proto) ? proto[0] : proto;
+  return typeof v === "string" && v.split(",")[0]!.trim().toLowerCase() === "https";
 }
 
 /**
@@ -185,12 +252,14 @@ export function tokenMatches(provided: string, expected: string): boolean {
 }
 
 /** ログイン成功時に発行する Cookie 文字列（Set-Cookie 用）。 */
-export function buildAuthCookie(token: string): string {
-  // 平文 HTTP（Tailscale の WireGuard 暗号化に依存）想定のため Secure は付けない。
+export function buildAuthCookie(token: string, opts?: { maxAgeSec?: number; secure?: boolean }): string {
+  // 既定（standard）: 平文 HTTP（Tailscale の WireGuard 暗号化に依存）想定のため Secure は付けない。
   // HttpOnly で JS からの窃取を防ぎ、SameSite=Lax で最低限の CSRF 耐性。
   // Max-Age は約 400 日（ブラウザ上限）。一度入れれば再入力不要にする。
-  const maxAge = 400 * 24 * 60 * 60;
-  return `ebi_auth=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}`;
+  // セキュアモードはセッション ID・短い Max-Age・HTTPS なら Secure を opts で渡す。
+  const maxAge = opts?.maxAgeSec ?? 400 * 24 * 60 * 60;
+  const secure = opts?.secure ? "; Secure" : "";
+  return `ebi_auth=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`;
 }
 
 // ===== 軽量レート制限（ブルートフォース対策・インメモリ）=====
@@ -255,14 +324,23 @@ export function delay(ms: number): Promise<void> {
  * Vite のマルチページビルドに依存させず、本番 Node 配信・dev いずれでも同じものを返す。
  * トークンを入力→POST /login→サーバが Cookie をセット→ "/" へ遷移、の一枚。
  */
-export function loginPageHtml(): string {
+export function loginPageHtml(opts?: { rememberToken?: boolean; nonce?: string }): string {
+  // セキュアモードではトークンを localStorage に残さない（既に残っていれば消す）。
+  const remember = opts?.rememberToken !== false;
+  const nonceAttr = opts?.nonce ? ` nonce="${opts.nonce}"` : "";
+  const loadSaved = remember
+    ? `try { var saved = localStorage.getItem("ebi_auth_token"); if (saved) t.value = saved; } catch (_) {}`
+    : `try { localStorage.removeItem("ebi_auth_token"); } catch (_) {}`;
+  const saveOnOk = remember
+    ? `try { localStorage.setItem("ebi_auth_token", t.value); } catch (_) {}`
+    : "";
   return `<!doctype html>
 <html lang="ja">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
 <title>ebi-team 🦐 ログイン</title>
-<style>
+<style${nonceAttr}>
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; }
   body {
@@ -303,13 +381,13 @@ export function loginPageHtml(): string {
     <button id="b" type="submit">ログイン</button>
     <div class="err" id="e"></div>
   </form>
-<script>
+<script${nonceAttr}>
   var f = document.getElementById("f");
   var t = document.getElementById("t");
   var b = document.getElementById("b");
   var e = document.getElementById("e");
   // 前回入力トークンの補助表示（利便性。Cookie は HttpOnly なので JS からは読めない）。
-  try { var saved = localStorage.getItem("ebi_auth_token"); if (saved) t.value = saved; } catch (_) {}
+  ${loadSaved}
   f.addEventListener("submit", function (ev) {
     ev.preventDefault();
     e.textContent = "";
@@ -320,7 +398,7 @@ export function loginPageHtml(): string {
       body: JSON.stringify({ token: t.value }),
     }).then(function (r) {
       if (r.ok) {
-        try { localStorage.setItem("ebi_auth_token", t.value); } catch (_) {}
+        ${saveOnOk}
         location.href = "/";
         return;
       }

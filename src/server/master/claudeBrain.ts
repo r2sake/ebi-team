@@ -167,7 +167,11 @@ export class ClaudeHeadlessBrain implements MasterBrain {
     const parentEnv = this.opts.parentEnv ?? process.env;
     // secure: 秘密の値を抜いてから deny list を掛ける。EBI_ID は hook（承認バブルの「誰から」）用。
     const childEnv = startOpts.secureEnv
-      ? { ...applyMasterEnvDenyList(stripSecretEnv(parentEnv).env), EBI_ID: startOpts.agentId ?? "master" }
+      ? {
+          ...applyMasterEnvDenyList(stripSecretEnv(parentEnv).env),
+          EBI_ID: startOpts.agentId ?? "master",
+          ...(startOpts.extraEnv ?? {}),
+        }
       : applyMasterEnvDenyList(parentEnv);
     const pre = evaluateMasterPreflight({ args, childEnv, parentEnv });
     if (!pre.ok) {
