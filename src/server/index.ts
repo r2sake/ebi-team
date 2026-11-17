@@ -2,6 +2,7 @@
 import { loadedEnvKeys } from "./env.ts";
 import { createServer, type IncomingMessage } from "node:http";
 import { readFile } from "node:fs/promises";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, extname, normalize } from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
@@ -32,8 +33,18 @@ import {
   type BackendLaunchInput,
   type ControlMcpSpec,
 } from "./backends/index.ts";
+import type { PermissionMode } from "./backends/types.ts";
 import { addWorktree, removeWorktree } from "./git.ts";
-import { Supervisor } from "./supervisor.ts";
+import { Supervisor, configureSupervisorSecurity } from "./supervisor.ts";
+import {
+  buildSecureSettings,
+  clampForSecurity,
+  resolveApprovalTimeoutMs,
+  resolveSecurityMode,
+  secureApprovalTitle,
+  shellQuote,
+  type ResolvedSecurityMode,
+} from "./security.ts";
 import {
   loadFixedEbiReport,
   supervisorEngineFrom,
@@ -41,6 +52,7 @@ import {
   loadDevChannelsAllowlist,
   loadBackendSettings,
   loadEffortByModel,
+  loadRawSecurityModeSync,
   validatePermissionMode,
   DEFAULT_PERMISSION_MODE,
   EMPTY_BACKEND_SETTINGS,
@@ -255,6 +267,108 @@ function controlMcpSpecFor(mcpRole: McpConfigRole, agentId: string): ControlMcpS
   };
 }
 
+// ===== セキュアモード =====
+// 起動フラグ（env EBI_SECURITY_MODE > config の securityMode > standard）で決まり、
+// **モジュール評価時に 1 回だけ**確定する定数。実行中に切り替える口は作らない
+// （動いているエビを途中で緩めない・切り替えは再起動）。中身は security.ts。
+const CONTROL_URL_INTERNAL = `http://${HOST === "0.0.0.0" || HOST === "::" ? "127.0.0.1" : HOST}:${PORT}`;
+const SECURITY: ResolvedSecurityMode = (() => {
+  let raw: unknown;
+  try {
+    raw = loadRawSecurityModeSync(CONFIG_PATH);
+  } catch (err) {
+    console.warn(`[ebi-team] securityMode を config から読めませんでした（env のみで判定）:`, (err as Error).message);
+  }
+  return resolveSecurityMode({ env: process.env.EBI_SECURITY_MODE, config: raw });
+})();
+const IS_SECURE = SECURITY.mode === "secure";
+/** claude に --settings で渡す secure 設定（起動のたびに書き直す）。 */
+const SECURE_SETTINGS_PATH =
+  process.env.EBI_SECURE_SETTINGS_PATH ?? join(process.cwd(), ".ebi-team", "secure-settings.json");
+/** 承認待ちの自動拒否までの時間（既定 10 分）。 */
+const SECURE_APPROVAL_TIMEOUT_MS = resolveApprovalTimeoutMs(process.env.EBI_SECURE_APPROVAL_TIMEOUT_MS);
+
+/**
+ * PreToolUse hook の起動コマンド（シェル経由で実行される）。
+ * dev（src 起点）は tsx ローダを**絶対パス**で渡す（hook はエビの cwd で動くため、
+ * `--import tsx` だと別リポジトリの cwd から tsx を解決できない）。
+ */
+function secureHookSpec(): { scriptPath: string; command: string } {
+  const root = process.cwd();
+  const scriptPath = RUNNING_FROM_SRC
+    ? join(root, "src/mcp/secure-hook.ts")
+    : join(root, "dist/server/mcp/secure-hook.js");
+  const argv = RUNNING_FROM_SRC
+    ? [process.execPath, "--import", import.meta.resolve("tsx"), scriptPath, "--url", CONTROL_URL_INTERNAL]
+    : [process.execPath, scriptPath, "--url", CONTROL_URL_INTERNAL];
+  return { scriptPath, command: argv.map(shellQuote).join(" ") };
+}
+
+if (SECURITY.warning) console.warn(`[ebi-team] ${SECURITY.warning}`);
+if (IS_SECURE) {
+  // secure 設定を書けないまま起動すると締め付けが効かないので、起動を止める（fail-closed）。
+  try {
+    const hook = secureHookSpec();
+    const settings = buildSecureSettings({
+      configPath: CONFIG_PATH,
+      settingsPath: SECURE_SETTINGS_PATH,
+      hookScriptPath: hook.scriptPath,
+      hookCommand: hook.command,
+      approvalTimeoutMs: SECURE_APPROVAL_TIMEOUT_MS,
+    });
+    mkdirSync(dirname(SECURE_SETTINGS_PATH), { recursive: true });
+    writeFileSync(SECURE_SETTINGS_PATH, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  } catch (err) {
+    console.error(`[ebi-team] セキュアモードの設定ファイルを書けないため起動を中止します:`, err);
+    process.exit(1);
+  }
+}
+configureSupervisorSecurity(SECURITY.mode, IS_SECURE ? SECURE_SETTINGS_PATH : null);
+
+/**
+ * セキュアモードの締め付け（security.ts の clampForSecurity）を掛ける薄い口。
+ * backend は「実際に起動するコマンドの方言」（bash 等のスタブは null＝引数に触らない）。
+ * 緩める指定・gemini の書き込み役は SecureModeRejection を投げる（制御 API は 400）。
+ */
+function secureClamp(
+  label: string,
+  backend: BackendId | null,
+  args: readonly string[],
+  opts?: { requested?: string | null; permissionMode?: PermissionMode | null },
+): string[] {
+  const r = clampForSecurity(
+    {
+      backend,
+      args,
+      requestedPermissionMode: opts?.requested ?? null,
+      permissionMode: opts?.permissionMode ?? null,
+      settingsPath: IS_SECURE ? SECURE_SETTINGS_PATH : null,
+    },
+    SECURITY.mode,
+  );
+  for (const n of r.notes) console.log(`[ebi-team] [secure] [${label}] ${n}`);
+  return r.args;
+}
+
+/**
+ * 固定エビの起動定義に secure を掛ける。対象は master / supervisor だけ。
+ * ボスが config で足した固定エビ（minaebi・errwatch 等＝kind dynamic）は範囲外で素通しする。
+ */
+function applySecurityToFixedSpec(spec: FixedEbiSpec): FixedEbiSpec {
+  if (!IS_SECURE) return spec;
+  if (spec.kind !== "master" && spec.kind !== "supervisor") return spec;
+  const ptyBackend = resolveBackend(spec.launch.command)?.id ?? null;
+  const args = secureClamp(spec.id, ptyBackend, spec.launch.args, { permissionMode: spec.permissionMode });
+  // ui:"chat" の master は extraArgs が頭脳（claude -p）の引数になる。
+  const isChat = spec.kind === "master" && spec.ui === "chat";
+  const chatBackend: BackendId | null = isChat && spec.brain === "claude" ? "claude" : null;
+  if (isChat && chatBackend === null) {
+    console.warn(`[ebi-team] [secure] master の頭脳 ${spec.brain} には secure 設定（--settings）を渡せません`);
+  }
+  const extraArgs = isChat ? secureClamp(spec.id, chatBackend, spec.extraArgs) : spec.extraArgs;
+  return { ...spec, extraArgs, launch: { ...spec.launch, args, secureEnv: true } };
+}
+
 const spawnConfig: SpawnConfig = {
   command: COMMAND,
   args: COMMAND_ARGS,
@@ -466,6 +580,7 @@ async function startMasterChatSession(spec: FixedEbiSpec): Promise<void> {
     systemPrompt: spec.launch.systemPrompt ?? null,
     mcpConfigPath: hasManualMcp ? null : ROLE_MCP_CONFIG.master,
     extraArgs: spec.extraArgs,
+    secureEnv: spec.launch.secureEnv === true,
     logPath: MASTER_CHAT_LOG_PATH,
     handlers: {
       onEvent: (id, envelope) => {
@@ -767,6 +882,44 @@ const controlApi = createControlApi({
   // ボスが UI で答えるまで resolve しない（未応答は待ち続ける・自動拒否しない）。
   // 「未応答 N 件」の再同期（孤児の破棄）。サーバ再起動なしで UI を実体へ戻す口。
   resyncChatPending: () => (masterSession ? masterSession.resyncPending() : 0),
+  requestSecureApproval: async (req, signal) => {
+    if (!IS_SECURE) return { behavior: "deny", message: "セキュアモードではありません" };
+    const session = masterSession;
+    if (!session) {
+      return {
+        behavior: "deny",
+        message: '承認バブルを出せる master（ui:"chat"）が居ないため拒否しました',
+      };
+    }
+    // 一定時間で自動拒否する。hook 側の接続断（claude の中断）でも畳む。
+    const ac = new AbortController();
+    const minutes = Math.max(1, Math.round(SECURE_APPROVAL_TIMEOUT_MS / 60_000));
+    const timer = setTimeout(
+      () => ac.abort(`${minutes} 分応答が無かったため自動で拒否しました`),
+      SECURE_APPROVAL_TIMEOUT_MS,
+    );
+    const onAbort = (): void => ac.abort("要求が取り消されました");
+    signal.addEventListener("abort", onAbort, { once: true });
+    console.log(`[ebi-team] [secure] 承認待ち: ${req.label}（${req.from ?? "不明"}）`);
+    try {
+      const decision = await session.handlePermissionRequest(
+        {
+          toolName: secureApprovalTitle(req.from, req.label),
+          input: { from: req.from, command: req.command, cwd: req.cwd },
+          // master 自身の permission_prompt と同じ tool_use_id にならないよう接頭辞を付ける。
+          toolUseId: req.toolUseId ? `secure-${req.toolUseId}` : null,
+        },
+        ac.signal,
+      );
+      console.log(
+        `[ebi-team] [secure] 承認結果: ${req.label}（${req.from ?? "不明"}）→ ${decision.behavior}`,
+      );
+      return decision.behavior === "allow" ? { behavior: "allow" } : decision;
+    } finally {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+    }
+  },
   requestChatPermission: async (req, signal) => {
     if (!masterSession) throw new Error('承認 UI は ui:"chat" の master が居るときだけ使えます');
     return masterSession.handlePermissionRequest(
@@ -922,7 +1075,7 @@ wss.on("connection", (ws, req) => {
   clients.add(ws);
   if (isSameOriginBrowser(req)) browserConnections.add(ws);
   // 接続直後にサーバ能力（監督が有効か）を送る。クライアントはこれで要約 UI の出し分けをする。
-  send(ws, { type: "capabilities", supervisor: supervisor.enabled });
+  send(ws, { type: "capabilities", supervisor: supervisor.enabled, securityMode: SECURITY.mode });
   // master が ui:"chat" なら、registry より**先に** state と直近の会話を送る。
   // クライアントは「chatState を受けた id＝chat モードの master」と判定して xterm ペインを
   // 作らない分岐に入るので、registry を先に送ると一瞬だけ PTY ペインが生えてしまう。
@@ -1133,6 +1286,12 @@ function handleClientMessage(ws: WebSocket, msg: ClientMessage): void {
       break;
     }
     case "chatAnswer": {
+      // セキュアモードでは承認・回答をボスのブラウザ（同一オリジンの UI）からだけ受ける。
+      // エビの素の WS クライアントから許可を付けられないようにする。
+      if (IS_SECURE && !browserConnections.has(ws)) {
+        send(ws, { type: "error", text: "セキュアモードでは承認はブラウザの UI からだけ行えます" });
+        break;
+      }
       const session = chatSessionFor(ws, msg.id);
       if (!session) break;
       void session
@@ -1358,6 +1517,10 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   });
   const backend = getBackend(backendId);
 
+  // セキュアモード: 緩める指定（明示の bypassPermissions）と gemini の書き込み役は、
+  // id を予約する前にここで弾く（制御 API / MCP には 400 で理由が返る）。
+  secureClamp("spawn", backendId, [], { requested: params.permissionMode ?? null, permissionMode });
+
   // モデル名の語彙は backend ごとに別物（claude の "opus"/"sonnet" は codex では通らず、
   // ChatGPT アカウントでは `The 'sonnet' model is not supported` で毎ターン 400 になる）。
   // よって役割の defaultModel（claude 語彙）は claude にだけ効かせ、非 claude では
@@ -1468,7 +1631,9 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     const input = launchInputFor([cwd]);
     const launch: LaunchParams = {
       command,
-      args: buildLaunchArgs(command, input),
+      args: secureClamp(agentId, resolveBackend(command)?.id ?? null, buildLaunchArgs(command, input), {
+        permissionMode,
+      }),
       cwd,
       model,
       env: launchEnv,
@@ -1479,6 +1644,7 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
       initialInject: initialInjectFor(command, input),
       // 役割別の ACK 監視窓（imagegen のように 1 ターンが長い役割で誤 respawn を避ける）。
       ackWatchMs: role?.ackWatchMs ?? null,
+      secureEnv: IS_SECURE,
     };
     const agent = registry.spawn(cwd, handlers, { id: agentId, kind: params.kind, role: role?.id, launch });
     watchEarlyExit(agent, backend, params);
@@ -1500,7 +1666,9 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
   const input = launchInputFor([wt.repoTop, wt.worktreePath]);
   const launch: LaunchParams = {
     command,
-    args: buildLaunchArgs(command, input),
+    args: secureClamp(agentId, resolveBackend(command)?.id ?? null, buildLaunchArgs(command, input), {
+      permissionMode,
+    }),
     cwd: wt.worktreePath,
     model,
     env: launchEnv,
@@ -1509,6 +1677,7 @@ async function spawnAgent(params: GeneralizedSpawnParams): Promise<string> {
     systemPrompt: appendSystemPrompt,
     initialInject: initialInjectFor(command, input),
     ackWatchMs: role?.ackWatchMs ?? null,
+    secureEnv: IS_SECURE,
   };
   const agent = registry.spawn(wt.worktreePath, handlers, {
     id: agentId,
@@ -1937,12 +2106,20 @@ async function startFixedEbi(): Promise<void> {
     // dev / 本番のファイル名差分をサーバ側で吸収する）。args に明示があればそちらを優先。
     // master は backend=claude に固定する（config/env で他 backend を既定にしても統括系は落とさない）。
     // env EBI_MASTER_UI で ui を上書きできる（config を書き換えずに切り戻せる口）。
-    const specs = raw.map((s) =>
-      applyMasterUiOverride(
+    // セキュアモードの締め付けは最後に掛ける（master / supervisor だけ。ユーザ拡張の固定エビは範囲外）。
+    // 締め付けで起こせない定義（gemini の書き込み役など）はその 1 体だけ外す。
+    const specs: FixedEbiSpec[] = [];
+    for (const s of raw) {
+      const base = applyMasterUiOverride(
         applyMasterBackendFailsafe(applyMasterMcpConfig(s, ROLE_MCP_CONFIG.master)),
         process.env.EBI_MASTER_UI,
-      ),
-    );
+      );
+      try {
+        specs.push(applySecurityToFixedSpec(base));
+      } catch (err) {
+        console.warn(`[ebi-team] 固定エビ ${s.id} を起動対象から外しました: ${(err as Error).message}`);
+      }
+    }
     if (specs.length === 0) {
       console.log(`[ebi-team] 固定エビ: なし（${CONFIG_PATH} 未配置または fixedEbi 空）`);
       return;
@@ -2102,6 +2279,15 @@ httpServer.listen(PORT, HOST, () => {
     console.log(`[ebi-team] .env 読み込み: ${loadedEnvKeys.length}件 (${loadedEnvKeys.join(", ")})`);
   }
   console.log(`[ebi-team] 制御API: http://${HOST}:${PORT}/control/*  (loopback 無認証 / 非loopbackはトークン必須)`);
+  if (IS_SECURE) {
+    console.log(
+      `[ebi-team] セキュリティモード: secure（${SECURITY.source}）` +
+        ` 設定=${SECURE_SETTINGS_PATH} 承認の自動拒否=${Math.round(SECURE_APPROVAL_TIMEOUT_MS / 1000)}秒` +
+        `（対象: master / supervisor / 動的エビ。config で足した固定エビは範囲外）`,
+    );
+  } else {
+    console.log(`[ebi-team] セキュリティモード: standard（EBI_SECURITY_MODE=secure で締め付け起動）`);
+  }
   if (authConfig.token) {
     console.log(`[ebi-team] 認証: EBI_AUTH_TOKEN 設定あり（非 loopback はトークン必須・/login で入力）`);
   } else if (HOST === "127.0.0.1" || HOST === "localhost") {

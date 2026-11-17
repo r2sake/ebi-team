@@ -236,6 +236,20 @@ export interface ControlDeps {
    */
   resyncChatPending: (() => number) | null;
   /**
+   * セキュアモードの承認の受け口（`POST /control/secure-approval` の実体）。
+   *
+   * PreToolUse hook（src/mcp/secure-hook.ts）が git push・本番の操作の前に叩く。ボスのチャットに
+   * 承認バブルを出し、**ボスが UI で答えるか、一定時間で自動拒否されるまで**応答を返さない。
+   * 返り値は `{behavior:"allow"}` か `{behavior:"deny", message}`。standard モードでは null（404）。
+   * master の MCP からは許可を付けられない（答えるのはボスのブラウザからの WS chatAnswer だけ）。
+   */
+  requestSecureApproval:
+    | ((
+        req: { from: string | null; label: string; command: string; cwd: string | null; toolUseId: string | null },
+        signal: AbortSignal,
+      ) => Promise<unknown>)
+    | null;
+  /**
    * ファイル編集の入力依頼（`POST /control/file-edit-request` の実体）。
    *
    * master の request_file_edit から呼ばれ、チャットに入力カードを出して**すぐ返る**
@@ -756,6 +770,38 @@ export function createControlApi(deps: ControlDeps) {
           ac.signal,
         );
         if (res.writableEnded) return true; // 既に切断済み
+        sendJson(res, 200, decision);
+        return true;
+      }
+
+      // ---- POST /control/secure-approval ----
+      // セキュアモードの PreToolUse hook の受け口。ボスが答える（か自動拒否）まで応答を返さない。
+      if (pathname === "/control/secure-approval" && method === "POST") {
+        if (!deps.requestSecureApproval) {
+          sendJson(res, 404, { error: "セキュアモードではないため承認の受け口はありません" });
+          return true;
+        }
+        const body = await readJsonBody(req);
+        const command = asString(body.command);
+        if (!command) {
+          sendJson(res, 400, { error: "command は必須です" });
+          return true;
+        }
+        const ac = new AbortController();
+        res.on("close", () => {
+          if (!res.writableEnded) ac.abort();
+        });
+        const decision = await deps.requestSecureApproval(
+          {
+            from: asString(body.from) ?? null,
+            label: asString(body.label) ?? "承認が必要な操作",
+            command,
+            cwd: asString(body.cwd) ?? null,
+            toolUseId: asString(body.toolUseId) ?? null,
+          },
+          ac.signal,
+        );
+        if (res.writableEnded) return true;
         sendJson(res, 200, decision);
         return true;
       }

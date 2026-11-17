@@ -4,6 +4,7 @@ import { countPtmxFds, readPtmxMax } from "./ptmxWatch.ts";
 import type { AgentRecord, AgentStatus, AgentMode, AgentKind } from "../shared/protocol.ts";
 import { deliveryText } from "../shared/deliveryTag.ts";
 import { extractFinalReport, isRelayEnabled, type FinalReport } from "./finalReport.ts";
+import { stripSecretEnv } from "./security.ts";
 import {
   CLAUDE_BACKEND,
   applyEnvDenyList,
@@ -382,6 +383,12 @@ export interface LaunchParams {
    * 監視窓に落ちて誤 respawn される」重なりを断つための口。
    */
   ackWatchMs?: number | null;
+  /**
+   * セキュアモードで秘密の値（EBI_AUTH_TOKEN・CLOUDFLARE_* など）を pty env から抜くか。
+   * サーバ起動時のモードで決まり、起動後に変わらない（動いているエビを途中で緩めない）。
+   * ボスが config で足した固定エビ（minaebi 等）には付けない＝範囲外。
+   */
+  secureEnv?: boolean;
 }
 
 /** Agent からのイベントを購読するためのコールバック束。 */
@@ -647,7 +654,7 @@ export class Agent {
     // inlineTui の on/off は backend.buildEnv() へ渡して backend に判断させる
     // （claude は off なら空を返す＝従来と同一。gemini の system settings パスのように
     //   「TUI 描画ではなく起動の必須条件」である env まで落とさないため）。
-    const spawnEnv = buildSpawnEnv(
+    const builtEnv = buildSpawnEnv(
       process.env,
       launch.env,
       true,
@@ -659,6 +666,7 @@ export class Agent {
       }),
       backend.envDenyList,
     );
+    const spawnEnv = launch.secureEnv ? stripSecretEnv(builtEnv).env : builtEnv;
     try {
       this.proc = pty.spawn(launch.command, launch.args, {
         name: "xterm-color",

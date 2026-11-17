@@ -49,6 +49,18 @@ body {
   color: var(--muted);
   margin-left: 6px;
 }
+/* セキュアモードのバッジ（capabilities.securityMode === "secure" のときだけ表示）。 */
+.security-badge {
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid #2e7d32;
+  color: #2e7d32;
+  background: rgba(46, 125, 50, 0.1);
+  white-space: nowrap;
+}
+.security-badge[hidden] { display: none; }
 
 .controls {
   display: flex;

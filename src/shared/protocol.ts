@@ -408,6 +408,11 @@ export interface CapabilitiesMessage {
   type: "capabilities";
   /** 監督・要約機能が有効か（＝サブスクの claude CLI が使えるか）。 */
   supervisor: boolean;
+  /**
+   * サーバ起動時に決まったセキュリティモード（"standard" | "secure"）。
+   * 起動後は変わらない（切り替えは再起動）。古いサーバは送らない＝未指定は standard 扱い。
+   */
+  securityMode?: "standard" | "secure";
 }
 
 /** ダッシュボード: エビ 1 体分の使用状況（cost/context/model）。 */

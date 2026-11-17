@@ -113,6 +113,8 @@ export interface MasterSessionOptions {
   mcpConfigPath: string | null;
   /** config の args（そのまま末尾へ付く）。 */
   extraArgs: readonly string[];
+  /** セキュアモードで頭脳プロセスの env から秘密の値を抜くか（既定 false）。 */
+  secureEnv?: boolean;
   /** 会話 JSONL の保存先（null ならメモリのみ）。 */
   logPath: string | null;
   handlers: MasterSessionHandlers;
@@ -355,6 +357,8 @@ export class MasterSession {
         mcpConfigPath: this.opts.mcpConfigPath,
         resumeSessionId,
         extraArgs: this.opts.extraArgs,
+        secureEnv: this.opts.secureEnv === true,
+        agentId: this.opts.id,
       });
     } catch (err) {
       this.brain = null;

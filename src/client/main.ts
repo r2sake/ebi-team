@@ -248,6 +248,11 @@ function handleServerMessage(msg: ServerMessage): void {
       addNotice("system", `エラー: ${msg.text}`);
       break;
     case "capabilities":
+      // セキュアモードのバッジ（起動時に決まり、再起動まで変わらない）。
+      {
+        const badge = document.getElementById("security-badge");
+        if (badge) badge.hidden = msg.securityMode !== "secure";
+      }
       // サーバ能力に応じて要約 UI の有無を切り替える。
       // 既存ペインは再生成して要約ボタンの有無を反映する（接続/再接続時のみ・低頻度）。
       if (msg.supervisor !== supervisorEnabled) {
