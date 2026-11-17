@@ -115,6 +115,8 @@ export const CODEX_TRAITS: BackendTraits = {
   killProcessGroup: true,
   // 役割プロンプト ACK の「静かな故障」を検知したら 1 回だけ作り直す（docs §7.1 の次の一手 1）。
   ackFailureWatch: CODEX_ACK_FAILURE_WATCH,
+  // 作業中に届いた master の訂正を次のターンまで待たせない（codex の steer・0.156.1 実測）。
+  steerWhileBusy: true,
   preflight: {
     versionArgs: ["--version"],
     verifiedVersion: "0.146.0",
