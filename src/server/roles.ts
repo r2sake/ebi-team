@@ -57,6 +57,12 @@ export interface EbiRole {
   mcpRole: EbiMcpRole;
   /** 既定 permission-mode。 */
   permissionMode: PermissionMode;
+  /**
+   * permissionMode をボスが config に明示したか（カスタム役割・同名上書きで permissionMode を書いた）。
+   * セキュアモードでは、明示されていない bypassPermissions（組込み engineer の既定）を auto に下げ、
+   * 明示された bypassPermissions だけを opt-in として残す（security.ts の securePermissionMode）。
+   */
+  permissionModeExplicit?: boolean;
   /** 既定モデル（alias）。 */
   defaultModel: string;
   /**
@@ -290,6 +296,7 @@ function normalizeCustomRole(id: string, raw: unknown): EbiRole {
     emoji,
     mcpRole,
     permissionMode,
+    ...(permissionModeRaw === undefined ? {} : { permissionModeExplicit: true }),
     defaultModel,
     backend,
     appendSystemPrompt,

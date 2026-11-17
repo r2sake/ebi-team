@@ -56,6 +56,15 @@ export interface MasterBrainStartOptions {
   resumeSessionId: string | null;
   /** 追加引数（config の args）。常に末尾へ付く。 */
   extraArgs: readonly string[];
+  /**
+   * セキュアモードで子 env から秘密の値を抜くか（未指定 false＝従来どおり）。
+   * 抜いたうえで EBI_ID（承認バブルの「誰から」）を足す。
+   */
+  secureEnv?: boolean;
+  /** master の agent id（secure で EBI_ID として渡す）。 */
+  agentId?: string | null;
+  /** 子 env に足す値（secure の EBI_CONTROL_TOKEN など）。秘密抜きの後に足す。 */
+  extraEnv?: Record<string, string>;
 }
 
 /** 文脈・トークンの観測値。 */

@@ -11,6 +11,42 @@ import {
   writeGeminiRuntime,
   type BackendId,
 } from "./backends/index.ts";
+import { clampForSecurity, stripSecretEnv, type SecurityMode } from "./security.ts";
+
+/**
+ * セキュアモードの設定（サーバ起動時に 1 回だけ index.ts が入れる）。
+ * 要約エンジンもエビと同じ 1 本道（clampForSecurity）で締める。
+ */
+let supervisorSecurity: { mode: SecurityMode; settingsPath: string | null } = {
+  mode: "standard",
+  settingsPath: null,
+};
+
+export function configureSupervisorSecurity(mode: SecurityMode, settingsPath: string | null): void {
+  supervisorSecurity = { mode, settingsPath };
+}
+
+/**
+ * 要約 1 回分の引数に secure の締め付けを掛ける純関数（プロンプトは常に最後のまま）。
+ * スタブ（EBI_SUMMARY_CMD）は触らない。gemini は読み取り役（plan）として yolo を下げる。
+ */
+export function secureSummaryArgs(
+  engine: SummaryEngine,
+  prompt: string,
+  security: { mode: SecurityMode; settingsPath: string | null } = supervisorSecurity,
+): string[] {
+  if (security.mode !== "secure" || engine.isStub) return buildSummaryArgs(engine, prompt);
+  const { args: baseArgs } = clampForSecurity(
+    {
+      backend: engine.backend,
+      args: engine.baseArgs,
+      permissionMode: "plan",
+      settingsPath: security.settingsPath,
+    },
+    security.mode,
+  );
+  return buildSummaryArgs({ ...engine, baseArgs }, prompt);
+}
 
 /**
  * 監督・要約エンジン（サブスク課金・API キー不要）。
@@ -252,7 +288,7 @@ export class Supervisor {
       "\n```";
 
     try {
-      const text = await runOnce(this.engine.cmd, buildSummaryArgs(this.engine, prompt), this.engine);
+      const text = await runOnce(this.engine.cmd, secureSummaryArgs(this.engine, prompt), this.engine);
       const cleaned = text.trim();
       if (!cleaned) return { ok: false, reason: "要約が空でした" };
       return { ok: true, text: cleaned };
@@ -270,10 +306,13 @@ export class Supervisor {
 function runOnce(cmd: string, args: string[], engine: SummaryEngine): Promise<string> {
   // gemini エンジンは API キー課金・別認証経路の env を親から落としてから起動する
   //（PTY 経路の envDenyList と同じ扱い。サブスク枠以外に載せない）。
-  const parentEnv =
+  const baseEnv =
     engine.backend === "gemini"
       ? applyEnvDenyList(process.env, GEMINI_TRAITS.envDenyList)
       : process.env;
+  // secure では秘密の値を子へ渡さない（スタブ起動は対象外）。
+  const parentEnv =
+    supervisorSecurity.mode === "secure" && !engine.isStub ? stripSecretEnv(baseEnv).env : baseEnv;
   return new Promise((resolve, reject) => {
     execFile(
       cmd,

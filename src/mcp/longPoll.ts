@@ -26,6 +26,7 @@ export function postLongPoll(
   url: string,
   body: unknown,
   signal?: AbortSignal,
+  extraHeaders?: Record<string, string>,
 ): Promise<LongPollResult> | null {
   let target: URL;
   try {
@@ -52,6 +53,7 @@ export function postLongPoll(
         path: `${target.pathname}${target.search}`,
         method: "POST",
         headers: {
+          ...(extraHeaders ?? {}),
           "Content-Type": "application/json",
           "Content-Length": String(payload.byteLength),
         },

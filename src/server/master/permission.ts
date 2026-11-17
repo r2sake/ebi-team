@@ -266,10 +266,13 @@ export class PermissionBroker {
     const onAbort = (): void => {
       if (entry.done || waiter.gone) return;
       waiter.gone = true;
+      // abort の理由が文字列なら拒否理由に使う（セキュアモードの「一定時間で自動拒否」など）。
+      const message =
+        typeof signal.reason === "string" && signal.reason ? signal.reason : "要求が取り消されました";
       // この待ち手には即座に返す（相手はもう聞いていないが Promise を宙に浮かせない）。
-      waiter.settle({ behavior: "deny", message: "要求が取り消されました" });
+      waiter.settle({ behavior: "deny", message });
       if (entry.waiters.some((w) => !w.gone)) return; // 他の接続はまだ生きている
-      this.finish(reqId, { behavior: "deny", message: "要求が取り消されました" }, "discarded", null);
+      this.finish(reqId, { behavior: "deny", message }, "discarded", null);
     };
     if (signal.aborted) {
       onAbort();

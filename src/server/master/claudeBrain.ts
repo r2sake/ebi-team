@@ -27,6 +27,7 @@ import {
   evaluateMasterPreflight,
 } from "./claudeArgs.ts";
 import { ClaudeStreamNormalizer, parseNdjsonLine } from "./claudeEvents.ts";
+import { stripSecretEnv } from "../security.ts";
 import {
   MASTER_PERMISSION_PROMPT_TOOL,
   PermissionBroker,
@@ -164,7 +165,14 @@ export class ClaudeHeadlessBrain implements MasterBrain {
       extraArgs: startOpts.extraArgs,
     });
     const parentEnv = this.opts.parentEnv ?? process.env;
-    const childEnv = applyMasterEnvDenyList(parentEnv);
+    // secure: 秘密の値を抜いてから deny list を掛ける。EBI_ID は hook（承認バブルの「誰から」）用。
+    const childEnv = startOpts.secureEnv
+      ? {
+          ...applyMasterEnvDenyList(stripSecretEnv(parentEnv).env),
+          EBI_ID: startOpts.agentId ?? "master",
+          ...(startOpts.extraEnv ?? {}),
+        }
+      : applyMasterEnvDenyList(parentEnv);
     const pre = evaluateMasterPreflight({ args, childEnv, parentEnv });
     if (!pre.ok) {
       throw new Error(`master の起動前チェックに失敗しました: ${pre.errors.join(" / ")}`);

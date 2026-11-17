@@ -19,6 +19,7 @@ import {
   type ViewerRecord,
 } from "../shared/protocol.ts";
 import { TodoError, type TodoBoard } from "./todos.ts";
+import { callerMayActAs, getControlCaller } from "./controlAuth.ts";
 import {
   ALLOWED_ATTACH_TYPES,
   maxBytesFor,
@@ -235,6 +236,20 @@ export interface ControlDeps {
    * サーバ再起動 / 「新しい会話」を使わずに直すための逃げ道。畳んだ件数を返す。
    */
   resyncChatPending: (() => number) | null;
+  /**
+   * セキュアモードの承認の受け口（`POST /control/secure-approval` の実体）。
+   *
+   * PreToolUse hook（src/mcp/secure-hook.ts）が git push・本番の操作の前に叩く。ボスのチャットに
+   * 承認バブルを出し、**ボスが UI で答えるか、一定時間で自動拒否されるまで**応答を返さない。
+   * 返り値は `{behavior:"allow"}` か `{behavior:"deny", message}`。standard モードでは null（404）。
+   * master の MCP からは許可を付けられない（答えるのはボスのブラウザからの WS chatAnswer だけ）。
+   */
+  requestSecureApproval:
+    | ((
+        req: { from: string | null; label: string; command: string; cwd: string | null; toolUseId: string | null },
+        signal: AbortSignal,
+      ) => Promise<unknown>)
+    | null;
   /**
    * ファイル編集の入力依頼（`POST /control/file-edit-request` の実体）。
    *
@@ -491,6 +506,11 @@ export function createControlApi(deps: ControlDeps) {
           sendJson(res, 400, { error: "from と message（文字列）は必須です" });
           return true;
         }
+        // セキュアモード: engineer は自分の id でしか名乗れない（なりすまし防止）。
+        if (!callerMayActAs(getControlCaller(req), from)) {
+          sendJson(res, 403, { error: `セキュアモード: from=${from} を名乗ることはできません` });
+          return true;
+        }
         const result = await registry.reverseInject(from, to, message, kind);
         if (result.delivered.length === 0) {
           // 宛先なし/isolated/自己送信などで配信ゼロは 4xx で理由を返す。
@@ -579,6 +599,10 @@ export function createControlApi(deps: ControlDeps) {
           sendJson(res, 400, { error: "クエリ id は必須です" });
           return true;
         }
+        if (!callerMayActAs(getControlCaller(req), id)) {
+          sendJson(res, 403, { error: `セキュアモード: id=${id} の購読はできません` });
+          return true;
+        }
         const timeoutRaw = Number(query.get("timeoutMs"));
         const timeoutMs =
           Number.isFinite(timeoutRaw) && timeoutRaw > 0 ? Math.min(Math.max(timeoutRaw, 1000), 60000) : 25000;
@@ -613,6 +637,10 @@ export function createControlApi(deps: ControlDeps) {
         const ids = idsRaw.filter((n): n is number => typeof n === "number" && Number.isFinite(n));
         if (!id) {
           sendJson(res, 400, { error: "id（文字列）は必須です" });
+          return true;
+        }
+        if (!callerMayActAs(getControlCaller(req), id)) {
+          sendJson(res, 403, { error: `セキュアモード: id=${id} の ACK はできません` });
           return true;
         }
         registry.ackDelivery(id, ids);
@@ -756,6 +784,40 @@ export function createControlApi(deps: ControlDeps) {
           ac.signal,
         );
         if (res.writableEnded) return true; // 既に切断済み
+        sendJson(res, 200, decision);
+        return true;
+      }
+
+      // ---- POST /control/secure-approval ----
+      // セキュアモードの PreToolUse hook の受け口。ボスが答える（か自動拒否）まで応答を返さない。
+      if (pathname === "/control/secure-approval" && method === "POST") {
+        if (!deps.requestSecureApproval) {
+          sendJson(res, 404, { error: "セキュアモードではないため承認の受け口はありません" });
+          return true;
+        }
+        const body = await readJsonBody(req);
+        const command = asString(body.command);
+        if (!command) {
+          sendJson(res, 400, { error: "command は必須です" });
+          return true;
+        }
+        const ac = new AbortController();
+        res.on("close", () => {
+          if (!res.writableEnded) ac.abort();
+        });
+        // 「誰から」はトークンで分かるならそれを使う（body の from は名乗りにすぎない）。
+        const caller = getControlCaller(req);
+        const decision = await deps.requestSecureApproval(
+          {
+            from: caller?.agentId ?? asString(body.from) ?? null,
+            label: asString(body.label) ?? "承認が必要な操作",
+            command,
+            cwd: asString(body.cwd) ?? null,
+            toolUseId: asString(body.toolUseId) ?? null,
+          },
+          ac.signal,
+        );
+        if (res.writableEnded) return true;
         sendJson(res, 200, decision);
         return true;
       }

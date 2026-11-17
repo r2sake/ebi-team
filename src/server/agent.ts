@@ -4,6 +4,7 @@ import { countPtmxFds, readPtmxMax } from "./ptmxWatch.ts";
 import type { AgentRecord, AgentStatus, AgentMode, AgentKind } from "../shared/protocol.ts";
 import { deliveryText } from "../shared/deliveryTag.ts";
 import { extractFinalReport, isRelayEnabled, type FinalReport } from "./finalReport.ts";
+import { stripSecretEnv } from "./security.ts";
 import {
   CLAUDE_BACKEND,
   applyEnvDenyList,
@@ -384,6 +385,18 @@ export interface LaunchParams {
    * 監視窓に落ちて誤 respawn される」重なりを断つための口。
    */
   ackWatchMs?: number | null;
+  /**
+   * セキュアモードで秘密の値（EBI_AUTH_TOKEN・CLOUDFLARE_* など）を pty env から抜くか。
+   * サーバ起動時のモードで決まり、起動後に変わらない（動いているエビを途中で緩めない）。
+   * ボスが config で足した固定エビ（minaebi 等）には付けない＝範囲外。
+   */
+  secureEnv?: boolean;
+  /**
+   * 起動ゲートのうち**自動応答しない**種別（セキュアモードの "trust"）。
+   * 検知したら応答を送らず、ボスに UI のターミナルで答えてもらう旨を notice で出す。
+   * dev channels 警告の自動応答とは分けて扱う（そちらは従来どおり許可リスト限定で自動応答する）。
+   */
+  manualGates?: readonly StartupGateKind[];
 }
 
 /** Agent からのイベントを購読するためのコールバック束。 */
@@ -649,8 +662,10 @@ export class Agent {
     // inlineTui の on/off は backend.buildEnv() へ渡して backend に判断させる
     // （claude は off なら空を返す＝従来と同一。gemini の system settings パスのように
     //   「TUI 描画ではなく起動の必須条件」である env まで落とさないため）。
+    // secure: 秘密の値は「親から継承する env」からだけ抜く（ebi-team が意図して渡す launch.env の
+    // EBI_CONTROL_TOKEN 等は残す）。
     const spawnEnv = buildSpawnEnv(
-      process.env,
+      launch.secureEnv ? stripSecretEnv(process.env).env : process.env,
       launch.env,
       true,
       backend.buildEnv({
@@ -1137,6 +1152,17 @@ export class Agent {
     const gate = spec.detect(this.gateScanBuffer);
     if (gate === null || this.answeredGates.has(gate)) return;
 
+    if (this.launch.manualGates?.includes(gate)) {
+      // セキュアモード: workspace trust 確認は自動で承認しない（ボスが UI で答える）。
+      this.answeredGates.add(gate);
+      this.gateScanBuffer = "";
+      const msg =
+        `セキュアモードのため起動時の確認（${gate === "trust" ? "workspace trust" : gate}）は自動で承認しません。` +
+        `このエビのターミナルで確認して答えてください`;
+      console.log(`[ebi-team] [${this.id}] ${msg}`);
+      this.handlers.onNotice(this.id, msg);
+      return;
+    }
     // 選択肢がまだ描画途中で応答を決められなければ、送らずに次の出力を待つ。
     const keys = spec.answerFor(gate, this.gateScanBuffer);
     if (keys === null || keys.length === 0) return;

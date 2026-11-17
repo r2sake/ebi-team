@@ -124,6 +124,11 @@ interface RawConfig {
    * 検証・引き当ては effort.ts（normalizeEffortByModel / effortForModel）が SoT。
    */
   effortByModel?: unknown;
+  /**
+   * セキュリティモード（"standard" | "secure"）。env EBI_SECURITY_MODE が優先。
+   * 検証は security.ts の resolveSecurityMode。再起動でのみ切り替わる。
+   */
+  securityMode?: unknown;
 }
 
 /**
@@ -155,6 +160,22 @@ async function readRawConfig(configPath: string): Promise<RawConfig | null> {
 export async function loadRawCustomRoles(configPath: string): Promise<unknown> {
   const parsed = await readRawConfig(configPath);
   return parsed?.roles;
+}
+
+/**
+ * ebi-team.config.json の top-level "securityMode" を生のまま返す（検証は security.ts）。
+ * ファイルが無い／キーが無ければ undefined。
+ */
+export function loadRawSecurityModeSync(configPath: string): unknown {
+  // サーバのモジュール評価時に 1 回だけ同期で読む（モードを定数にして途中で変えないため）。
+  // JSON 不正は throw（呼び出し側が安全側に倒す）。
+  let text: string;
+  try {
+    text = readFileSync(configPath, "utf8");
+  } catch {
+    return undefined;
+  }
+  return (JSON.parse(text) as RawConfig)?.securityMode;
 }
 
 /**

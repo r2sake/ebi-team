@@ -315,6 +315,7 @@ async function withControlApi(
     shareChatImage: deps.shareChatImage,
     requestChatPermission: null,
     resyncChatPending: null,
+    requestSecureApproval: null,
     requestFileEdit: null,
     todos: null,
   });

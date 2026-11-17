@@ -11,6 +11,8 @@
       <!-- 狭幅時のみ表示するサイドバー（registry ドロワー）開閉ボタン。 -->
       <button id="sidebar-toggle" class="sidebar-toggle" title="registry を開閉" aria-label="registry を開閉">☰</button>
       <h1>🦐 ebi-team <span class="sub">エビチーム</span></h1>
+      <!-- セキュアモードで起動しているときだけ出す（capabilities.securityMode）。 -->
+      <span id="security-badge" class="security-badge" hidden title="セキュアモード: git push・本番の操作はチャットで承認したときだけ通ります。秘密のファイル・外部送信は止めています（切り替えはサーバ再起動）">🔒 セキュア</span>
       <!-- ボスの TODO（ボスがやらなければならないこと）。押すと一覧のパネルが開く。中身は todoPanel.ts。 -->
       <button id="todo-btn" class="todo-btn" aria-haspopup="dialog" aria-expanded="false">📋 TODO 0</button>
       <div class="controls">
