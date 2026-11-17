@@ -272,6 +272,11 @@ export class ClaudeHeadlessBrain implements MasterBrain {
     return this.broker.pendingCount;
   }
 
+  /** 未応答の承認/質問の id 一覧（再同期用）。 */
+  get pendingPermissionIds(): readonly string[] {
+    return this.broker.pendingIds();
+  }
+
   /**
    * 承認 / 質問への応答（WS `chatAnswer` → MasterSession → ここ）。
    * 応答は stdin ではなく **保留中の MCP ツール呼び出しの戻り値**として claude へ返る

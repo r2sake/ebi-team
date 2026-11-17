@@ -314,6 +314,7 @@ async function withControlApi(
     readChatAttachment: null,
     shareChatImage: deps.shareChatImage,
     requestChatPermission: null,
+    resyncChatPending: null,
     requestFileEdit: null,
     todos: null,
   });

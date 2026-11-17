@@ -647,6 +647,36 @@ export class MasterSession {
   }
 
   /**
+   * 未応答の承認/質問を**ブローカの台帳に合わせて畳む**（`POST /control/chat-pending-resync`）。
+   *
+   * UI 側にだけ残ってブローカには居ない「孤児」は、ボスが答えても
+   * `未応答の承認/質問が見つかりません` になり自力では消えない。サーバ再起動や
+   * 「新しい会話」を使わずに戻すための逃げ道。畳んだ件数を返す。
+   */
+  resyncPending(): number {
+    // pendingPermissionIds を持たない backend（＝承認 UI 非対応）は台帳が空＝全部孤児。
+    const live = new Set(this.brain?.pendingPermissionIds ?? []);
+    const orphans = [...this.pending].filter((id) => !live.has(id));
+    for (const id of orphans) {
+      // emit() は onBrainEvent を通らないので、集合からも自分で落とす。
+      this.pending.delete(id);
+      this.emit({ kind: "permissionSettled", id, outcome: "discarded", answer: null });
+    }
+    // ブローカ側にだけ居る保留（イベント取りこぼし）も件数に反映しておく。
+    for (const id of live) this.pending.add(id);
+    if (orphans.length > 0) {
+      this.handlers.onNotice(
+        this.id,
+        `孤立していた未応答の承認/質問 ${orphans.length} 件を破棄しました（再同期）`,
+      );
+    }
+    // waiting のときだけ動かす（stopped を busy へ上書きしない・settled と同じ扱い）。
+    if (this.stateValue === "waiting") this.setState(this.pending.size > 0 ? "waiting" : "busy");
+    this.notifyPendingChange();
+    return orphans.length;
+  }
+
+  /**
    * `--permission-prompt-tool`（制御MCP の permission_prompt → `POST /control/chat-permission`）
    * から届いた承認要求。**ボスが答えるまで resolve しない**（自動拒否しない・裁定どおり）。
    * signal は HTTP 接続の切断（claude 側がツール呼び出しを諦めた）で発火する。

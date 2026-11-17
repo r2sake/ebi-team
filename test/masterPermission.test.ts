@@ -237,6 +237,48 @@ test("質問の一部だけ答えたあと破棄されると、残りのスロ�
   );
 });
 
+test("同一 toolUseId の二重要求: UI 発火は 1 回・pendingCount 1・settled 1 回で 0 に戻る", async () => {
+  // 実事象（2026-09-08）: MCP 側の permission_prompt が同じ tool_use_id で 2 回届き、
+  // question が 2 本 UI へ出たのに settled は 1 回しか来ず、pending が 1 のまま残った。
+  const c = collector();
+  const broker = new PermissionBroker(c.handlers);
+  const input = { questions: [{ question: "Q1", options: [{ label: "A" }] }] };
+  const first = broker.request({ toolName: ASK_USER_QUESTION_TOOL, input, toolUseId: "dup" });
+  const second = broker.request({ toolName: ASK_USER_QUESTION_TOOL, input, toolUseId: "dup" });
+  assert.equal(c.questions.length, 1, "UI へは 1 回だけ出す");
+  assert.equal(broker.pendingCount, 1);
+  assert.deepEqual(broker.pendingIds(), ["dup#0"]);
+
+  broker.answer("dup#0", { choice: ["A"] });
+  const a = await first;
+  const b = await second;
+  // 2 本目の HTTP にも同じ決定を返す（片方だけ宙に浮かせない）。
+  assert.deepEqual(a, b);
+  assert.equal(a.behavior, "allow");
+  assert.equal(c.settled.length, 1);
+  assert.equal(broker.pendingCount, 0);
+});
+
+test("二重要求: 片方の接続だけ切れても保留は残り、全部切れたときに 1 回だけ破棄される", async () => {
+  const c = collector();
+  const broker = new PermissionBroker(c.handlers);
+  const ac1 = new AbortController();
+  const ac2 = new AbortController();
+  const first = broker.request({ toolName: "Bash", input: {}, toolUseId: "dup" }, ac1.signal);
+  const second = broker.request({ toolName: "Bash", input: {}, toolUseId: "dup" }, ac2.signal);
+  assert.equal(c.permissions.length, 1);
+
+  ac1.abort();
+  assert.equal((await first).behavior, "deny");
+  assert.equal(broker.pendingCount, 1, "もう 1 本の接続が生きているので保留は残る");
+  assert.equal(c.settled.length, 0);
+
+  ac2.abort();
+  assert.equal((await second).behavior, "deny");
+  assert.equal(broker.pendingCount, 0);
+  assert.deepEqual(c.settled.map((s) => s.outcome), ["discarded"]);
+});
+
 test("toolUseId が無い要求にも一意の id が振られる", async () => {
   const c = collector();
   const broker = new PermissionBroker(c.handlers);
