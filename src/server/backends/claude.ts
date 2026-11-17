@@ -110,6 +110,36 @@ export function detectStartupGate(rawScanBuffer: string): StartupGateKind | null
   return null;
 }
 
+/** trust 確認の「信頼する」側の選択肢（空白を除いた表記。新旧の文言の両方）。 */
+const TRUST_YES = String.raw`(?:Yes,?I?trust(?:this)?(?:folder|project)?|Yes,?proceed)`;
+const TRUST_NO = String.raw`No,?exit`;
+/** 選択中を示すカーソル記号（Ink の select）。 */
+const CURSOR = String.raw`[❯›>]`;
+
+/**
+ * workspace trust 確認で「信頼する（Yes）」を選ぶキー列を決める純関数。
+ *
+ * 選択肢の並び順に頼らない（2026-11 の claude 2.1.322 で「❯ No, exit / Yes, I trust this folder」の
+ * 順になり、従来の "1"+Enter が **No, exit を選んでエビが即終了**していた）。
+ * - カーソルが既に Yes にある → Enter だけ
+ * - 番号付きの選択肢（"2. Yes, ..."）→ その番号＋Enter
+ * - カーソルが No にあり、Yes がその後ろ → ↓ で Yes へ移ってから Enter
+ * - それ以外（選択肢がまだ描画途中など）→ null（送らずに次の出力を待つ。誤って No を選ばない）
+ */
+export function trustGateKeys(plainScanBuffer: string): string[] | null {
+  const c = plainScanBuffer.replace(/\s+/g, "");
+  const yes = new RegExp(TRUST_YES, "i").exec(c);
+  if (!yes) return null;
+  if (new RegExp(`${CURSOR}(?:\\d+\\.)?${TRUST_YES}`, "i").test(c)) return ["\r"];
+  const numbered = new RegExp(`(\\d+)\\.${TRUST_YES}`, "i").exec(c);
+  if (numbered) return [`${numbered[1]}\r`];
+  const no = new RegExp(TRUST_NO, "i").exec(c);
+  if (no && no.index < yes.index && new RegExp(`${CURSOR}(?:\\d+\\.)?${TRUST_NO}`, "i").test(c)) {
+    return ["\x1b[B", "\r"];
+  }
+  return null;
+}
+
 /**
  * Claude の起動ゲート定義。
  * 対象は 2 種（いずれも選択肢 1＝許可 を選んで Enter）:
@@ -124,11 +154,11 @@ const CLAUDE_STARTUP_GATES: StartupGateSpec = {
   readyBlockingGate: "devChannels",
   isAutoAnswerEligible: isDevChannelsAutoAnswerEligible,
   detect: detectStartupGate,
-  answerFor: () => "1\r",
+  answerFor: (kind, plainScanBuffer) => (kind === "trust" ? trustGateKeys(plainScanBuffer) : ["1\r"]),
   noticeFor: (kind) =>
     kind === "devChannels"
       ? `起動ゲート自動応答: development channels 警告に "1"+Enter を送信（許可リスト限定・ready 前）`
-      : `起動ゲート自動応答: workspace trust 確認に "1"+Enter を送信（ready 前）`,
+      : `起動ゲート自動応答: workspace trust 確認で「信頼する（Yes）」を選択（ready 前）`,
 };
 
 /** Claude Code バックエンド。 */
