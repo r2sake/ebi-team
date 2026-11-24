@@ -20,6 +20,15 @@ html, body {
   font-family: "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
 }
 
+/* 書体の指定が無い code / pre（チャットと TODO の Markdown・ツール出力）は、ブラウザ既定の
+   等幅フォントに任せない。Chrome の既定の等幅を「Osaka」にしている Mac では、Osaka が macOS の
+   ダウンロード式フォント（MobileAsset）で、OS が古い版を消す（.asset.purged）と開きっぱなしの
+   タブの字形の番号がずれ、1 文字手前の字に化ける（2026-11 実害）。常駐する OS の等幅を明示する。
+   日本語は Hiragino に落とす。クラスで書体を決めている所（viewer・file editor 等）はそちらが勝つ。 */
+code, pre, kbd, samp {
+  font-family: Menlo, Monaco, "Courier New", "Hiragino Sans", monospace;
+}
+
 body {
   display: flex;
   flex-direction: column;
