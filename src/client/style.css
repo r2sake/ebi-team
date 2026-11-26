@@ -24,7 +24,9 @@ html, body {
    等幅フォントに任せない。Chrome の既定の等幅を「Osaka」にしている Mac では、Osaka が macOS の
    ダウンロード式フォント（MobileAsset）で、OS が古い版を消す（.asset.purged）と開きっぱなしの
    タブの字形の番号がずれ、1 文字手前の字に化ける（2026-11 実害）。常駐する OS の等幅を明示する。
-   日本語は Hiragino に落とす。クラスで書体を決めている所（viewer・file editor 等）はそちらが勝つ。 */
+   日本語は Hiragino に落とす。クラスで書体を決めている所（viewer・file editor 等）はそちらが勝つ。
+   そのクラス側の等幅の指定にも、末尾の monospace（＝ボスの Chrome の既定の等幅＝Osaka）の手前に
+   必ず "Hiragino Sans" を置く。どの字も Osaka まで落ちないようにするため。 */
 code, pre, kbd, samp {
   font-family: Menlo, Monaco, "Courier New", "Hiragino Sans", monospace;
 }
@@ -513,7 +515,7 @@ button:hover { filter: brightness(1.07); }
 /* .txt は等幅の生テキスト。 */
 .viewer-txt {
   margin: 0;
-  font-family: Menlo, Monaco, "Courier New", monospace;
+  font-family: Menlo, Monaco, "Courier New", "Hiragino Sans", monospace;
   font-size: 12px;
   line-height: 1.55;
   white-space: pre-wrap;
@@ -555,7 +557,7 @@ button:hover { filter: brightness(1.07); }
 }
 /* インライン code。 */
 .viewer-body.md .md-inline-code {
-  font-family: Menlo, Monaco, "Courier New", monospace;
+  font-family: Menlo, Monaco, "Courier New", "Hiragino Sans", monospace;
   font-size: 0.88em;
   background: var(--panel-2);
   border: 1px solid var(--border);
@@ -572,7 +574,7 @@ button:hover { filter: brightness(1.07); }
   overflow-x: auto;
 }
 .viewer-body.md .md-code code {
-  font-family: Menlo, Monaco, "Courier New", monospace;
+  font-family: Menlo, Monaco, "Courier New", "Hiragino Sans", monospace;
   font-size: 12px;
   line-height: 1.5;
   color: var(--text);
@@ -944,7 +946,7 @@ button:hover { filter: brightness(1.07); }
 .fe-btn.danger { color: #e05b5b; margin-right: auto; }
 .fe-btn:disabled { opacity: 0.55; cursor: default; }
 .fe-path {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, "Hiragino Sans", monospace;
   font-size: 12px;
   color: var(--text);
   word-break: break-all;
@@ -977,7 +979,7 @@ button:hover { filter: brightness(1.07); }
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 10px 12px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, "Hiragino Sans", monospace;
   font-size: 14px; /* 狭幅は下で 16px（iOS 自動ズーム抑止） */
   line-height: 1.5;
 }
@@ -991,7 +993,7 @@ button:hover { filter: brightness(1.07); }
   align-items: center;
 }
 .fe-key-label {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, "Hiragino Sans", monospace;
   font-size: 13px;
   font-weight: 700;
   color: var(--text);
@@ -1006,7 +1008,7 @@ button:hover { filter: brightness(1.07); }
   border-radius: 8px;
   padding: 10px 12px;
   font-size: 16px; /* iOS 自動ズーム抑止 */
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, "Hiragino Sans", monospace;
 }
 .fe-dirs { display: flex; flex-direction: column; gap: 4px; }
 .fe-diff {
@@ -1018,7 +1020,7 @@ button:hover { filter: brightness(1.07); }
   overflow-x: auto;
   font-size: 12px;
   line-height: 1.5;
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, "Hiragino Sans", monospace;
 }
 .fe-diff-line { padding: 0 10px; white-space: pre; }
 .fe-diff-line.op-add { background: rgba(91, 191, 122, 0.15); color: #7fd99a; }
@@ -1028,7 +1030,7 @@ button:hover { filter: brightness(1.07); }
   .fe-text { font-size: 16px; }
 }
 .chat-file-path {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, "Hiragino Sans", monospace;
   word-break: break-all;
 }
 
@@ -1739,4 +1741,42 @@ button:hover { filter: brightness(1.07); }
   .todo-btn { order: 0; margin: 0 auto 0 8px; min-height: 32px; }
   .todo-sheet { width: 100%; border-left: none; }
   .todo-text { font-size: 16px; } /* iOS の自動ズーム抑止 */
+}
+
+/* 開きっぱなしのタブが古い画面のままのとき、新しい版を知らせる帯（buildCheck.ts）。 */
+.build-stale-bar {
+  position: fixed;
+  left: 50%;
+  top: 56px; /* 上の帯（topbar）のすぐ下。下はチャットの入力欄と重なるので避ける */
+  transform: translateX(-50%);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100vw - 32px);
+  padding: 10px 12px 10px 14px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+  font-size: 13px;
+}
+.build-stale-bar button {
+  flex: 0 0 auto;
+  min-height: 32px;
+  padding: 4px 12px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: var(--accent);
+  color: #21130c;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+.build-stale-bar .build-stale-close {
+  background: transparent;
+  color: var(--muted);
+  border-color: var(--border);
+  font-weight: 400;
 }
