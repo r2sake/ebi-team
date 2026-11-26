@@ -129,7 +129,8 @@ export class Pane {
     this.term = new Terminal({
       cursorBlink: true,
       fontSize: 12,
-      fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+      // 末尾の monospace（ブラウザ既定の等幅＝Osaka のことがある）まで落とさない（style.css の code/pre と同じ理由）。
+      fontFamily: 'Menlo, Monaco, "Courier New", "Hiragino Sans", monospace',
       theme: { background: "#000000" },
       // インライン TUI 化（サーバ側で CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1）により、
       // 通常バッファへ実ログが積まれてスクロールバックが機能する。長時間セッションでも

@@ -5,6 +5,7 @@ import { FilePicker } from "./filePicker.ts";
 import { ChatPanel } from "./chat.ts";
 import { FileEditorDialog } from "./fileEditor.ts";
 import { TodoPanel } from "./todoPanel.ts";
+import { startBuildCheck } from "./buildCheck.ts";
 import {
   type ClientMessage,
   type ServerMessage,
@@ -147,6 +148,9 @@ function selectionExists(id: string | null): boolean {
   );
 }
 
+// 開きっぱなしのタブが古い画面のまま残っていないかの見張り（新しい版があれば帯で知らせる）。
+const checkBuild = startBuildCheck();
+
 // ===== WebSocket 接続（自動再接続つき）=====
 let ws: WebSocket | null = null;
 let reconnectTimer: number | null = null;
@@ -163,6 +167,8 @@ function connect(): void {
     connStatus.textContent = "接続済み";
     connStatus.className = "conn ok";
     sendMsg({ type: "list" });
+    // つなぎ直し（サーバの入れ替え後など）のたびに、画面の版も確かめる。
+    checkBuild();
     // 再接続時はサーバ側の購読集合がリセットされているので、
     // 既存ペイン分を再購読しておく（初回は panes が空なので no-op）。
     const ids = [...panes.keys()];
