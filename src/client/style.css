@@ -1747,7 +1747,7 @@ button:hover { filter: brightness(1.07); }
 .build-stale-bar {
   position: fixed;
   left: 50%;
-  bottom: 16px;
+  top: 56px; /* 上の帯（topbar）のすぐ下。下はチャットの入力欄と重なるので避ける */
   transform: translateX(-50%);
   z-index: 1000;
   display: flex;
